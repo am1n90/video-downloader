@@ -1,0 +1,24 @@
+# Данные пользователя
+settings.json
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+build-venv/
+build-ffmpeg-cache/
+
+# Сборка
+build/
+dist/
+Output/
+*.spec
+
+# Бинарники ffmpeg (не в репозитории)
+ffmpeg*.exe
+ffprobe*.exe
+
+# Прочее
+*.log
+*.tmp
