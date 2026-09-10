@@ -48,17 +48,14 @@ if not exist "dist\VideoDownloader\ffprobe.exe" (
   goto :fail
 )
 
-echo [5/6] Тестовый запуск собранного exe (10 секунд)...
+echo [5/6] Тестовый запуск собранного exe (-selftest: авто-выход через 8с)...
 set QT_QPA_PLATFORM=windows
-start "" /wait "dist\VideoDownloader\VideoDownloader.exe" -selftest
-timeout /t 10 /nobreak >nul
-tasklist /fi "IMAGENAME eq VideoDownloader.exe" 2>nul | find /i "VideoDownloader.exe" >nul
+"dist\VideoDownloader\VideoDownloader.exe" -selftest
 if errorlevel 1 (
-  echo WARNING: процесс не найден через 10с - проверьте вручную dist\VideoDownloader\VideoDownloader.exe
-) else (
-  echo OK: exe запущен и работает
-  taskkill /im VideoDownloader.exe /f >nul 2>&1
+  echo FAIL: exe завершился с ошибкой
+  goto :fail
 )
+echo OK: exe запустился и завершился сам (selftest)
 
 echo [6/6] Inno Setup: сборка установщика...
 set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
@@ -75,11 +72,7 @@ if "%APPVER%"=="" (
   echo FAIL: не удалось прочитать APP_VERSION из config.py
   goto :fail
 )
-powershell -NoProfile -Command ^
-  "$f='installer.iss'; $c=[IO.File]::ReadAllText($f);" ^
-  "$c=$c -replace '#define MyAppVersion \"[^\"]*\"', '#define MyAppVersion \"%APPVER%\"';" ^
-  "$c=$c -replace 'OutputBaseFilename=VideoDownloader-Setup-[0-9.]+', 'OutputBaseFilename=VideoDownloader-Setup-%APPVER%';" ^
-  "[IO.File]::WriteAllText($f, $c)"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0set_version.ps1" -Version %APPVER% || goto :fail
 echo Версия из config.py: %APPVER%
 
 if exist "Output" rmdir /s /q "Output"

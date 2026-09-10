@@ -9,7 +9,6 @@
 """
 
 import os
-import subprocess
 import sys
 import threading
 import urllib.request
@@ -23,8 +22,13 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import QDesktopServices, QGuiApplication, QImage
-from PySide6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel
-from PySide6.QtWidgets import QVBoxLayout, QWidget, QSizePolicy
+from PySide6.QtWidgets import (
+    QApplication,
+    QHBoxLayout,
+    QLabel,
+    QVBoxLayout,
+    QWidget,
+)
 
 from qfluentwidgets import (
     BodyLabel,
@@ -32,7 +36,6 @@ from qfluentwidgets import (
     CheckBox,
     ComboBox,
     EditableComboBox,
-    FluentIconBase,
     IconWidget,
     IndeterminateProgressRing,
     InfoBar,
@@ -41,27 +44,19 @@ from qfluentwidgets import (
     PrimaryPushButton,
     ProgressBar,
     PushButton,
-    RoundMenu,
     ScrollArea,
     SearchLineEdit,
     SegmentedWidget,
     SettingCard,
     SettingCardGroup,
     SpinBox,
-    StateToolTip,
     StrongBodyLabel,
-    SubtitleLabel,
     Theme,
     TitleLabel,
-    ToggleToolButton,
-    ToolButton,
     FluentWindow,
     NavigationItemPosition,
     FluentIcon as FIF,
-    isDarkTheme,
     setTheme,
-    setThemeColor,
-    themeColor,
 )
 
 import config
@@ -127,12 +122,14 @@ def fmt_duration(seconds):
 # ================= МОСТ: фоновые потоки → GUI =================
 
 class Bridge(QObject):
-    """Передаёт события из потоков Python в GUI через сигналы Qt."""
+    """Передаёт события из потоков Python в GUI через сигналы Qt.
+
+    Анализ ссылок идёт через AnalyzeWorker.done/failed (прямые сигналы
+    воркера), поэтому analyzeDone/analyzeFailed здесь не нужны.
+    """
 
     itemChanged = Signal(object)
     queueChanged = Signal()
-    analyzeDone = Signal(object)
-    analyzeFailed = Signal(str)
 
 
 class AnalyzeWorker(QThread):
@@ -188,7 +185,8 @@ class UpdateWorker(QThread):
     mode='download': download_file с прогрессом и отменой + sha256.
     """
 
-    manifestReady = Signal(object)   # manifest или None
+    manifestReady = Signal(object)   # manifest / None (нет обновлений)
+    manifestError = Signal(str)      # не удалось проверить (сеть/формат)
     downloadProgress = Signal(float, int, int)
     downloadDone = Signal(str)        # путь
     downloadFailed = Signal(str)
@@ -236,11 +234,17 @@ class UpdateWorker(QThread):
                 self.downloadDone.emit(dest)
         except updater.DownloadCancelled:
             pass  # отмена: тихо, без ошибок
+        except updater.ManifestError as exc:
+            # Отличаем «проверить не вышло» от «обновлений нет» (BUG-10)
+            if self.mode == "check":
+                self.manifestError.emit(str(exc))
+            else:
+                self.downloadFailed.emit(str(exc))
         except Exception as exc:
             if self.mode == "download":
                 self.downloadFailed.emit(str(exc))
             else:
-                self.manifestReady.emit(None)
+                self.manifestError.emit(str(exc))
 
 
 # ================= СТРАНИЦА: ЗАГРУЗКА =================
@@ -258,8 +262,6 @@ class DownloadPage(QWidget):
 
         self._build_ui()
 
-        bridge.analyzeDone.connect(self._on_analyze_ok)
-        bridge.analyzeFailed.connect(self._on_analyze_fail)
         bridge.itemChanged.connect(self._on_current_item)
         bridge.queueChanged.connect(self._rebuild_current)
 
@@ -515,6 +517,11 @@ class DownloadPage(QWidget):
         if not url:
             self._set_status("Вставьте ссылку", "error")
             return
+        # Guard: не запускаем второй анализ, пока первый не завершился
+        # (раньше «Вставить» в момент работы воркера плодила потоки).
+        if (self._analyze_worker is not None
+                and self._analyze_worker.isRunning()):
+            return
 
         self.analyze_btn.setEnabled(False)
         self.download_btn.setEnabled(False)
@@ -722,13 +729,16 @@ class QueueCard(CardWidget):
         acts = QHBoxLayout(self.actions_widget)
         acts.setContentsMargins(0, 0, 0, 0)
         acts.setSpacing(SP_GROUP)
-        lay_acts = self.actions_widget
         lay.addLayout(head)
 
         self.bar = ProgressBar(self)
         self.bar.setRange(0, 100)
         self.bar.hide()
         lay.addWidget(self.bar)
+
+        # Кэш статуса: кнопки/тексты статуса пересоздаём только при смене
+        # статуса, а на тиках прогресса обновляем только бар и мету (BUG-11).
+        self._last_status = None
 
         self.update_state(item)
 
@@ -786,6 +796,12 @@ class QueueCard(CardWidget):
             self.bar.hide()
 
         self.meta_label.setText("  •  ".join(parts))
+
+        # Кнопки пересоздаём только при смене статуса: раньше это
+        # происходило на каждом тике прогресса (десятки раз/сек).
+        if item.status == self._last_status:
+            return
+        self._last_status = item.status
 
         self._clear_actions()
         if item.status in (STATUS_DOWNLOADING, STATUS_QUEUED,
@@ -886,8 +902,8 @@ class LibraryThumbWorker(QThread):
 class LibraryRow(CardWidget):
     """Строка библиотеки: миниатюра, название, детали, кнопки."""
 
-    def __init__(self, entry, parent=None):
-        super().__init__(parent)
+    def __init__(self, entry, page=None):
+        super().__init__(page)
         self.entry = entry
 
         lay = QHBoxLayout(self)
@@ -895,15 +911,26 @@ class LibraryRow(CardWidget):
                                SP_GROUP * 2, SP_GROUP * 2)
         lay.setSpacing(SP_GROUP * 2)
 
-        # Миниатюра (фрагмент видео) слева
+        # Миниатюра (фрагмент видео) слева. Воркер парентится к СТРАНИЦЕ,
+        # а не к карточке: refresh() удаляет карточки deleteLater'ом, и
+        # живой QThread, привязанный к карточке, крашил бы приложение
+        # (Qt6: qFatal «QThread destroyed while thread is still running»).
         self.thumb = ImageLabel(self)
         self.thumb.setFixedSize(120, 68)
-        if entry.get("thumbnail"):
-            worker = LibraryThumbWorker(
-                entry["thumbnail"], (120, 68), self
-            )
-            worker.loaded.connect(self._on_thumb)
-            worker.start()
+        self._thumb_url = entry.get("thumbnail")
+        if self._thumb_url and page is not None:
+            cached = page._get_cached_thumb(self._thumb_url)
+            if cached is not None:
+                # Кеш сессии: без сети и без нового потока
+                self.thumb.setImage(cached)
+                self.thumb.scaledToHeight(68)
+            else:
+                worker = LibraryThumbWorker(
+                    self._thumb_url, (120, 68), page
+                )
+                worker.loaded.connect(self._on_thumb)
+                page._track_thumb(worker)
+                worker.start()
         self.thumb.scaledToHeight(68)
         lay.addWidget(self.thumb)
 
@@ -948,6 +975,10 @@ class LibraryRow(CardWidget):
 
     def _on_thumb(self, url, image):
         if not image.isNull():
+            # Сохранить в кеш страницы (сессии)
+            page = self.parent()
+            if isinstance(page, LibraryPage):
+                page._store_cached_thumb(url, image)
             self.thumb.setImage(image)
 
     def _open_file(self):
@@ -969,6 +1000,8 @@ class LibraryPage(TransparentScrollArea):
         self.bridge = bridge
         self.manager = manager
         self.settings = settings
+        # Живые воркеры миниатюр (чтобы не терять при refresh и закрытии)
+        self._thumb_workers = []
 
         self.setViewportMargins(SP_WINDOW, SP_WINDOW, SP_WINDOW, SP_WINDOW)
         self.setWidgetResizable(True)
@@ -1000,6 +1033,16 @@ class LibraryPage(TransparentScrollArea):
         self.empty_label = BodyLabel("Здесь появятся завершённые загрузки")
         self.empty_label.setAlignment(Qt.AlignCenter)
         self.vbox.addWidget(self.empty_label, stretch=1)
+
+        # Контейнер строк: при refresh очищаем ТОЛЬКО его — постоянные
+        # элементы (заголовок, фильтры, empty_label, stretch) не трогаем.
+        # Раньше цикл «while vbox.count() > 3» по индексам съедал empty_label
+        # и stretch → краш на 3-м refresh (RuntimeError: C++ object deleted).
+        self.rows_container = QWidget(inner)
+        self.rows_vbox = QVBoxLayout(self.rows_container)
+        self.rows_vbox.setContentsMargins(0, 0, 0, 0)
+        self.rows_vbox.setSpacing(SP_GROUP)
+        self.vbox.addWidget(self.rows_container)
 
         self.vbox.addStretch(1)
         self.setWidget(inner)
@@ -1040,9 +1083,10 @@ class LibraryPage(TransparentScrollArea):
         return entries
 
     def refresh(self):
-        # Очистить карточки (всё после фильтров: empty_label + stretch)
-        while self.vbox.count() > 3:
-            item = self.vbox.takeAt(3)
+        # Очистить ТОЛЬКО строки в rows_vbox (постоянные элементы страницы
+        # не трогаем — см. комментарий в __init__).
+        while self.rows_vbox.count():
+            item = self.rows_vbox.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
@@ -1089,7 +1133,7 @@ class LibraryPage(TransparentScrollArea):
 
         for e in rows:
             card = self._make_row(e)
-            self.vbox.insertWidget(self.vbox.count() - 1, card)
+            self.rows_vbox.addWidget(card)
 
     def _make_row(self, entry):
         # Дополнить запись метаданными файла
@@ -1107,6 +1151,45 @@ class LibraryPage(TransparentScrollArea):
 
         return LibraryRow(entry, self)
 
+    # Кеш миниатюр на сессию: url -> QImage. Общий для страницы, живёт
+    # между refresh (раньше каждый refresh перекачивал все картинки).
+    _thumb_cache = {}
+    _thumb_cache_max = 100
+
+    def _track_thumb(self, worker):
+        """Учесть живой воркер миниатюры (удаляется по finished).
+
+        Нужно, чтобы при refresh/закрытии не остались висящие потоки.
+        """
+        self._thumb_workers.append(worker)
+        worker.finished.connect(lambda: self._thumb_workers.remove(worker)
+                                if worker in self._thumb_workers else None)
+
+    def _get_cached_thumb(self, url):
+        if not url:
+            return None
+        img = self.__class__._thumb_cache.get(url)
+        return img if (img is not None and not img.isNull()) else None
+
+    def _store_cached_thumb(self, url, image):
+        if url and not image.isNull():
+            cache = self.__class__._thumb_cache
+            cache[url] = image
+            # Простой LRU-обрезка по размеру
+            if len(cache) > self._thumb_cache_max:
+                for key in list(cache.keys())[:len(cache) - self._thumb_cache_max]:
+                    del cache[key]
+
+    def stop_workers(self):
+        """Остановить все воркеры миниатюр (при закрытии окна)."""
+        for worker in list(self._thumb_workers):
+            try:
+                worker.quit()
+                worker.wait(1500)
+            except Exception:
+                pass
+        self._thumb_workers.clear()
+
     def showEvent(self, event):
         super().showEvent(event)
         self.refresh()
@@ -1117,6 +1200,7 @@ class LibraryPage(TransparentScrollArea):
 class SettingsPage(TransparentScrollArea):
     themeChanged = Signal(str)
     folderChanged = Signal(str)
+    maxConcurrentChanged = Signal(int)
 
     def __init__(self, settings, bridge=None, parent=None):
         super().__init__(parent)
@@ -1278,6 +1362,10 @@ class SettingsPage(TransparentScrollArea):
         self.conc_spin.valueChanged.connect(
             lambda v: self.settings.__setitem__("max_concurrent", int(v))
         )
+        # BUG-5: применение на лету, не только после перезапуска
+        self.conc_spin.valueChanged.connect(
+            lambda v: self.maxConcurrentChanged.emit(int(v))
+        )
         conc_card.hBoxLayout.addWidget(self.conc_spin)
         conc_card.hBoxLayout.addSpacing(SP_GROUP)
         cards.append(conc_card)
@@ -1314,7 +1402,14 @@ class SettingsPage(TransparentScrollArea):
             parent=self,
         )
         self._update_worker.manifestReady.connect(self._on_manifest)
+        self._update_worker.manifestError.connect(self._on_manifest_error)
         self._update_worker.start()
+
+    def _on_manifest_error(self, error):
+        """Проверка не удалась (сеть/таймаут) — не «нет обновлений»."""
+        self._update_manifest = None
+        if not self._update_silent:
+            self.show_update_info(f"Не удалось проверить обновления: {error}")
 
     def _on_manifest(self, manifest):
         self._update_manifest = manifest
@@ -1450,6 +1545,10 @@ class MainWindow(FluentWindow):
         self.settings_page.themeChanged.connect(self._apply_theme)
         # Смена папки в настройках — синхронизировать поле на «Загрузке»
         self.settings_page.folderChanged.connect(self._on_default_folder_changed)
+        # Число одновременных загрузок применяется к живому менеджеру сразу
+        self.settings_page.maxConcurrentChanged.connect(
+            self.manager.set_max_concurrent
+        )
 
         # Запись завершённых загрузок в историю
         self.bridge.itemChanged.connect(self._on_item_finished)
@@ -1486,7 +1585,6 @@ class MainWindow(FluentWindow):
         pages = {
             "download": self.download_page,
             "library": self.library_page,
-            "library": self.library_page,
             "settings": self.settings_page,
         }
         widget = pages.get(route_key)
@@ -1516,33 +1614,50 @@ class MainWindow(FluentWindow):
         """Сохранить завершённую загрузку в историю (для Библиотеки)."""
         if item.status != STATUS_COMPLETED or not item.files:
             return
-        path = item.files[0]
-        if not os.path.isfile(path):
-            return
-        config.add_history(self.settings, {
-            "url": item.url,
-            "source": source_from_url(item.url),
-            "title": item.title or os.path.basename(path),
-            "quality": item.quality if item.quality != "best" else "Лучшее",
-            "duration": item.duration,
-            "mode": item.mode,
-            "thumbnail": item.thumbnail,
-            "path": path,
-        })
+        # Плейлист: раньше в историю попадал только первый файл (BUG-14) —
+        # остальные видео терялись из Библиотеки. Пишем каждый скачанный файл.
+        for path in item.files:
+            if not os.path.isfile(path):
+                continue
+            config.add_history(self.settings, {
+                "url": item.url,
+                "source": source_from_url(item.url),
+                "title": item.title or os.path.basename(path),
+                "quality": item.quality if item.quality != "best" else "Лучшее",
+                "duration": item.duration,
+                "mode": item.mode,
+                "thumbnail": item.thumbnail,
+                "path": path,
+            })
         config.save(self.settings)
 
     # ---------- завершение ----------
 
     def closeEvent(self, event):
-        # Остановить фоновые QThread'ы страницы ДО выхода — иначе крах
+        # Остановить фоновые QThread'ы ДО выхода — иначе крах
+        # «QThread destroyed while thread is still running».
+        # Сначала politely: cancel() у воркеров с отменой, затем wait().
+        threads = []
         for attr in ("_analyze_worker", "_thumb_worker"):
             thread = getattr(self.download_page, attr, None)
             if thread is not None:
-                try:
-                    thread.quit()
-                    thread.wait(2000)
-                except Exception:
-                    pass
+                threads.append(thread)
+        update_worker = getattr(self.settings_page, "_update_worker", None)
+        if update_worker is not None:
+            update_worker.cancel()          # тихая остановка проверок/скачивания
+            threads.append(update_worker)
+        for thread in threads:
+            try:
+                thread.quit()
+                thread.wait(2000)
+            except Exception:
+                pass
+        # Миниатюры Библиотеки: воркеры парентятся к странице и живут
+        # дольше карточек — останавливаем их явно
+        try:
+            self.library_page.stop_workers()
+        except Exception:
+            pass
         self.settings["window_geometry"] = (
             f"{self.width()}x{self.height()}"
         )

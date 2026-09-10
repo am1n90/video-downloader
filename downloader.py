@@ -137,22 +137,42 @@ class DownloadItem:
 
         self._cancel = threading.Event()
         self._pause = threading.Event()
+        # Намерение пользователя (последнее действие побеждает):
+        #   pause  -> _pause + _cancel,     _cancel_intent=False
+        #   resume -> _resume_requested,    _pause сброшен
+        #   cancel -> _cancel,              _cancel_intent=True
+        # Нужно, чтобы «Пауза → сразу Отмена» завершала задачу (ERROR),
+        # а не оставляла PAUSED.
+        self._thread = None
+        self._resume_requested = False
+        self._cancel_intent = False
 
     @property
     def label(self):
         return self.title or self.url
 
     def request_pause(self):
-        if self.status in (STATUS_DOWNLOADING, STATUS_QUEUED):
+        # Пауза доступна на всех активных фазах, включая анализ: в ANALYZING
+        # _cancel прервёт extract_info по первому progress-хуку, как только
+        # начнётся фаза скачивания (см. _run_item / _progress_hook).
+        if self.status in (STATUS_QUEUED, STATUS_ANALYZING, STATUS_DOWNLOADING):
             self._pause.set()
             self._cancel.set()
+            # отложенный resume и намерение отмены снимаются: актуальна пауза
+            self._resume_requested = False
+            self._cancel_intent = False
 
     def request_resume(self):
+        # Не сбрасываем _cancel и не меняем статус здесь: если рабочий поток
+        # ещё жив, это сделает планировщик после его фактического завершения
+        # (иначе два потока качали бы один файл — гонка pause→resume).
+        self._resume_requested = True
         self._pause.clear()
-        self._cancel.clear()
+        self._cancel_intent = False
 
     def request_cancel(self):
         self._cancel.set()
+        self._cancel_intent = True
 
 
 class DownloadCancelled(Exception):
@@ -193,29 +213,57 @@ class DownloadManager:
     def pause(self, item_id):
         with self._lock:
             item = self.items.get(item_id)
-        if item:
-            item.request_pause()
-            self._notify(item)
+        if item is None:
+            return
+        item.request_pause()
+        # Задача в очереди (потока ещё нет) — сразу честная пауза
+        if item.status == STATUS_QUEUED:
+            item.status = STATUS_PAUSED
+        self._notify(item)
+        self._notify_queue()
 
     def resume(self, item_id):
         with self._lock:
             item = self.items.get(item_id)
-        if item:
-            item.request_resume()
-            item.status = STATUS_QUEUED
+        if item is None:
+            return
+        item.request_resume()
+        # Перезапуск возможен, только если рабочий поток уже мёртв; в противном
+        # случае _resume_requested подхватит finally-ветка _run_item или
+        # планировщик после завершения потока (отложенный resume).
+        thread = item._thread
+        if thread is None or not thread.is_alive():
+            self._restart_item(item)
+        else:
             self._notify(item)
-            self._wake.set()
+        self._wake.set()
+
+    def _restart_item(self, item):
+        """Сбросить события и вернуть задачу в очередь (поток мёртв)."""
+        item._cancel.clear()
+        item._pause.clear()
+        item._resume_requested = False
+        item._cancel_intent = False
+        item.status = STATUS_QUEUED
+        self._notify(item)
 
     def cancel(self, item_id):
         with self._lock:
             item = self.items.get(item_id)
-        if item:
-            item.request_cancel()
-            if item.status == STATUS_QUEUED:
+        if item is None:
+            return
+        item.request_cancel()
+        # Если рабочего потока нет — завершаем сразу. Мёртвый поток всегда
+        # оставляет финальный статус, поэтому перезатираем только QUEUED/PAUSED
+        # (иначе можно было бы затереть COMPLETED в момент завершения).
+        thread = item._thread
+        if thread is None or not thread.is_alive():
+            if item.status in (STATUS_QUEUED, STATUS_PAUSED):
                 item.status = STATUS_ERROR
                 item.error = "Отменено"
                 self._notify(item)
                 self._notify_queue()
+                self._wake.set()
 
     def remove(self, item_id):
         with self._lock:
@@ -228,6 +276,7 @@ class DownloadManager:
                 if item_id in self.order:
                     self.order.remove(item_id)
         self._notify_queue()
+        self._wake.set()
 
     def set_max_concurrent(self, value):
         self.max_concurrent = max(1, int(value))
@@ -237,7 +286,7 @@ class DownloadManager:
         with self._lock:
             return sum(
                 1 for i in self.items.values()
-                if i.status in ACTIVE_STATUSES or i._pause.is_set()
+                if i.status in ACTIVE_STATUSES
             )
 
     # ---------- внутреннее ----------
@@ -269,9 +318,25 @@ class DownloadManager:
             self._wake.clear()
 
             with self._lock:
+                # Отложенный resume: пользователь нажал «Продолжить», пока
+                # поток ещё разматывался. Поток умер → задача в очередь.
+                # (Проверка is_alive() исключает второй поток у задачи.)
+                for iid in list(self.order):
+                    item = self.items.get(iid)
+                    if (
+                        item is not None
+                        and item._resume_requested
+                        and item.status == STATUS_PAUSED
+                        and (item._thread is None
+                             or not item._thread.is_alive())
+                    ):
+                        self._restart_item(item)
+
+                # Пауза не занимает слот параллельности (BUG-2): активны
+                # только реально работающие задачи.
                 active = sum(
                     1 for i in self.items.values()
-                    if i.status in ACTIVE_STATUSES or i._pause.is_set()
+                    if i.status in ACTIVE_STATUSES
                 )
                 startable = [
                     self.items[iid] for iid in self.order
@@ -285,6 +350,7 @@ class DownloadManager:
                 thread = threading.Thread(
                     target=self._run_item, args=(item,), daemon=True
                 )
+                item._thread = thread
                 thread.start()
 
     def start(self):
@@ -361,12 +427,9 @@ class DownloadManager:
                 if not item.thumbnail:
                     item.thumbnail = info.get("thumbnail")
 
-                if item._cancel.is_set() and item._pause.is_set():
-                    item.status = STATUS_PAUSED
-                    self._notify(item)
-                    self._wake.set()
-                    return
-
+                # extract_info вернулся — файл скачан полностью; даже если
+                # пауза пришла в последний момент, задача завершена (при
+                # возобновлении yt-dlp и так увидел бы готовый файл).
                 item.status = STATUS_PROCESSING
                 self._notify(item)
 
@@ -386,11 +449,14 @@ class DownloadManager:
                 item.status = STATUS_COMPLETED
                 self._notify(item)
         except DownloadCancelled:
-            if item._pause.is_set():
-                item.status = STATUS_PAUSED
-            else:
+            # Намерение пользователя (последнее действие побеждает):
+            #   пауза → PAUSED (планировщик вернёт в очередь при resume),
+            #   отмена → ERROR «Отменено».
+            if item._cancel_intent:
                 item.status = STATUS_ERROR
                 item.error = "Отменено"
+            else:
+                item.status = STATUS_PAUSED
             self._notify(item)
         except Exception as exc:
             item.status = STATUS_ERROR

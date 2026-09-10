@@ -17,8 +17,6 @@ import sys
 import threading
 import urllib.request
 
-import config
-
 MANIFEST_TIMEOUT = 5   # секунд
 DOWNLOAD_TIMEOUT = 30   # секунд на чанк
 
@@ -27,8 +25,23 @@ def _is_frozen():
     return getattr(sys, "frozen", False)
 
 
+class ManifestError(Exception):
+    """Ошибка сети при получении манифеста (офлайн, таймаут, битый JSON).
+
+    Отдельный тип позволяет GUI отличать «проверить не вышло» от
+    «проверено: обновлений нет».
+    """
+
+
 def fetch_manifest(url):
-    """Скачать и распарсить latest.json. Оффлайн/любая ошибка → None."""
+    """Скачать и распарсить latest.json.
+
+    Возвращает dict или None (манифест корректен, обновлений нет).
+    Ошибки сети/формата: raise ManifestError — вызывающий код может
+    сообщить пользователю «не удалось проверить», а не «нет обновлений».
+    """
+    if not url:
+        raise ManifestError("не задан URL манифеста")
     try:
         request = urllib.request.Request(
             url, headers={"User-Agent": "VideoDownloader-Updater"}
@@ -37,12 +50,14 @@ def fetch_manifest(url):
             data = resp.read()
         manifest = json.loads(data.decode("utf-8"))
         if not isinstance(manifest, dict):
-            return None
+            raise ManifestError("манифест повреждён (не dict)")
         if not all(k in manifest for k in ("version", "url")):
-            return None
+            raise ManifestError("манифест без version/url")
         return manifest
-    except Exception:
-        return None
+    except ManifestError:
+        raise
+    except Exception as exc:
+        raise ManifestError(str(exc)) from exc
 
 
 def is_newer(remote, local):
