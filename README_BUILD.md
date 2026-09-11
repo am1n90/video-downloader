@@ -64,18 +64,20 @@ build.bat
 
 Скрипт (в корне проекта):
 1. создаёт изолированный `build-venv` и ставит `requirements.txt` + `requirements-dev.txt` (pyinstaller);
-2. запускает PyInstaller: `--onedir --noconsole --collect-all qfluentwidgets --collect-all yt_dlp`;
+2. запускает PyInstaller: `--onedir --noconsole --collect-all qfluentwidgets --collect-all yt_dlp --collect-all yt_dlp_ejs`;
 3. скачивает ffmpeg (BtbN win64-gpl, кэшируется в `build-ffmpeg-cache\`) и кладёт `ffmpeg.exe`/`ffprobe.exe` в `dist\VideoDownloader\`;
-4. **тестово запускает** собранный exe (10 сек) — при провале сборка останавливается;
-5. вызывает `ISCC.exe installer.iss`.
+4. скачивает Deno (JS-рантайм для yt-dlp; фиксированная версия, официальные sha256, кэш в `build-deno-cache\`) и кладёт `deno.exe` в `dist\VideoDownloader\` рядом с exe;
+5. **тестово запускает** собранный exe (авто-выход через 8 с) — при провале сборка останавливается;
+6. вызывает `ISCC.exe installer.iss`.
 
-Результат: **`Output\VideoDownloader-Setup-1.0.0.exe`**.
+Результат: **`Output\VideoDownloader-Setup-<APP_VERSION>.exe`** (версия читается из `config.py`).
 
-## Как работает собранное приложение
+### Как работает собранное приложение
 
 - Установка **per-user** в `%LOCALAPPDATA%\Programs\VideoDownloader` — без UAC, папка доступна для записи.
 - `ffmpeg.exe`/`ffprobe.exe` лежат рядом с exe; yt-dlp находит их через `ffmpeg_location` (системный PATH не трогается).
-- Настройки и история: `%LOCALAPPDATA%\VideoDownloader\settings.json` — выживают при обновлении установки.
+- `deno.exe` лежит рядом с exe; yt-dlp находит его сам (при frozen поиск JS-рантайма начинается с папки exe). Пара `yt-dlp`/`yt-dlp-ejs` в `requirements.txt` пинена и обновляется только вместе (версия ejs — из METADATA нового yt-dlp).
+- Настройки и история: `%LOCALAPPDATA%\VideoDownloader\settings.json` — выживают при обновлении установки; запись атомарная (tmp+fsync+replace), повреждённый файл сохраняется как `settings.json.corrupt-<дата>`, события целостности — в `app.log` рядом; предупреждения yt-dlp — в `yt-dlp.log` рядом.
 - Обновление: запустить новый установщик поверх старого (AppId фиксированный, Inno Setup предложит удалить старую версию; данные останутся).
 
 ## Проверка после сборки

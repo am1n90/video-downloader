@@ -12,6 +12,8 @@ import uuid
 
 from yt_dlp import YoutubeDL
 
+from config import get_logger
+
 STATUS_QUEUED = "queued"
 STATUS_ANALYZING = "analyzing"
 STATUS_DOWNLOADING = "downloading"
@@ -45,9 +47,12 @@ def fmt_eta(value):
 
 def fetch_info(url, playlist=False):
     """Информация о ссылке без скачивания (для превью и валидации)."""
+    # Предупреждения yt-dlp (в т.ч. о JS-рантайме) — не подавляются и не
+    # попадают в GUI, а пишутся в yt-dlp.log через единый config.get_logger.
+    # Ошибки для GUI не меняются: исключения идут прежним путём.
     options = {
         "quiet": True,
-        "no_warnings": True,
+        "logger": get_logger("vdl.ytdlp", "yt-dlp.log"),
         "extract_flat": "in_playlist",
         "noplaylist": not playlist,
     }
@@ -394,7 +399,9 @@ class DownloadManager:
             "noplaylist": not item.playlist,
             "progress_hooks": [self._progress_hook(item)],
             "quiet": True,
-            "no_warnings": True,
+            # Предупреждения yt-dlp — в yt-dlp.log (не подавляются и не
+            # попадают в GUI); ошибки для GUI — прежним путём (исключения).
+            "logger": get_logger("vdl.ytdlp", "yt-dlp.log"),
             "noprogress": True,
             "continuedl": True,   # докачка .part — основa паузы/возобновления
         }

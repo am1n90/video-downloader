@@ -5,7 +5,7 @@ REM
 REM  Требования:
 REM    - Python 3.10+ в PATH (для создания venv)
 REM    - Inno Setup 6 (ISCC.exe) в стандартном расположении
-REM    - Доступ в сеть (pip + скачивание ffmpeg)
+REM    - Доступ в сеть (pip-пакеты, ffmpeg ~80 МБ, deno ~40 МБ)
 REM
 REM  Результат:
 REM    Output\VideoDownloader-Setup-1.0.0.exe
@@ -13,17 +13,17 @@ REM ============================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-echo [1/6] Создание изолированного venv для сборки...
+echo [1/7] Создание изолированного venv для сборки...
 if exist "build-venv" rmdir /s /q "build-venv"
 python -m venv build-venv || goto :fail
 call "build-venv\Scripts\activate.bat" || goto :fail
 
-echo [2/6] Установка зависимостей...
+echo [2/7] Установка зависимостей...
 python -m pip install --upgrade pip || goto :fail
 pip install -r requirements.txt || goto :fail
 pip install -r requirements-dev.txt || goto :fail
 
-echo [3/6] PyInstaller: сборка dist\VideoDownloader...
+echo [3/7] PyInstaller: сборка dist\VideoDownloader...
 if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
 if exist "VideoDownloader.spec" del /q "VideoDownloader.spec"
@@ -31,13 +31,14 @@ pyinstaller --noconsole --onedir --name VideoDownloader ^
   --icon assets\app.ico ^
   --collect-all qfluentwidgets ^
   --collect-all yt_dlp ^
+  --collect-all yt_dlp_ejs ^
   main.py || goto :fail
 if not exist "dist\VideoDownloader\VideoDownloader.exe" (
   echo FAIL: dist\VideoDownloader\VideoDownloader.exe не создан
   goto :fail
 )
 
-echo [4/6] Скачивание ffmpeg (BtbN win64-gpl)...
+echo [4/7] Скачивание ffmpeg (BtbN win64-gpl)...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_ffmpeg.ps1" || goto :fail
 if not exist "dist\VideoDownloader\ffmpeg.exe" (
   echo FAIL: ffmpeg.exe не на месте после загрузки
@@ -48,7 +49,14 @@ if not exist "dist\VideoDownloader\ffprobe.exe" (
   goto :fail
 )
 
-echo [5/6] Тестовый запуск собранного exe (-selftest: авто-выход через 8с)...
+echo [5/7] Скачивание Deno v2.9.6 (JS-рантайм для yt-dlp)...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_deno.ps1" || goto :fail
+if not exist "dist\VideoDownloader\deno.exe" (
+  echo FAIL: deno.exe не на месте после загрузки
+  goto :fail
+)
+
+echo [6/7] Тестовый запуск собранного exe (-selftest: авто-выход через 8с)...
 set QT_QPA_PLATFORM=windows
 "dist\VideoDownloader\VideoDownloader.exe" -selftest
 if errorlevel 1 (
@@ -57,7 +65,7 @@ if errorlevel 1 (
 )
 echo OK: exe запустился и завершился сам (selftest)
 
-echo [6/6] Inno Setup: сборка установщика...
+echo [7/7] Inno Setup: сборка установщика...
 set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC%" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
 if not exist "%ISCC%" set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"

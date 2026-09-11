@@ -19,6 +19,14 @@ Output/
 ffmpeg*.exe
 ffprobe*.exe
 
+# Бинарник deno и кэш его сборки (не в репозитории)
+deno.exe
+build-deno-cache/
+
+# Резервные копии пользовательских данных (не в репозитории)
+settings.json.bak-*
+settings.json.corrupt-*
+
 # Прочее
 *.log
 *.tmp
