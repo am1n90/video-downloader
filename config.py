@@ -10,7 +10,7 @@ import time
 
 # Единый источник версии приложения (build.bat подставляет её в installer.iss
 # и в Output\latest.json). Bump версии = правка этой строки.
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 # Репозиторий релизов (GitHub Releases)
 REPO = "am1n90/video-downloader"
@@ -214,7 +214,35 @@ def load():
                          "создана: сохранение отключено до перезапуска")
             return settings
         settings.update({k: v for k, v in data.items() if k in DEFAULTS})
+        # 1.0.3: у истории могла накопиться одна запись на путь (до 1.0.3
+        # add_history не проверял существующие пути). Дедуплицируем при
+        # загрузке: остаётся первая запись каждого пути — она самая новая
+        # (add_history всегда вставляет в начало). Некорректные записи
+        # (не dict / без path) не трогаем — их фильтрует get_history().
+        settings["history"] = _dedup_history(settings.get("history"))
         return settings
+
+
+def _dedup_history(history):
+    """Одна запись истории на путь (остаётся самая новая — первая).
+
+    Новая запись всегда в начале списка (add_history -> insert(0)), поэтому
+    при обходе с начала первая встречная запись пути и есть самая новая.
+    Сравнение путей — как во всём коде: os.path.normcase (Windows не
+    различает регистр). Записи без path не дедуплицируются.
+    """
+    if not isinstance(history, list):
+        return history
+    seen = set()
+    result = []
+    for entry in history:
+        if isinstance(entry, dict) and entry.get("path"):
+            key = os.path.normcase(entry["path"])
+            if key in seen:
+                continue
+            seen.add(key)
+        result.append(entry)
+    return result
 
 
 def save(settings):
@@ -277,11 +305,48 @@ def add_history(settings, entry):
     """Добавить завершённую загрузку в историю (в начало).
 
     entry: {url, source, title, quality, duration, path, mode}
+    Один файл = одна запись: если путь уже есть в истории, старая запись
+    удаляется — новая встаёт в начало (замена, не дубль). До 1.0.3 путь не
+    проверялся и повторная загрузка того же файла дублировала запись.
     """
     with _lock:
         history = list(settings.get("history", []))
+        path = entry.get("path") if isinstance(entry, dict) else None
+        if path:
+            key = os.path.normcase(path)
+            history = [e for e in history
+                        if not (isinstance(e, dict) and e.get("path")
+                                and os.path.normcase(e["path"]) == key)]
         history.insert(0, entry)
         settings["history"] = history[:200]  # максимум 200 записей
+
+
+def remove_history(settings, paths):
+    """Убрать из истории записи с указанными путями (1.0.3, Библиотека).
+
+    paths — исходные пути записей; сравнение через os.path.normcase,
+    как в add_history. Записи без path не трогаются. Возвращает число
+    удалённых записей. Файлы на диске не затрагиваются — их удаляет
+    вызывающий код (gui) по отдельному подтверждению пользователя.
+    """
+    keys = {os.path.normcase(p) for p in paths if p}
+    removed = 0
+    with _lock:
+        kept = []
+        for e in settings.get("history", []):
+            if (isinstance(e, dict) and e.get("path")
+                    and os.path.normcase(e["path"]) in keys):
+                removed += 1
+            else:
+                kept.append(e)
+        settings["history"] = kept
+    return removed
+
+
+def clear_history(settings):
+    """Очистить историю целиком (только записи; файлы не трогаются)."""
+    with _lock:
+        settings["history"] = []
 
 
 def get_history(settings):

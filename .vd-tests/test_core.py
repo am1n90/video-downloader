@@ -115,6 +115,54 @@ try:
     h = config.get_history(s3)
     check("get_history: только существующие файлы",
           len(h) == 1 and h[0]["title"] == "204", f"len={len(h)}, first={h[0]['title'] if h else None}")
+
+    # --- 1.0.3: дедуп истории (один путь = одна запись) ---
+    sd = dict(config.DEFAULTS)
+    pa = os.path.join(tmpd, "same.mp4")
+    config.add_history(sd, {"path": pa, "title": "старая"})
+    config.add_history(sd, {"path": os.path.join(tmpd, "other.mp4"), "title": "другой"})
+    config.add_history(sd, {"path": pa, "title": "новая"})
+    check("add_history: дедуп — тот же путь не дублируется",
+          len(sd["history"]) == 2 and sd["history"][0]["title"] == "новая",
+          f"len={len(sd['history'])}, first={sd['history'][0]['title'] if sd['history'] else None}")
+    config.add_history(sd, {"path": os.path.join(tmpd, "SAME.MP4"), "title": "регистр"})
+    check("add_history: путь без учёта регистра (normcase, Windows)",
+          len(sd["history"]) == 2 and sd["history"][0]["title"] == "регистр",
+          f"len={len(sd['history'])}, first={sd['history'][0]['title'] if sd['history'] else None}")
+
+    # дедуп при загрузке: 9 записей на 5 путей (сценарий владельца) -> 5,
+    # остаются самые новые (первая встречная запись пути — insert(0) держит
+    # новые сверху)
+    dup = {"theme": "dark", "history": [
+        {"path": os.path.join(tmpd, "a.mp4"), "title": "a1"},  # a: самая новая
+        {"path": os.path.join(tmpd, "b.mp4"), "title": "b1"},  # b: самая новая
+        {"path": os.path.join(tmpd, "a.mp4"), "title": "a2"},  # дубль a, старее
+        {"path": os.path.join(tmpd, "c.mp4"), "title": "c1"},
+        {"path": os.path.join(tmpd, "b.mp4"), "title": "b2"},   # дубль b, старее
+        {"path": os.path.join(tmpd, "d.mp4"), "title": "d1"},
+        {"path": os.path.join(tmpd, "c.mp4"), "title": "c2"},   # дубль c, старее
+        {"path": os.path.join(tmpd, "e.mp4"), "title": "e1"},
+        {"path": os.path.join(tmpd, "e.mp4"), "title": "e2"},   # дубль e, старее
+    ]}
+    open(tmp_settings, "w", encoding="utf-8").write(json.dumps(dup))
+    sl = config.load()
+    titles = [e["title"] for e in sl["history"]]
+    check("load(): 9 записей на 5 путей -> 5, остаются самые новые",
+          len(sl["history"]) == 5 and titles == ["a1", "b1", "c1", "d1", "e1"],
+          f"titles={titles}")
+
+    # remove_history / clear_history (1.0.3, Библиотека)
+    sr = dict(config.DEFAULTS)
+    p1 = os.path.join(tmpd, "r1.mp4")
+    p2 = os.path.join(tmpd, "r2.mp4")
+    config.add_history(sr, {"path": p1, "title": "r1"})
+    config.add_history(sr, {"path": p2, "title": "r2"})
+    removed = config.remove_history(sr, [p1.upper()])   # регистр не важен
+    check("remove_history: убирает по пути (без учёта регистра)",
+          removed == 1 and len(sr["history"]) == 1 and sr["history"][0]["title"] == "r2",
+          f"removed={removed}, len={len(sr['history'])}")
+    config.clear_history(sr)
+    check("clear_history: список пуст", sr["history"] == [])
 finally:
     config.CONFIG_PATH = old_path
 

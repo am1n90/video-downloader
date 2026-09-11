@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 
 from qfluentwidgets import (
     BodyLabel,
+    CaptionLabel,
     CardWidget,
     CheckBox,
     ComboBox,
@@ -41,6 +42,7 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     LineEdit,
+    MessageBoxBase,
     PrimaryPushButton,
     ProgressBar,
     PushButton,
@@ -51,6 +53,7 @@ from qfluentwidgets import (
     SettingCardGroup,
     SpinBox,
     StrongBodyLabel,
+    SubtitleLabel,
     Theme,
     TitleLabel,
     FluentWindow,
@@ -106,8 +109,6 @@ SP_WINDOW = 24   # 24px паддинг окна (6 × 4px сетка)
 SP_BLOCK = 16    # 16px между блоками
 SP_GROUP = 8     # 8px внутри групп
 
-MEDIA_EXTS = {".mp4", ".mkv", ".webm", ".mp3", ".m4a"}
-
 
 def fmt_duration(seconds):
     if not seconds:
@@ -117,6 +118,15 @@ def fmt_duration(seconds):
     if hours:
         return f"{hours}:{minutes:02d}:{sec:02d}"
     return f"{minutes}:{sec:02d}"
+
+
+def ru_records(n):
+    """Форма слова для счётчика: 1 запись / 2 записи / 5 записей."""
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} запись"
+    if 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+        return f"{n} записи"
+    return f"{n} записей"
 
 
 # ================= МОСТ: фоновые потоки → GUI =================
@@ -911,6 +921,14 @@ class LibraryRow(CardWidget):
                                SP_GROUP * 2, SP_GROUP * 2)
         lay.setSpacing(SP_GROUP * 2)
 
+        # 1.0.3: выбор записи для удаления (кнопка «Удалить» на панели).
+        # Колбэк на страницу: LibraryRow не знает про выбор других строк.
+        self.select_check = CheckBox(self)
+        self.select_check.stateChanged.connect(
+            lambda: page._on_selection_changed() if page else None
+        )
+        lay.addWidget(self.select_check)
+
         # Миниатюра (фрагмент видео) слева. Воркер парентится к СТРАНИЦЕ,
         # а не к карточке: refresh() удаляет карточки deleteLater'ом, и
         # живой QThread, привязанный к карточке, крашил бы приложение
@@ -994,6 +1012,46 @@ class LibraryRow(CardWidget):
                 QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
 
+# ================= ДИАЛОГ ПОДТВЕРЖДЕНИЯ УДАЛЕНИЯ =================
+
+
+class ConfirmDeleteDialog(MessageBoxBase):
+    """«Удалить N записей?» с галочкой «Удалить также файлы с диска».
+
+    Галочка по умолчанию выключена (удаляем только из Библиотеки).
+    С галочкой файлы удаляются навсегда (os.remove), не в Корзину —
+    поэтому под галочкой предупреждение. exec() возвращает True при
+    подтверждении, выбранное состояние — в атрибуте delete_files.
+    """
+
+    def __init__(self, count, parent=None):
+        super().__init__(parent)
+        self.delete_files = False
+
+        self.viewLayout.addWidget(SubtitleLabel(
+            f"Удалить {ru_records(count)}?", self))
+        self.viewLayout.addWidget(BodyLabel(
+            "Записи будут убраны из Библиотеки.", self))
+        self.files_check = CheckBox("Удалить также файлы с диска", self)
+        self.files_check.setChecked(False)
+        self.files_check.stateChanged.connect(
+            lambda: self._on_files_check())
+        self.viewLayout.addWidget(self.files_check)
+        self.warn_label = CaptionLabel("Файлы будут удалены навсегда", self)
+        self.warn_label.setVisible(False)
+        self.viewLayout.addWidget(self.warn_label)
+
+        self.yesButton.setText("Удалить")
+        self.cancelButton.setText("Отмена")
+
+    def _on_files_check(self):
+        self.delete_files = self.files_check.isChecked()
+        self.warn_label.setVisible(self.delete_files)
+
+
+# ================= СТРАНИЦА: БИБЛИОТЕКА =================
+
+
 class LibraryPage(TransparentScrollArea):
     def __init__(self, bridge, manager, settings, parent=None):
         super().__init__(parent)
@@ -1028,6 +1086,21 @@ class LibraryPage(TransparentScrollArea):
         self.source_filter.currentIndexChanged.connect(lambda: self.refresh())
         filters.addWidget(self.source_filter)
 
+        # 1.0.3: управление записями — удаление выбранных и очистка списка.
+        # «Удалить» активна при выбранной записи, «Очистить данные
+        # библиотеки» — при непустой истории (обновляется в refresh()).
+        self.delete_btn = PushButton("Удалить", self)
+        self.delete_btn.setIcon(FIF.DELETE)
+        self.delete_btn.setEnabled(False)
+        self.delete_btn.clicked.connect(self._delete_selected)
+        filters.addWidget(self.delete_btn)
+
+        self.clear_btn = PushButton("Очистить данные библиотеки", self)
+        self.clear_btn.setIcon(FIF.BROOM)
+        self.clear_btn.setEnabled(False)
+        self.clear_btn.clicked.connect(self._clear_library_data)
+        filters.addWidget(self.clear_btn)
+
         self.vbox.addLayout(filters)
 
         self.empty_label = BodyLabel("Здесь появятся завершённые загрузки")
@@ -1048,39 +1121,112 @@ class LibraryPage(TransparentScrollArea):
         self.setWidget(inner)
 
     def _entries(self):
-        """История + файлы из папки, которых нет в истории."""
+        """Записи истории (только они: чужие файлы из папки загрузок
+        не показываем — 1.0.3). get_history() оставляет только
+        существующие на диске файлы, дубли путей исключены
+        (дедуп в config.load/add_history).
+        """
         import config as cfg
+        return list(cfg.get_history(self.settings))
 
-        entries = []
-        seen_paths = set()
+    # ---------- 1.0.3: выбор, удаление записей, очистка списка ----------
 
-        for e in cfg.get_history(self.settings):
-            entries.append(e)
-            seen_paths.add(os.path.normcase(e.get("path", "")))
+    def _selected_rows(self):
+        """Выбранные строки (в порядке отображения)."""
+        rows = []
+        for i in range(self.rows_vbox.count()):
+            item = self.rows_vbox.itemAt(i)
+            widget = item.widget() if item else None
+            if isinstance(widget, LibraryRow) and widget.select_check.isChecked():
+                rows.append(widget)
+        return rows
 
-        folder = self.settings.get("default_folder")
-        if folder and os.path.isdir(folder):
-            try:
-                names = os.listdir(folder)
-            except OSError:
-                names = []
-            for name in sorted(names):
-                path = os.path.join(folder, name)
-                if not os.path.isfile(path):
+    def _on_selection_changed(self):
+        """Чекбокс строки переключён — пересчитать «Удалить»."""
+        self.delete_btn.setEnabled(bool(self._selected_rows()))
+
+    def _confirm_delete(self, count):
+        """Подтверждение удаления (вынесено отдельно для тестируемости).
+
+        Возвращает (ok, delete_files): ok — подтверждено; delete_files —
+        стоит ли удалять файлы с диска (галочка, по умолчанию выключена).
+        """
+        dialog = ConfirmDeleteDialog(count, self.window())
+        ok = bool(dialog.exec())
+        return ok, (dialog.delete_files if ok else False)
+
+    def _delete_selected(self):
+        """Удалить выбранные записи из Библиотеки (по подтверждению).
+
+        Без галочки — только записи. С галочкой — файлы удаляются навсегда
+        (os.remove ровно по пути записи; папки, маски и соседние файлы
+        вроде .part не затрагиваются). Не удалившийся файл (занят, нет
+        прав) остаётся в Библиотеке, его имя — в InfoBar; файла уже нет на
+        диске — не ошибка, запись удаляется.
+        """
+        rows = self._selected_rows()
+        if not rows:
+            return
+        ok, delete_files = self._confirm_delete(len(rows))
+        if not ok:
+            return
+
+        failed = []           # файлы, которые не удалось удалить с диска
+        paths_to_remove = []  # записи, уходящие из Библиотеки
+
+        for row in rows:
+            path = row.entry.get("path") or ""
+            if delete_files and path and os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    failed.append(os.path.basename(path))
                     continue
-                if os.path.splitext(name)[1].lower() not in MEDIA_EXTS:
-                    continue
-                if os.path.normcase(path) in seen_paths:
-                    continue
-                ext = os.path.splitext(name)[1].upper().lstrip(".")
-                entries.append({
-                    "path": path,
-                    "title": os.path.splitext(name)[0],
-                    "format": ext,
-                    "source": "Папка загрузок",
-                })
+            paths_to_remove.append(path)
 
-        return entries
+        config.remove_history(self.settings, paths_to_remove)
+        config.save(self.settings)
+        self.refresh()
+
+        if failed:
+            self._notify("warning", "Не удалены файлы: " + ", ".join(failed))
+        elif paths_to_remove:
+            self._notify("success",
+                         "Удалено: " + ru_records(len(paths_to_remove)))
+
+    def _confirm_clear(self):
+        """Подтверждение очистки списка (отдельно для тестируемости)."""
+        from qfluentwidgets import MessageBox
+        box = MessageBox(
+            "Очистить данные библиотеки",
+            "Список загрузок будет очищен. Файлы на диске останутся.",
+            self.window(),
+        )
+        return bool(box.exec())
+
+    def _clear_library_data(self):
+        """Очистить список записей (файлы на диске не трогаются)."""
+        if not self.settings.get("history"):
+            return
+        if not self._confirm_clear():
+            return
+        config.clear_history(self.settings)
+        config.save(self.settings)
+        self.refresh()
+        self._notify("success", "Данные библиотеки очищены")
+
+    def _notify(self, kind, text):
+        """Итог операции в InfoBar (в offscreen-тестах подменяется)."""
+        bar = InfoBar.warning if kind == "warning" else InfoBar.success
+        bar(
+            title="Библиотека",
+            content=text,
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=-1 if kind == "warning" else 4000,
+            parent=self.window(),
+        )
 
     def refresh(self):
         # Очистить ТОЛЬКО строки в rows_vbox (постоянные элементы страницы
@@ -1134,6 +1280,11 @@ class LibraryPage(TransparentScrollArea):
         for e in rows:
             card = self._make_row(e)
             self.rows_vbox.addWidget(card)
+
+        # 1.0.3: строки пересозданы — выбор сброшен. «Удалить» неактивна
+        # без выбранных записей; очистка — при непустой истории.
+        self.delete_btn.setEnabled(False)
+        self.clear_btn.setEnabled(bool(self.settings.get("history")))
 
     def _make_row(self, entry):
         # Дополнить запись метаданными файла
