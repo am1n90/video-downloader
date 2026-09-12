@@ -33,7 +33,7 @@ except ImportError as e:
     print("   пакет yt-dlp-ejs: ОТСУТСТВУЕТ:", e)
 
 # deno.exe рядом с VideoDownloader.exe (yt-dlp ищет его там при frozen)
-exe_dir = os.path.dirname(os.path.dirname(APP))   # _internal -> папка exe
+exe_dir = os.path.dirname(APP)   # _internal -> папка exe (один уровень вверх)
 deno = os.path.join(exe_dir, "deno.exe")
 if os.path.isfile(deno):
     import subprocess

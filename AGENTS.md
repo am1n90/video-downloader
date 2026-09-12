@@ -8,37 +8,69 @@
 очередь с паузой/докачкой, библиотека, автообновление через GitHub Releases.
 Пользователь — владелец репозитория am1n90. Язык общения — русский.
 
-## Текущее состояние (11 сентября 2026, v1.0.3 — код, без сборки/релиза)
+## Текущее состояние (12 сентября 2026, v1.0.4 — код+тесты+сборка, релиз не публиковался)
 
-- Версия: **1.0.3** (APP_VERSION в config.py; сборка/релиз 1.0.3 —
-  отдельной задачей). Изменения против 1.0.2: Библиотека — дедуп истории
-  (add_history путь-замена + _dedup_history в load(), самоизлечение
-  settings.json), показ только истории (сканирование папки убрано),
-  удаление записей с галочкой «Удалить также файлы с диска» (os.remove
-  навсегда, только точный путь записи) и «Очистить данные библиотеки»
+- Версия: **1.0.4** (APP_VERSION в config.py). Изменения против 1.0.3:
+  TikTok починен — curl_cffi==0.16.0 в requirements.txt (impersonation
+  для yt-dlp, без него любая ссылка TikTok падает «Unexpected response
+  from webpage request»); повтор переходящих ошибок в downloader.py
+  (2 доп. попытки с паузой 2 с; постоянные ошибки — сразу; отмена/
+  пауза прерывают ожидание; успешный extract_info не повторяется;
+  дисковые ошибки без повторов; каждая попытка в yt-dlp.log,
+  финальная ошибка с числом попыток); build.bat --collect-all
+  curl_cffi + проверки бинарников в dist (_wrapper.pyd,
+  libcurl-impersonate dll)
+- **Сборка 1.0.4 выполнена 12.09.2026 (BUILD_EXIT=0)**:
+  Output\VideoDownloader-Setup-1.0.4.exe (180 856 514 байт) +
+  latest.json (sha256 7945c735…c062). Inno Setup 6.7.3 установлен
+  12.09 через winget per-user (без UAC; ISCC в %LOCALAPPDATA%\
+  Programs\Inno Setup 6 — ровно где ищет build.bat). Установлена
+  в %LOCALAPPDATA%\Programs\VideoDownloader (на этой машине раньше
+  не стояла; settings.json %LOCALAPPDATA%\VideoDownloader — девственно-
+  тестовый, backup не требовался). Проверки в установленной копии:
+  AC2 (curl_cffi 0.16.0 + бинарники _internal\curl_cffi.libs\
+  libcurl-impersonate*.dll), AC3 (TikTok ×2: анализ+видео 2.7 МБ+MP3
+  1.4 МБ+ffprobe audio-поток; .vd-tests\check_installed_tiktok.py),
+  AC8 (YouTube 4K 2160, ejs 0.8.0, deno 2.9.6; Instagram/VK анализ;
+  check_installed_yt.py — поправлен exe_dir, deno теперь виден).
+  Инцидент: первый запуск установщика из bash завис (CPU~0 после
+  самораспаковки; убит); повтор через PowerShell Start-Process
+  (install_vd.ps1 в %TEMP%, как updater.py) — SETUP_EXIT=0
 - Рабочая машина: домашний ноутбук (свежий клон, см. «Историю» 11.09):
   Python 3.14.5 в PATH, build-venv пересоздан, requirements.txt стоит
-  (PySide6 6.11.2, qfluentwidgets 1.11.3 — колёса под 3.14 есть);
-  Inno Setup 6 и gh CLI НЕ установлены (для сборки/релиза понадобятся:
+  (PySide6 6.11.2, qfluentwidgets 1.11.3, curl_cffi 0.16.0 — колёса
+  под 3.14 есть); Inno Setup 6 и gh CLI НЕ установлены (для сборки/релиза понадобятся:
   winget 1.29.290 / choco 2.7.2 доступны); GH_TOKEN не задан
 - Сборка 1.0.2: Output\VideoDownloader-Setup-1.0.2.exe (168 198 089
   байт) + latest.json (sha256 сходится) — на старой машине; релиз
   v1.0.2 опубликован 11.09.2026 (Latest), алиас latest отдаёт 1.0.2,
   тег v1.0.2 → 98b28e4; живой тест обновления 1.0.1→1.0.2 с GitHub
   выполнен 11.09, все проверки пройдены
-- Пины: yt-dlp==2026.8.19 + yt-dlp-ejs==0.8.0 (согласованная пара, версия
-  ejs — из METADATA yt-dlp). yt-dlp находит deno.exe рядом с exe (frozen:
-  _find_exe ищет с dirname(sys.executable), конфиг js_runtimes не нужен)
-- Предупреждения yt-dlp — в yt-dlp.log (logger в опциях; frozen
-  %LOCALAPPDATA%\VideoDownloader\, dev — корень проекта, покрыт *.log);
-  события целостности настроек — в app.log (единый config.get_logger)
-- Тесты: .vd-tests\ — core **38** (+5 dedup 1.0.3), manifest 4, library
-  (переписан под 1.0.3, 28 проверок), gui smoke, p1 concurrency,
-  config_robust 40, ytdlp_logger 8, e2e download, live fetch_info,
-  check_sources (проверка источников 12.09: analyze/download,
-  range-фрагменты, кадры; sources.local.txt — личное, в .gitignore) +
-  вспомогательные make_demo_data.py / live_demo_check.py (тестовые
-  данные Библиотеки и их авто-проверка). Запуск:
+- Пины: yt-dlp==2026.8.19 + yt-dlp-ejs==0.8.0 + curl_cffi==0.16.0.
+  Тройка согласована: ejs и curl_cffi обновлять ТОЛЬКО вместе с
+  yt-dlp, версии брать из METADATA нового yt-dlp (Requires-Dist:
+  yt-dlp-ejs==X; extra curl-cffi — допустимый диапазон, extra
+  pin-curl-cffi — рекомендованная точная версия; для 2026.8.19 это
+  curl-cffi>=0.5.10,<0.17, pin 0.16.0). curl_cffi 0.16.0 проверен
+  12.09 на реальных ссылках TikTok (анализ+скачивание+MP3; 0.16.3
+  тоже работал — выбран 0.16.0 как рекомендация yt-dlp). yt-dlp
+  находит deno.exe рядом с exe (frozen: _find_exe ищет с
+  dirname(sys.executable), конфиг js_runtimes не нужен);
+  curl_cffi несёт бинарники в пакете (_wrapper.pyd +
+  curl_cffi.libs\\libcurl-impersonate*.dll — build.bat проверяет
+  их наличие в dist)
+- Предупреждения yt-dlp и неудачные попытки повторов — в yt-dlp.log
+  (logger в опциях; frozen %LOCALAPPDATA%\VideoDownloader\, dev —
+  корень проекта, покрыт *.log); события целостности настроек — в app.log (единый config.get_logger)
+- Тесты: .vd-tests\ — core **38**, retry **42** (1.0.4: подмена
+  YoutubeDL; AC4/AC5/AC6 + счётчик попыток + записи в yt-dlp.log +
+  правки владельца: без повторного скачивания после успешного
+  extract_info, дисковые ошибки без повторов), manifest 4,
+  check_installed_tiktok (AC3 в установленной копии), library (28 проверок), gui smoke,
+  p1 concurrency, config_robust 40, ytdlp_logger 8, e2e download,
+  live fetch_info, check_sources (analyze/download, range-фрагменты,
+  кадры; sources.local.txt — личное, в .gitignore) + вспомогательные
+  make_demo_data.py / live_demo_check.py. Запуск:
   build-venv\Scripts\python.exe .vd-tests\<имя> с PYTHONIOENCODING=utf-8
   (GUI-тесты — с QT_QPA_PLATFORM=offscreen)
 - config (F1/F2/F3): load() никогда не бросает (ValueError=JSON+Unicode);
@@ -84,12 +116,15 @@
    без прогресса) — фрагменты надёжнее качать прямым форматом
    (url1080); download_ranges на прямом формате работает (30с
    фрагмент 1080p скачан, звук есть)
-5. **TikTok не работает в собранной программе**: yt-dlp 2026.8.19
-   требует curl_cffi (impersonation), его нет в requirements.txt.
-   Проверено 12.09.2026: без curl_cffi любая ссылка TikTok падает —
-   Unexpected response from webpage request. Нужно добавить в
-   requirements.txt, включить в сборку (PyInstaller) и проверить в
-   установленной копии
+5. ~~**TikTok не работает в собранной программе**~~ — **ВЫПОЛНЕНО
+   12.09.2026, v1.0.4**: curl_cffi ==0.16.0 в requirements.txt
+   (рекомендация yt-dlp из METADATA pin-curl-cffi; проверен 12.09 на
+   реальных ссылках TikTok), build.bat --collect-all curl_cffi +
+   ASCII-проверки бинарников (_wrapper.pyd, libcurl-impersonate*.dll)
+   в dist, повтор переходящих ошибок в downloader.py (см. «Историю»
+   12.09). **Сборка и проверка установленной копии тоже выполнены
+   12.09** (AC2/AC3/AC8 — см. «Текущее состояние»); осталось:
+   коммит/push/релиз v1.0.4
 6. **1.0.5 Галочка «Без водяного знака» и вход для Instagram** — по
    итогам проверки источников: вход оказался не нужен (публичный
    reel анализируется и скачивается без cookies), yt-dlp выбирает
@@ -124,13 +159,20 @@
   планировщик с _thread/_resume_requested/_cancel_intent (отложенный
   resume, is_alive-проверки, пауза не занимает слот), формат yt-dlp:
   видео `bestvideo+bestaudio/best` или `bestvideo[height<=N]+bestaudio/...`,
-  аудио → FFmpegExtractAudio MP3 192k; пауза/докачка через .part
+  аудио → FFmpegExtractAudio MP3 192k; пауза/докачка через .part;
+  повтор переходящих ошибок (1.0.4): RETRY_ATTEMPTS=3, пауза 2 с,
+  _is_retryable (RETRYABLE_MARKERS — сеть/5xx/извлечение; NO_RETRY_
+  MARKERS — удалено/приватно/нужен вход/диск и пр., слова с границами
+  \b), успешный extract_info не повторяется (_finish_item вне цикла),
+  каждая неудачная попытка — WARNING в yt-dlp.log, финальная ошибка —
+  «... (после N попыток)»; ожидание между попытками прерывается
+  отменой/паузой (item._cancel.wait)
 - `updater.py` — автообновление (stdlib): `fetch_manifest` (при ошибках
   сети/формата raise ManifestError), `is_newer` (семвер), `download_file`
   (чанки/прогресс/отмена), `sha256_file`/verify (битый → файл удалён),
   `apply_update` — Popen `/VERYSILENT /NORESTART /CLOSEAPPLICATIONS/
   /SUPPRESSMSGBOXES /AUTOLAUNCH` (только при sys.frozen)
-- `config.py` — APP_VERSION 1.0.2, REPO, DEFAULTS, load/save (utf-8-sig),
+- `config.py` — APP_VERSION 1.0.4, REPO, DEFAULTS, load/save (utf-8-sig),
   история (макс 200, только существующие файлы); при sys.frozen —
   %LOCALAPPDATA%\VideoDownloader\settings.json, в dev — settings.json
   в корне проекта
@@ -235,6 +277,54 @@ VideoDownloader`, без UAC, AppId фиксированный, RU/EN, ярлы�
 
 ## История
 
+- **12.09.2026 (вечер), v1.0.4 — TikTok + повтор, код+тесты, без
+  сборки/релиза**: curl_cffi==0.16.0 (по правке владельца — сначала
+  0.16.0 как рекомендация yt-dlp из METADATA pin-curl-cffi, живая
+  проверка TikTok ×2 анализ + скачивание видео + MP3 прошла; пин
+  0.16.0; 0.16.3 работал 12.09 утром тоже). Повтор переходящих
+  ошибок: RETRY_ATTEMPTS=3 / RETRY_PAUSE_SECONDS=2.0; _is_retryable
+  двухступенчатый — сначала RETRYABLE_MARKERS (timed out/timeout/
+  connection/ssl/certificate/unexpected response/unable to extract/
+  unable to download webpage/temporary/reset by peer/internal server
+  error/500/502/503/504), затем NO_RETRY_MARKERS (unavailable/not
+  available/private/login/sign in/log in/unsupported url/removed/
+  deleted/age/copyright/geo/404/not a video) с границами слов \b
+  (голое «age» ловится в «webpage»/«message» — переходящие ошибки
+  TikTok остались бы без повтора); неизвестная ошибка — повторяем.
+  Тот же экземпляр YoutubeDL на все попытки (докачка .part и cookies
+  сохраняются); DownloadCancelled — наружу без повторов; ожидание
+  между попытками — item._cancel.wait(2.0): отмена → сразу ERROR
+  «Отменено», пауза → PAUSED. extract_info(download=True) и финальная
+  фаза (_finish_item: COMPLETED, files, _notify) разделены — падение
+  после успешного extract_info не повторяет скачивание. Дисковые
+  ошибки (no space left/not enough space/permission denied/файл
+  занят/unable to write) — без повторов. Финальная ошибка «исходный
+  текст (после N попыток)» одной строкой (GUI однострочный; тип
+  ошибки yt-dlp не сохраняется — gui.py различает только str(exc)),
+  каждая попытка — WARNING «attempt k/N failed (url): …» в yt-dlp.log.
+  Живое подтверждение повтора: TikTok MP3 упал с первой попытки
+  («Unable to extract universal data for rehydration»), yt-dlp.log
+  записал attempt 1/3 failed, повтор прошёл — задача COMPLETED.
+  Тесты: новый .vd-tests\test_retry.py — 42 PASS (классификация
+  20, AC4 анализ+скачивание, AC5 постоянные 1 попытка, AC6 отмена/
+  пауза в ожидании <0.35с, счётчик в ошибке, записи в логе, правки
+  владельца: падение после extract_info без повторов, дисковые
+  ошибки 1 попытка); весь
+  офлайн-набор зелёный (core 38, manifest 4, config_robust 40,
+  ytdlp_logger 8, library, smoke, p1). Проверки источников на
+  0.16.0: TikTok ×2 (анализ+скачивание+кадры+MP3), Instagram
+  анализ, VK анализ, YouTube 4K (2160) на месте. build.bat:
+  --collect-all curl_cffi + ASCII-проверки _wrapper.pyd и
+  libcurl-impersonate*.dll) в dist (подтверждено сборкой 12.09:
+  проверки в build.bat отработали, бинарники в dist и в установленной
+  копии). APP_VERSION 1.0.4. Правки владельца после ревью диффа
+  (вечер 12.09): _run_attempt повторяет только extract_info —
+  _finish_item (COMPLETED/files/_notify) вынесен из retry-цикла,
+  падение после успешного extract_info не перекачивает файл;
+  дисковые ошибки (no space left/not enough space/permission
+  denied/файл занят/unable to write) добавлены в NO_RETRY — 1 попытка;
+  тип ошибки yt-dlp в финале не сохраняется (gui.py различает только
+  str(exc) — одинаково для всех исключений)
 - **12.09.2026, проверка источников (п.3 «Что осталось») — выполнено**
   (.vd-tests\check_sources.py + sources.local.txt, личное — в
   .gitignore; ffmpeg в dist\VideoDownloader через build_ffmpeg.ps1).

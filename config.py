@@ -10,7 +10,7 @@ import time
 
 # Единый источник версии приложения (build.bat подставляет её в installer.iss
 # и в Output\latest.json). Bump версии = правка этой строки.
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 # Репозиторий релизов (GitHub Releases)
 REPO = "am1n90/video-downloader"

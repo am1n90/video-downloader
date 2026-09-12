@@ -32,8 +32,8 @@ Output files live in %TEMP% only; ffmpeg/ffprobe are taken from
 dist\\VideoDownloader (fetched once by build_ffmpeg.ps1, cached in
 build-ffmpeg-cache).
 
-TikTok note: yt-dlp needs curl_cffi (impersonation) for TikTok; it is
-installed in build-venv for this test only (NOT in requirements.txt).
+TikTok note: yt-dlp needs curl_cffi (impersonation) for TikTok;
+since 1.0.4 it is pinned in requirements.txt (curl_cffi==0.16.0).
 
 ASCII only.
 """

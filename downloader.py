@@ -6,13 +6,22 @@ DownloadManager — очередь задач: параллельные загр
 """
 
 import os
+import re
 import sys
 import threading
+import time
 import uuid
 
 from yt_dlp import YoutubeDL
 
 from config import get_logger
+
+# Повтор переходящих ошибок (1.0.4): сетевые сбои и сбои извлечения yt-dlp
+# иногда проходят со второй попытки (замечено на TikTok и VK). Повторяются
+# ТОЛЬКО переходящие ошибки; постоянные (видео удалено, приватное, нужен
+# вход) завершаются сразу — повтор их не исправит.
+RETRY_ATTEMPTS = 3            # всего попыток: 1 основная + 2 повтора
+RETRY_PAUSE_SECONDS = 2.0     # пауза между попытками
 
 STATUS_QUEUED = "queued"
 STATUS_ANALYZING = "analyzing"
@@ -45,6 +54,108 @@ def fmt_eta(value):
     return f"{minutes}:{seconds:02d}"
 
 
+# Переходящие сбои (1.0.4): сеть (таймауты, обрывы, SSL, 5xx) и сбои
+# извлечения yt-dlp. Наблюдения на реальных ссылках: TikTok «Unexpected
+# response from webpage request» и «Unable to extract ... universal data
+# for rehydration», SSL CERTIFICATE_VERIFY_FAILED у VK — со второй попытки
+# проходят. Проверяются ПЕРВЫМИ: «HTTP Error 503: Service Unavailable»
+# содержит слово «unavailable», но 503 — именно переходящая.
+RETRYABLE_MARKERS = (
+    "timed out",
+    "timeout",
+    "connection",              # reset / refused / aborted
+    "ssl",
+    "certificate",
+    "unexpected response",     # TikTok
+    "unable to extract",       # TikTok (universal data for rehydration)
+    "unable to download webpage",
+    "temporary",
+    "reset by peer",
+    "internal server error",
+    "500", "502", "503", "504",
+)
+
+# Ошибки, которые повтор не исправит: видео удалено/недоступно, приватное,
+# нужен вход, возрастное ограничение, авторские права, гео-блокировка,
+# неподдерживаемый URL, 404. Слова с границами (\b): голая подстрока "age"
+# совпала бы с "webpage"/"message" и не дала бы повторять переходящие
+# ошибки TikTok. Язык сообщений yt-dlp стабилен, перевода нет.
+NO_RETRY_MARKERS = (
+    "unavailable",              # Video unavailable (YouTube)
+    "not available",            # в т.ч. not available in your country
+    "private",
+    "login",                    # login required
+    "sign in",
+    "log in",
+    "unsupported url",
+    "removed",
+    "deleted",
+    "age",                      # Confirm your age / age-restricted
+    "copyright",
+    "geo",                      # geo-restricted
+    "404",
+    "not a video",
+    # Ошибки записи на диск: повтор с перекачкой файла их не исправит
+    "no space left",           # [Errno 28] No space left on device
+    "not enough space",        # WinError 112
+    "permission denied",       # [Errno 13] / WinError 5
+    "being used by another process",   # WinError 32 (файл занят)
+    "unable to write data",    # обёртка yt-dlp для ошибок записи
+)
+
+_RETRYABLE_RE = re.compile(
+    "|".join(re.escape(m) for m in RETRYABLE_MARKERS), re.IGNORECASE
+)
+_NO_RETRY_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(m) for m in NO_RETRY_MARKERS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_retryable(exc):
+    """True — переходящая ошибка (сеть/извлечение), повтор имеет смысл.
+
+    False — постоянная (видео удалено, приватное, нужен вход и т.п.):
+    повтор не изменит результат, задача завершается сразу.
+
+    Порядок: сначала переходящие маркеры (503 содержит «Unavailable», но
+    повторяется), затем постоянные. Неизвестная ошибка — True: безопаснее
+    дать повтору шанс (постоянная всё равно даст понятный текст после
+    исчерпанных попыток), чем не повторить переходящую.
+    """
+    if isinstance(exc, DownloadCancelled):
+        return False
+    text = str(exc).lower()
+    if _RETRYABLE_RE.search(text):
+        return True
+    if _NO_RETRY_RE.search(text):
+        return False
+    return True
+
+
+def _log_attempt_error(exc, attempt, total, url):
+    """Неудачная попытка -> yt-dlp.log (существующий логгер vdl.ytdlp).
+
+    Для диагностики по логам: сколько было попыток и чем закончилась каждая.
+    """
+    logger = get_logger("vdl.ytdlp", "yt-dlp.log")
+    logger.warning(
+        "attempt %d/%d failed (%s): %s",
+        attempt, total, url, str(exc).replace("\n", " ")[:500],
+    )
+
+
+def _final_error_message(exc, attempts):
+    """Текст финальной ошибки: исходное сообщение + счётчик попыток.
+
+    Одна строка (переводы строк схлопнуты): GUI показывает ошибку в одно-
+    строчных подписях. «(после N попыток)» — для диагностики: видно, что
+    повтор был и не помог.
+    """
+    text = " ".join(str(exc).split())
+    return f"{text} (после {attempts} попыток)"
+
+
 def fetch_info(url, playlist=False):
     """Информация о ссылке без скачивания (для превью и валидации)."""
     # Предупреждения yt-dlp (в т.ч. о JS-рантайме) — не подавляются и не
@@ -56,8 +167,27 @@ def fetch_info(url, playlist=False):
         "extract_flat": "in_playlist",
         "noplaylist": not playlist,
     }
-    with YoutubeDL(options) as ydl:
-        info = ydl.extract_info(url, download=False)
+
+    # Повтор переходящих ошибок (1.0.4): попытки с паузой RETRY_PAUSE_SECONDS;
+    # постоянные ошибки (удалено/приватно/нужен вход) — без повторов.
+    last_exc = None
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=False)
+            break
+        except Exception as exc:
+            if not _is_retryable(exc):
+                raise
+            last_exc = exc
+            _log_attempt_error(exc, attempt, RETRY_ATTEMPTS, url)
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_PAUSE_SECONDS)
+    else:
+        # все попытки исчерпаны — та же ошибка + счётчик попыток
+        raise Exception(
+            _final_error_message(last_exc, RETRY_ATTEMPTS)
+        ) from last_exc
 
     if "entries" in info:
         entries = [e for e in (info.get("entries") or []) if e]
@@ -421,40 +551,106 @@ class DownloadManager:
             ]
         return options
 
+    def _run_attempt(self, item, ydl):
+        """Повторяемая часть попытки: ТОЛЬКО extract_info(download=True).
+
+        Установка COMPLETED, item.files и _notify вынесены в _run_item:
+        если extract_info прошёл, файл скачан полностью, и падение на
+        последующих шагах (prepare_filename, оповещение GUI) не должно
+        запускать повторное скачивание.
+        """
+        info = ydl.extract_info(item.url, download=True)
+
+        # Метаданные задачи (для отображения и истории)
+        if not item.title:
+            item.title = info.get("title") or ""
+        if item.duration is None:
+            item.duration = info.get("duration")
+        if not item.thumbnail:
+            item.thumbnail = info.get("thumbnail")
+        return info
+
+    def _finish_item(self, item, info, ydl):
+        """Финальная фаза после успешного extract_info (не повторяется).
+
+        Здесь исключение — уже не сетевая проблема yt-dlp: файл скачан,
+        повтор скачивания не поможет и не нужен.
+        """
+        # extract_info вернулся — файл скачан полностью; даже если
+        # пауза пришла в последний момент, задача завершена (при
+        # возобновлении yt-dlp и так увидел бы готовый файл).
+        item.status = STATUS_PROCESSING
+        self._notify(item)
+
+        if "entries" in info:
+            files = []
+            for entry in (info.get("entries") or []):
+                if entry:
+                    files.append(ydl.prepare_filename(entry))
+        else:
+            files = [ydl.prepare_filename(info)]
+
+        if item.mode == "audio":
+            files = [os.path.splitext(p)[0] + ".mp3" for p in files]
+
+        item.files = files
+        item.progress = 100
+        item.status = STATUS_COMPLETED
+        self._notify(item)
+
+    def _wait_between_attempts(self, item):
+        """Пауза между попытками (RETRY_PAUSE_SECONDS), прерываемая
+        отменой/паузой пользователя. Возвращает:
+            None      — пауза истекла, можно повторять;
+            "cancel"  — отмена: прервать задачу (ERROR «Отменено»);
+            "pause"   — пауза: задача уходит в PAUSED.
+        Отмена и пауза в этот момент должны срабатывать мгновенно, а не
+        ждать конца таймаута (AC: отмена прерывает ожидание)."""
+        if item._cancel.wait(RETRY_PAUSE_SECONDS):
+            if item._cancel_intent:
+                return "cancel"
+            return "pause"
+        return None
+
     def _run_item(self, item):
         try:
+            # Повтор переходящих ошибок (1.0.4). Тот же экземпляр YoutubeDL
+            # на все попытки: докачка .part и кеш cookies переживают повтор,
+            # а частично скачанное не теряется. Постоянные ошибки (удалено/
+            # приватно/нужен вход) — ровно одна попытка. Каждая неудачная
+            # попытка пишется в yt-dlp.log (_log_attempt_error).
+            # extract_info(download=True) и финальная фаза (_finish_item)
+            # разделены: успех extract_info = файл скачан; падение после
+            # него (prepare_filename, _notify) повторного скачивания
+            # не запускает.
             with YoutubeDL(self._build_options(item)) as ydl:
-                info = ydl.extract_info(item.url, download=True)
-
-                # Метаданные задачи (для отображения и истории)
-                if not item.title:
-                    item.title = info.get("title") or ""
-                if item.duration is None:
-                    item.duration = info.get("duration")
-                if not item.thumbnail:
-                    item.thumbnail = info.get("thumbnail")
-
-                # extract_info вернулся — файл скачан полностью; даже если
-                # пауза пришла в последний момент, задача завершена (при
-                # возобновлении yt-dlp и так увидел бы готовый файл).
-                item.status = STATUS_PROCESSING
-                self._notify(item)
-
-                if "entries" in info:
-                    files = []
-                    for entry in (info.get("entries") or []):
-                        if entry:
-                            files.append(ydl.prepare_filename(entry))
+                last_exc = None
+                for attempt in range(1, RETRY_ATTEMPTS + 1):
+                    try:
+                        info = self._run_attempt(item, ydl)
+                        break
+                    except DownloadCancelled:
+                        raise
+                    except Exception as exc:
+                        if not _is_retryable(exc):
+                            raise
+                        last_exc = exc
+                        _log_attempt_error(exc, attempt, RETRY_ATTEMPTS,
+                                           item.url)
+                        if attempt < RETRY_ATTEMPTS:
+                            how = self._wait_between_attempts(item)
+                            if how == "cancel":
+                                # Отмена в ожидании: задача завершается как
+                                # отменённая (ERROR «Отменено»), а не сетевой
+                                # ошибкой (AC: отмена прерывает ожидание).
+                                raise DownloadCancelled()
+                            if how == "pause":
+                                raise DownloadCancelled()
                 else:
-                    files = [ydl.prepare_filename(info)]
-
-                if item.mode == "audio":
-                    files = [os.path.splitext(p)[0] + ".mp3" for p in files]
-
-                item.files = files
-                item.progress = 100
-                item.status = STATUS_COMPLETED
-                self._notify(item)
+                    raise Exception(
+                        _final_error_message(last_exc, RETRY_ATTEMPTS)
+                    ) from last_exc
+                self._finish_item(item, info, ydl)
         except DownloadCancelled:
             # Намерение пользователя (последнее действие побеждает):
             #   пауза → PAUSED (планировщик вернёт в очередь при resume),

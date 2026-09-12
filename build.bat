@@ -32,11 +32,25 @@ pyinstaller --noconsole --onedir --name VideoDownloader ^
   --collect-all qfluentwidgets ^
   --collect-all yt_dlp ^
   --collect-all yt_dlp_ejs ^
+  --collect-all curl_cffi ^
   main.py || goto :fail
 if not exist "dist\VideoDownloader\VideoDownloader.exe" (
-  echo FAIL: dist\VideoDownloader\VideoDownloader.exe не создан
+  echo FAIL: dist\VideoDownloader\VideoDownloader.exe not created
   goto :fail
 )
+
+REM curl_cffi must ship with its native binaries, not just Python code
+REM (TikTok needs libcurl-impersonate). Verify both landed in dist.
+if not exist "dist\VideoDownloader\_internal\curl_cffi\_wrapper.pyd" (
+  echo FAIL: curl_cffi\_wrapper.pyd missing in dist
+  goto :fail
+)
+dir /b "dist\VideoDownloader\_internal\curl_cffi.libs\libcurl-impersonate*.dll" >nul 2>&1
+if errorlevel 1 (
+  echo FAIL: libcurl-impersonate dll missing in curl_cffi.libs
+  goto :fail
+)
+echo OK: curl_cffi collected with native binaries
 
 echo [4/7] Скачивание ffmpeg (BtbN win64-gpl)...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_ffmpeg.ps1" || goto :fail
