@@ -1,5 +1,6 @@
 # Данные пользователя
 settings.json
+.vd-tests/sources.local.txt
 
 # Python
 __pycache__/
