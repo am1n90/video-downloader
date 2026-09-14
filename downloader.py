@@ -54,6 +54,38 @@ def fmt_eta(value):
     return f"{minutes}:{seconds:02d}"
 
 
+def fragment_suffix(start, end):
+    """Суффикс имени файла фрагмента (1.0.5): «[clip 35s-95s]».
+
+    Только латиница, цифры, пробел и дефис-минус — по правилу владельца
+    (без русских букв и типографских тире): имя файла не зависит от
+    раскладки/кодировки и гарантированно допустимо на Windows.
+    Эмодзи/кириллица в %(title)s остаются — yt-dlp санитизирует их сам
+    (sanitize_filename в prepare_filename).
+    """
+    return f"[clip {int(round(start))}s-{int(round(end))}s]"
+
+
+# Фрагмент (1.0.5): yt-dlp качает секции через FFmpegFD — ffmpeg-процесс,
+# progress-hooks НЕ вызываются (статус зависал в ANALYZING, отмена не
+# срабатывала до конца ffmpeg). Сторож в _run_item следит за задачей:
+#   - отмена: hooks не придут — задача честно завершается сразу;
+#   - VK: HLS-секция зависает на медленном CDN (дважды по 15+ минут,
+#     12.09 и 13.09) — нет роста файлов 10 минут -> понятная ошибка.
+# «Прогресс» = рост файлов с суффиксом [clip] в папке назначения:
+# точная обрезка 4K длится и дольше 10 минут, но файл растёт —
+# ложных срабатываний нет.
+FRAGMENT_STALL_TIMEOUT = 600.0    # 10 минут без роста файлов
+FRAGMENT_WATCH_POLL = 1.0        # период опроса сторожа
+
+
+def _is_vk_url(url):
+    """VK-ссылка (для текста ошибки зависания фрагмента; как
+    source_from_url в gui)."""
+    low = (url or "").lower()
+    return "vk.com" in low or "vkvideo" in low
+
+
 # Переходящие сбои (1.0.4): сеть (таймауты, обрывы, SSL, 5xx) и сбои
 # извлечения yt-dlp. Наблюдения на реальных ссылках: TikTok «Unexpected
 # response from webpage request» и «Unable to extract ... universal data
@@ -247,13 +279,18 @@ class DownloadItem:
     """Одна задача в очереди."""
 
     def __init__(self, url, mode="video", quality="best", output_dir=".",
-                 playlist=False):
+                 playlist=False, time_range=None, precise_cut=False):
         self.id = uuid.uuid4().hex[:12]
         self.url = url
         self.mode = mode
         self.quality = quality
         self.output_dir = output_dir
         self.playlist = playlist
+        # 1.0.5 фрагмент: (start, end) в секундах, None — полное видео
+        # (поведение прежнее). precise_cut — force_keyframes_at_cuts
+        # (точная обрезка с перекодированием).
+        self.time_range = time_range
+        self.precise_cut = bool(precise_cut)
 
         self.status = STATUS_QUEUED
         self.title = ""
@@ -269,6 +306,10 @@ class DownloadItem:
 
         self.downloaded_bytes = 0
         self.total_bytes = None
+
+        # 1.0.5: задача брошена сторожем (отмена/зависание фрагмента) —
+        # статусы и файлы воркера-зомби игнорируются (см. _run_item)
+        self._abandoned = False
 
         self._cancel = threading.Event()
         self._pause = threading.Event()
@@ -335,9 +376,14 @@ class DownloadManager:
     # ---------- публичное API ----------
 
     def add(self, url, mode="video", quality="best", output_dir=".",
-            playlist=False):
-        """Добавить задачу. Возвращает DownloadItem."""
-        item = DownloadItem(url, mode, quality, output_dir, playlist)
+            playlist=False, time_range=None, precise_cut=False):
+        """Добавить задачу. Возвращает DownloadItem.
+
+        time_range=(start, end) — скачивать только фрагмент (секунды);
+        None — полное видео. precise_cut — точная обрезка (1.0.5).
+        """
+        item = DownloadItem(url, mode, quality, output_dir, playlist,
+                            time_range, precise_cut)
         with self._lock:
             self.items[item.id] = item
             self.order.append(item.id)
@@ -536,10 +582,43 @@ class DownloadManager:
             "continuedl": True,   # докачка .part — основa паузы/возобновления
         }
 
+        # Фрагмент (1.0.5): download_ranges + force_keyframes_at_cuts.
+        # Имя файла отличается от полного видео суффиксом [clip Ns-Ms] —
+        # фрагмент и полное видео не перезаписывают друг друга (и не
+        # вытесняют запись друг друга в истории: add_history заменяет
+        # запись по пути). Механизм тот же, что проверен 12.09 в
+        # check_sources.py на VK (прямой формат) — см. AGENTS.md.
+        if item.time_range:
+            start, end = item.time_range
+            options["outtmpl"] = os.path.join(
+                item.output_dir,
+                f"%(title)s {fragment_suffix(start, end)}.%(ext)s",
+            )
+            options["download_ranges"] = (
+                lambda info, ydl, _s=float(start), _e=float(end):
+                [{"start_time": _s, "end_time": _e}]
+            )
+            if item.precise_cut:
+                # Точная обрезка: ключевые кадры вставляются в точки реза,
+                # но секции перекодируются — заметно медленнее.
+                options["force_keyframes_at_cuts"] = True
+
         # В собранном exe (PyInstaller) ffmpeg лежит рядом с исполняемым
         # файлом; в dev-режиме yt-dlp ищет его в PATH.
         if getattr(sys, "frozen", False):
-            options["ffmpeg_location"] = os.path.dirname(sys.executable)
+            ffmpeg_dir = os.path.dirname(sys.executable)
+            options["ffmpeg_location"] = ffmpeg_dir
+            # Фрагмент (1.0.5): FFmpegFD.available() — выбор downloader'а
+            # при download_ranges — читает ContextVar, а НЕ params
+            # (известный Fixme yt-dlp: CLI ставит его в parse_options,
+            # см. yt_dlp/__init__.py: FFmpegPostProcessor._ffmpeg_location.
+            # set(...)). Без него фрагмент https-форматов падает
+            # «You have requested downloading the video partially, but
+            # ffmpeg is not installed», хотя ffmpeg передан в params.
+            # Ставим так же, как CLI; ContextVar живёт в контексте потока,
+            # а _build_options вызывается в потоке скачивания.
+            from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
+            FFmpegPostProcessor._ffmpeg_location.set(ffmpeg_dir)
 
         if item.mode == "audio":
             options["postprocessors"] = [
@@ -558,7 +637,16 @@ class DownloadManager:
         если extract_info прошёл, файл скачан полностью, и падение на
         последующих шагах (prepare_filename, оповещение GUI) не должно
         запускать повторное скачивание.
+
+        1.0.5 фрагмент: FFmpegFD не дергает progress-hooks — статус сам
+        бы не ушёл из ANALYZING. Ставим честный DOWNLOADING с нулевым
+        прогрессом до extract_info: GUI показывает «Скачивание
+        фрагмента…» без процента (процента нет, но статус правдив).
         """
+        if item.time_range and item.status != STATUS_DOWNLOADING:
+            item.status = STATUS_DOWNLOADING
+            item.progress = 0.0
+            self._notify(item)
         info = ydl.extract_info(item.url, download=True)
 
         # Метаданные задачи (для отображения и истории)
@@ -613,6 +701,16 @@ class DownloadManager:
         return None
 
     def _run_item(self, item):
+        # 1.0.5 фрагмент: сторож — отмена и зависание VK. FFmpegFD не
+        # дергает progress-hooks, поэтому cancel-намерение пользователя
+        # не пробьётся через _progress_hook; сторож опрашивает задачу
+        # из отдельного потока и завершает её сам.
+        if item.time_range:
+            watch = threading.Thread(
+                target=self._fragment_watch, args=(item,),
+                daemon=True,
+            )
+            watch.start()
         try:
             # Повтор переходящих ошибок (1.0.4). Тот же экземпляр YoutubeDL
             # на все попытки: докачка .part и кеш cookies переживают повтор,
@@ -650,11 +748,19 @@ class DownloadManager:
                     raise Exception(
                         _final_error_message(last_exc, RETRY_ATTEMPTS)
                     ) from last_exc
+                # 1.0.5: сторож завершил задачу (отмена) — воркер-зомби
+                # не должен перезаписывать её финальный статус
+                if item._abandoned:
+                    return
                 self._finish_item(item, info, ydl)
         except DownloadCancelled:
             # Намерение пользователя (последнее действие побеждает):
             #   пауза → PAUSED (планировщик вернёт в очередь при resume),
             #   отмена → ERROR «Отменено».
+            # 1.0.5: если задачу уже завершил сторож (item._abandoned),
+            # воркер-зомби молчит — его статус устарел.
+            if item._abandoned:
+                return
             if item._cancel_intent:
                 item.status = STATUS_ERROR
                 item.error = "Отменено"
@@ -662,8 +768,153 @@ class DownloadManager:
                 item.status = STATUS_PAUSED
             self._notify(item)
         except Exception as exc:
+            # 1.0.5: сторож завершил задачу раньше — игнорируем
+            # запоздалую ошибку воркера-зомби (ffmpeg может ещё писать
+            # файл; файл перезапишется при следующем скачивании)
+            if item._abandoned:
+                return
             item.status = STATUS_ERROR
             item.error = str(exc)
             self._notify(item)
         finally:
             self._wake.set()
+
+    def _fragment_watch(self, item):
+        """Сторож фрагментной задачи (1.0.5). Живёт, пока задача активна.
+
+        FFmpegFD не дергает progress-hooks: без сторожа «Отмена» ждала
+        бы конца ffmpeg (VK HLS — бесконечно), а VK-зависание висело
+        бы до пользователя. Что делает:
+          - отмена: _cancel взведён, а задача в DOWNLOADING -> задача
+            завершается сразу (ERROR «Отменено»); воркер-зомби
+            игнорируется по item._abandoned;
+          - зависание: файлы фрагмента не растут FRAGMENT_STALL_TIMEOUT
+            (по умолчанию 10 минут) -> ERROR; для VK — «VK пока не
+            поддерживает скачивание фрагмента».
+        «Рост файлов»: суммарный размер файлов с суффиксом [clip ...]
+        в папке назначения (.part включены): ffmpeg дописывает их по
+        ходу скачивания, даже если очень медленно.
+        """
+        deadline_stall = time.monotonic() + FRAGMENT_STALL_TIMEOUT
+        last_size = self._fragment_files_size(item)
+        while True:
+            # задача закончилась (воркер успел раньше сторожа)
+            if item.status not in ACTIVE_STATUSES:
+                return
+            # отмена пользователя: hooks от FFmpegFD не придут — действуем
+            if item._cancel.is_set():
+                item._abandoned = True
+                self._kill_fragment_ffmpeg(item)
+                item.status = STATUS_ERROR
+                item.error = "Отменено"
+                self._notify(item)
+                self._wake.set()
+                return
+            # пауза не поддерживается при фрагменте (кнопка скрыта в GUI),
+            # но защита от «зависшей паузы» всё равно нужна
+            if item._pause.is_set():
+                item._abandoned = True
+                item.status = STATUS_PAUSED
+                self._notify(item)
+                self._wake.set()
+                return
+            size = self._fragment_files_size(item)
+            if size != last_size:
+                last_size = size
+                deadline_stall = time.monotonic() + FRAGMENT_STALL_TIMEOUT
+            elif time.monotonic() >= deadline_stall:
+                _log_attempt_error(
+                    Exception("fragment stall: no file growth for %ds"
+                              % int(FRAGMENT_STALL_TIMEOUT)),
+                    1, 1, item.url,
+                )
+                item._abandoned = True
+                self._kill_fragment_ffmpeg(item)
+                item.status = STATUS_ERROR
+                item.error = ("VK пока не поддерживает скачивание "
+                              "фрагмента" if _is_vk_url(item.url)
+                              else "Скачивание фрагмента прервано: нет "
+                                   "прогресса 10 минут")
+                self._notify(item)
+                self._wake.set()
+                return
+            time.sleep(FRAGMENT_WATCH_POLL)
+
+    @staticmethod
+    def _fragment_files_size(item):
+        """Суммарный размер файлов фрагмента в папке назначения
+        (включая .part) — «прогресс» для сторожа. Ошибки игнорируем:
+        значение лишь ориентир (0 -> нет файлов -> считаем ростом от 0).
+        """
+        try:
+            suffix = fragment_suffix(*item.time_range)
+            total = 0
+            for name in os.listdir(item.output_dir):
+                if suffix in name:
+                    p = os.path.join(item.output_dir, name)
+                    try:
+                        total += os.path.getsize(p)
+                    except OSError:
+                        pass
+            return total
+        except OSError:
+            return 0
+
+    def _kill_fragment_ffmpeg(self, item):
+        """Убить ffmpeg-сироту фрагмента (1.0.5/1.0.6).
+
+        Только Windows. Ищем дочерний ffmpeg.exe по трём условиям:
+          1. ParentProcessId == PID нашего процесса
+          2. В cmdline есть суффикс [clip Ns-Ms] этого item
+          3. В cmdline есть normcase(output_dir) этого item
+        Убиваем os.kill(pid, 9). Ошибки — в yt-dlp.log, не бросаем.
+        time_range=None -> сразу выход (не запрашиваем CIM).
+        """
+        if os.name != "nt":
+            return
+        if item.time_range is None:
+            return
+        try:
+            import json
+            import subprocess
+            suffix = fragment_suffix(*item.time_range)
+            ps = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process "
+                 "-Filter "
+                 "\"Name='ffmpeg.exe'\" | "
+                 "Select-Object ProcessId,ParentProcessId,CommandLine | "
+                 "ConvertTo-Json"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if ps.returncode != 0:
+                return
+            rows = json.loads(ps.stdout) if ps.stdout.strip() else []
+            if isinstance(rows, dict):
+                rows = [rows]
+        except Exception:
+            return
+        pid = os.getpid()
+        norm_out = os.path.normcase(item.output_dir)
+        targets = []
+        for r in rows:
+            pp = r.get("ParentProcessId")
+            if pp != pid:
+                continue
+            # normcase обеих сторон: реальный cmdline содержит путь в
+            # регистре пользователя (C:/Videos), а normcase — нижний
+            # регистр + backslash (c:\videos)
+            cl = os.path.normcase(r.get("CommandLine") or "")
+            if suffix not in cl:
+                continue
+            if norm_out not in cl:
+                continue
+            targets.append(r["ProcessId"])
+        for tpid in targets:
+            try:
+                os.kill(tpid, 9)
+            except Exception:
+                _log_attempt_error(
+                    Exception("kill(%d) failed" % tpid),
+                    1, 1, item.url,
+                )

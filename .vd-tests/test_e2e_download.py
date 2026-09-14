@@ -17,6 +17,24 @@ import downloader
 PHASE = sys.argv[1] if len(sys.argv) > 1 else "one"
 URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 
+# dev-окружение этой машины: ffmpeg в PATH отсутствует, а приложение
+# подставляет ffmpeg_location только при sys.frozen. Инъекция ТОЛЬКО
+# в тесте (как в check_fragment.py): обёртка _build_options + ContextVar
+# для FFmpegFD — иначе merge bestvideo+bestaudio падает «ffmpeg is not
+# installed» (см. downloader.py 1.0.5, комментарий про ContextVar).
+_FFMPEG_DIR = os.path.join(ROOT, "dist", "VideoDownloader")
+if os.path.isfile(os.path.join(_FFMPEG_DIR, "ffmpeg.exe")):
+    from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor
+    _orig_build = downloader.DownloadManager._build_options
+
+    def _build_with_ffmpeg(self, it):
+        opts = _orig_build(self, it)
+        opts["ffmpeg_location"] = _FFMPEG_DIR
+        FFmpegPostProcessor._ffmpeg_location.set(_FFMPEG_DIR)
+        return opts
+
+    downloader.DownloadManager._build_options = _build_with_ffmpeg
+
 outdir = os.path.join(os.environ.get("TEMP", "/tmp"), "vd-e2e-yt")
 os.makedirs(outdir, exist_ok=True)
 

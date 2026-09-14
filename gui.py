@@ -15,6 +15,7 @@ import urllib.request
 
 from PySide6.QtCore import (
     QObject,
+    QRect,
     Qt,
     QThread,
     QTimer,
@@ -76,6 +77,7 @@ from downloader import (
     fetch_info,
     fmt_eta,
     fmt_speed,
+    fragment_suffix,
 )
 
 try:
@@ -120,6 +122,40 @@ def fmt_duration(seconds):
     return f"{minutes}:{sec:02d}"
 
 
+def parse_timecode(text):
+    """«м:сс» / «ч:мм:сс» / «90» (голые секунды) -> секунды, иначе None.
+
+    Ведущие нули допустимы («0:35», «02:10», «1:00:00») — fmt_timecode
+    пишет именно так, поля должны принимать свой же вывод. Для полей
+    точного ввода фрагмента (1.0.5).
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    parts = text.split(":")
+    if len(parts) > 3:
+        return None
+    for p in parts:
+        if not p.isdigit():
+            return None
+    nums = [int(p) for p in parts]
+    if len(nums) == 1:
+        return nums[0]
+    if len(nums) == 2:
+        return nums[0] * 60 + nums[1]
+    return nums[0] * 3600 + nums[1] * 60 + nums[2]
+
+
+def fmt_timecode(seconds):
+    """Секунды -> «м:сс» или «ч:м:сс» без ведущих нулей минут (0:35, 2:10)."""
+    seconds = max(0, int(round(seconds)))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
+
+
 def ru_records(n):
     """Форма слова для счётчика: 1 запись / 2 записи / 5 записей."""
     if n % 10 == 1 and n % 100 != 11:
@@ -140,6 +176,208 @@ class Bridge(QObject):
 
     itemChanged = Signal(object)
     queueChanged = Signal()
+
+
+# ================= ПОЛЗУНОК ФРАГМЕНТА (1.0.5) =================
+
+
+MIN_FRAGMENT_SECONDS = 1   # AC2: минимальный фрагмент
+
+
+class RangeSlider(QWidget):
+    """Ползунок с двумя ручками: начало/конец фрагмента (целые секунды).
+
+    Инвариант: 0 <= start < end <= duration, длительность >= 1 с
+    (клэмпы в _set_handle). Сигналы: rangeChanged(start, end) — по
+    завершении перемещения (отпускание мыши / стрелка клавиатуры);
+    fieldsMoved() — на каждом тике drag'а (поля точного ввода
+    обновляются мгновенно, над ручками — подписи времени).
+    Тесты: set_values() НЕ эмитит сигналы — программная установка из
+    полей ввода не должна зацикливать связь слайдер <-> поля.
+    """
+
+    HANDLE_SIZE = 16
+    TRACK_MARGIN = 12      # место под ручку у края
+
+    rangeChanged = Signal(int, int)
+    fieldsMoved = Signal()
+
+    def __init__(self, duration=0, parent=None):
+        super().__init__(parent)
+        self.duration = max(0, int(duration))
+        self.start = 0
+        self.end = self.duration
+        self._active = None            # "start"/"end" при drag
+        self._drag_offset = 0
+        self.setMinimumHeight(36)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.ClickFocus)
+
+    # ---------- публичное API ----------
+
+    def set_duration(self, duration):
+        """Новая длина видео: сброс ручек на 0..duration."""
+        self.duration = max(0, int(duration))
+        self.start = 0
+        self.end = self.duration
+        self.update()
+
+    def set_values(self, start, end):
+        """Программная установка значений (из полей) — без сигналов."""
+        self.start = int(start)
+        self.end = int(end)
+        self.update()
+
+    def values(self):
+        return self.start, self.end
+
+    # ---------- геометрия и события ----------
+
+    def _x_to_time(self, x):
+        left = self.TRACK_MARGIN + self.HANDLE_SIZE // 2
+        right = self.width() - left
+        if right <= left:
+            return 0
+        t = (x - left) * self.duration / (right - left)
+        return max(0, min(self.duration, int(t)))
+
+    def _time_to_x(self, t):
+        left = self.TRACK_MARGIN + self.HANDLE_SIZE // 2
+        right = self.width() - left
+        if self.duration <= 0:
+            return left
+        return left + (right - left) * t / self.duration
+
+    def _handle_rect(self, which):
+        t = self.start if which == "start" else self.end
+        x = self._time_to_x(t)
+        r = self.HANDLE_SIZE // 2
+        return QRect(int(x) - r, (self.height() - self.HANDLE_SIZE) // 2,
+                     self.HANDLE_SIZE, self.HANDLE_SIZE)
+
+    def _nearest_handle(self, x):
+        """Ручка под курсором («start» при равной удалённости)."""
+        if abs(x - self._time_to_x(self.start)) <= self.HANDLE_SIZE / 2 + 2:
+            return "start"
+        if abs(x - self._time_to_x(self.end)) <= self.HANDLE_SIZE / 2 + 2:
+            return "end"
+        return None
+
+    def mousePressEvent(self, event):
+        if self.duration <= 0:
+            return
+        which = self._nearest_handle(event.position().x())
+        if which:
+            self._active = which
+            self._drag_offset = int(event.position().x() - self._time_to_x(
+                self.start if which == "start" else self.end))
+            self.fieldsMoved.emit()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._active is None:
+            self.setCursor(
+                Qt.SizeHorCursor if self._nearest_handle(event.position().x())
+                else Qt.ArrowCursor
+            )
+            return
+        t = self._x_to_time(int(event.position().x()) - self._drag_offset)
+        self._set_handle(self._active, t, emit=True)
+
+    def mouseReleaseEvent(self, event):
+        if self._active is not None:
+            self._active = None
+            self.rangeChanged.emit(self.start, self.end)
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        # Стрелки двигают ближайшую к центру ручку (клавиатурная
+        # доступность); += 1 секунда с соблюдением инварианта.
+        if self.duration <= 0:
+            super().keyPressEvent(event)
+            return
+        cx = self.width() / 2
+        step = 1
+        if event.key() not in (Qt.Key_Left, Qt.Key_Right):
+            super().keyPressEvent(event)
+            return
+        if self._time_to_x(self.start) > cx or (
+                self._time_to_x(self.start) == cx
+                and event.key() == Qt.Key_Left):
+            which, delta = "start", (-step if event.key() == Qt.Key_Left
+                                     else step)
+        else:
+            which, delta = "end", (-step if event.key() == Qt.Key_Left
+                                   else step)
+        self._set_handle(which, (self.start if which == "start" else self.end)
+                         + delta, emit=False)
+        self.rangeChanged.emit(self.start, self.end)
+
+    def _set_handle(self, which, t, emit=False):
+        """Установить ручку с клэмпами: конец не раньше начала + 1 с,
+        границы [0..duration]; вторая ручка не сдвигается (значение
+        просто ограничивается инвариантом)."""
+        t = max(0, min(self.duration, int(t)))
+        if which == "start":
+            self.start = max(0, min(t, self.end - MIN_FRAGMENT_SECONDS))
+        else:
+            self.end = min(self.duration,
+                           max(t, self.start + MIN_FRAGMENT_SECONDS))
+        if emit:
+            self.fieldsMoved.emit()
+        self.update()
+
+    # ---------- отрисовка ----------
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import (
+            QColor,
+            QLinearGradient,
+            QPainter,
+            QPen,
+        )
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        track_y = self.height() // 2
+        track_left = self.TRACK_MARGIN
+        track_right = self.width() - self.TRACK_MARGIN
+
+        # дорожка (цвет адаптируется к теме: тёмная/светлая)
+        track_color = QColor(255, 255, 255, 60) if self._is_dark() else \
+            QColor(0, 0, 0, 40)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(track_color)
+        painter.drawRoundedRect(
+            QRect(track_left, track_y - 3, track_right - track_left, 6), 3, 3
+        )
+
+        # выделенный фрагмент (start..end)
+        if self.duration > 0:
+            x1 = self._time_to_x(self.start)
+            x2 = self._time_to_x(self.end)
+            grad = QLinearGradient(x1, 0, x2, 0)
+            grad.setColorAt(0, QColor("#4cc2ff"))
+            grad.setColorAt(1, QColor("#2b88d8"))
+            painter.setBrush(grad)
+            painter.drawRoundedRect(
+                QRect(int(x1), track_y - 3, max(1, int(x2 - x1)), 6), 3, 3
+            )
+
+        # ручки: синий круг с белой окантовкой
+        for which in ("start", "end"):
+            rect = self._handle_rect(which)
+            painter.setBrush(QColor("#0078d4"))
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            painter.drawEllipse(rect)
+
+        painter.end()
+
+    def _is_dark(self):
+        """Тёмная ли тема сейчас (для цвета дорожки)."""
+        from qfluentwidgets import isDarkTheme
+        return isDarkTheme()
 
 
 class AnalyzeWorker(QThread):
@@ -474,6 +712,69 @@ class DownloadPage(QWidget):
         self.playlist_check.stateChanged.connect(lambda: self._analyze_if_ready())
         lay.addWidget(self.playlist_check)
 
+        # ---- Фрагмент (1.0.5) ----
+        self.fragment_check = CheckBox("Скачать только фрагмент", card)
+        self.fragment_check.setChecked(False)   # по умолчанию выкл (AC1)
+        self.fragment_check.stateChanged.connect(self._on_fragment_check)
+        lay.addWidget(self.fragment_check)
+
+        # Блок управления фрагментом: слайдер + подписи + поля + точная
+        # обрезка. Скрыт, пока галочка выключена; при выключенной галочке
+        # поведение и опции — прежние (AC1).
+        self.fragment_box = QWidget(card)
+        fb = QVBoxLayout(self.fragment_box)
+        fb.setContentsMargins(0, SP_GROUP, 0, 0)
+        fb.setSpacing(SP_GROUP)
+
+        # Подписи времени над ручками + длительность фрагмента посередине
+        lab_row = QHBoxLayout()
+        self.frag_start_label = BodyLabel("0:00", self.fragment_box)
+        self.frag_range_label = BodyLabel("", self.fragment_box)
+        self.frag_range_label.setAlignment(Qt.AlignCenter)
+        self.frag_end_label = BodyLabel("0:00", self.fragment_box)
+        lab_row.addWidget(self.frag_start_label)
+        lab_row.addStretch()
+        lab_row.addWidget(self.frag_range_label, stretch=1)
+        lab_row.addStretch()
+        lab_row.addWidget(self.frag_end_label)
+        fb.addLayout(lab_row)
+
+        self.range_slider = RangeSlider(0, self.fragment_box)
+        self.range_slider.rangeChanged.connect(self._on_slider_changed)
+        self.range_slider.fieldsMoved.connect(self._sync_fields_from_slider)
+        fb.addWidget(self.range_slider)
+
+        # Поля точного ввода (мм:сс / ч:мм:сс), связаны в обе стороны
+        # (placeholder обновляется после анализа — см. _on_analyze_ok)
+        fields_row = QHBoxLayout()
+        fields_row.addWidget(BodyLabel("Начало:", self.fragment_box))
+        self.frag_start_edit = LineEdit(self.fragment_box)
+        self.frag_start_edit.setPlaceholderText("мм:сс")
+        self.frag_start_edit.setFixedWidth(90)
+        self.frag_start_edit.editingFinished.connect(self._on_fields_done)
+        fields_row.addWidget(self.frag_start_edit)
+        fields_row.addWidget(BodyLabel("Конец:", self.fragment_box))
+        self.frag_end_edit = LineEdit(self.fragment_box)
+        self.frag_end_edit.setPlaceholderText("мм:сс")
+        self.frag_end_edit.setFixedWidth(90)
+        self.frag_end_edit.editingFinished.connect(self._on_fields_done)
+        fields_row.addStretch()
+        fb.addLayout(fields_row)
+
+        # Точная обрезка (медленнее)
+        self.precise_check = CheckBox("Точная обрезка (медленнее)", card)
+        self.precise_check.setChecked(False)
+        self.precise_check.setToolTip(
+            "Вкл: начало ровно в заданной секунде, но видео "
+            "перекодируется — это долго.\n"
+            "Выкл: быстро, но начало может сдвинуться на несколько "
+            "секунд к ближайшему ключевому кадру."
+        )
+        fb.addWidget(self.precise_check)
+
+        self.fragment_box.hide()
+        lay.addWidget(self.fragment_box)
+
         return card
 
     # ---------- действия ----------
@@ -496,6 +797,16 @@ class DownloadPage(QWidget):
         self.format_card.hide()
         self.empty_card.show()
         self._set_status("", "")
+        self._reset_fragment_state()
+
+    def _reset_fragment_state(self):
+        """Сброс UI фрагмента (новая ссылка / сброс превью): галочка
+        выключена, блок скрыт, значения — 0..0 (до следующего анализа)."""
+        self.fragment_check.setChecked(False)
+        self.fragment_check.setVisible(False)
+        self.fragment_box.hide()
+        self.range_slider.set_duration(0)
+        self._frag_inited_duration = None
 
     def _set_status(self, text, kind="info"):
         """kind: info / error / ok; '' — скрыть."""
@@ -562,6 +873,10 @@ class DownloadPage(QWidget):
 
         self._set_status("Ссылка поддерживается", "ok")
         self._render_quality()
+        # Фрагмент (1.0.5): галочка доступна только для одиночного видео
+        # с известной длительностью; при плейлисте — скрыта (допущение).
+        self._reset_fragment_state()
+        self.fragment_check.setVisible(self._fragment_available())
         self.download_btn.setEnabled(True)
 
         self._load_thumb(info["thumbnail"])
@@ -614,6 +929,122 @@ class DownloadPage(QWidget):
             self.quality_combo.addItem(text)
         self.quality_combo.setCurrentIndex(0)
 
+    # ---------- фрагмент (1.0.5) ----------
+
+    def _on_fragment_check(self):
+        """Галочка «Скачать только фрагмент»: показать/скрыть блок."""
+        show = self.fragment_check.isChecked()
+        # фрагмент доступен только для одиночного видео с длительностью
+        if show and self._fragment_available():
+            self.fragment_box.show()
+            self._init_fragment_ui()
+        else:
+            self.fragment_box.hide()
+            if show and not self._fragment_available():
+                # недоступно (плейлист/нет длительности): сбросить, чтобы
+                # не отправить в очередь невалидный диапазон
+                self.fragment_check.setChecked(False)
+
+    def _fragment_available(self):
+        """Фрагмент возможен: одиночное видео с известной длительностью
+        (плейлисты не поддерживаем — допущение из плана)."""
+        info = self.preview_info or {}
+        duration = info.get("duration") or 0
+        return bool(info) and not info.get("is_playlist") and duration >= 2
+
+    def _init_fragment_ui(self):
+        """Инициализация блока фрагмента после анализа (или повторная).
+
+        При повторном показе (галочку сняли и вернули) выбор сохраняется;
+        сброс — только при смене видео (другая длительность).
+        """
+        duration = int(self.preview_info.get("duration") or 0)
+        if getattr(self, "_frag_inited_duration", None) != duration:
+            self._frag_inited_duration = duration
+            self.range_slider.set_duration(duration)
+            # Дефолт: 0 .. duration (всё видео)
+            self._sync_fields_from_slider()
+        placeholder = "ч:мм:сс" if duration >= 3600 else "мм:сс"
+        self.frag_start_edit.setPlaceholderText(placeholder)
+        self.frag_end_edit.setPlaceholderText(placeholder)
+        self._update_fragment_summary()
+
+    def _on_slider_changed(self, start, end):
+        """Слайдер отпущен — обновить поля, подписи и сводку."""
+        self._sync_fields_from_slider()
+        self._update_fragment_summary()
+
+    def _sync_fields_from_slider(self):
+        """Поля точного ввода и подписи над ручками <- слайдер (включая
+        drag без отпускания: fieldsMoved)."""
+        start, end = self.range_slider.values()
+        self.frag_start_edit.setText(fmt_timecode(start))
+        self.frag_end_edit.setText(fmt_timecode(end))
+        self.frag_start_label.setText(fmt_timecode(start))
+        self.frag_end_label.setText(fmt_timecode(end))
+
+    def _on_fields_done(self):
+        """Поля (Enter/потеря фокуса) -> слайдер: с валидацией и клэмпами.
+
+        Invalid ввод не применяется (поля вернут слайдерные значения при
+        следующей синхронизации). Клэмпы те же, что у слайдера: конец не
+        раньше начала + 1 с, границы [0..duration].
+        """
+        start_s = parse_timecode(self.frag_start_edit.text())
+        end_s = parse_timecode(self.frag_end_edit.text())
+        duration = int((self.preview_info or {}).get("duration") or 0)
+
+        if start_s is None or end_s is None or duration <= 0:
+            self._sync_fields_from_slider()   # invalid — вернуть как есть
+            return
+        # правила к границам и минимальному фрагменту (как в слайдере)
+        start_s = max(0, min(start_s, duration))
+        end_s = max(0, min(end_s, duration))
+        if end_s - start_s < MIN_FRAGMENT_SECONDS:
+            self._sync_fields_from_slider()
+            return
+        self.range_slider.set_values(start_s, end_s)
+        self._sync_fields_from_slider()
+        self._update_fragment_summary()
+
+    def _update_fragment_summary(self):
+        """Длительность фрагмента + примерный размер (видео)."""
+        start, end = self.range_slider.values()
+        self.frag_range_label.setText(
+            f"{fmt_timecode(end - start)}"
+            + (f" • ~{fmt_mb(self._fragment_size(start, end))}"
+               if self._fragment_size(start, end) else "")
+        )
+
+    def _fragment_size(self, start, end):
+        """Примерный размер фрагмента = размер выбранного качества × доля.
+
+        Для аудио не показываем (нет данных в preview_info — допущение
+        из плана). Возвращает байты или None, если размер неизвестен.
+        """
+        info = self.preview_info or {}
+        if info.get("is_playlist") or not info.get("duration"):
+            return None
+        mode = "audio" if (self.mode_combo.currentText()
+                           == MODE_LABELS["audio"]) else "video"
+        if mode == "audio":
+            return None
+        heights = info.get("video_qualities") or []
+        sizes = info.get("quality_sizes") or {}
+        # выбранное качество — та же функция, что в _start_download
+        quality = self._selected_quality(mode)
+        if not heights:
+            return None
+        if quality == "best" or not quality.isdigit():
+            height = heights[0]
+        else:
+            height = int(quality)
+        size = sizes.get(height)
+        if not size:
+            return None
+        share = (end - start) / float(info["duration"])
+        return int(size * share)
+
     def _choose_dir(self):
         from PySide6.QtWidgets import QFileDialog
         path = QFileDialog.getExistingDirectory(
@@ -644,27 +1075,46 @@ class DownloadPage(QWidget):
             return
 
         mode = "audio" if self.mode_combo.currentText() == MODE_LABELS["audio"] else "video"
-        quality = "best"
-        if mode == "video" and self.preview_info:
-            heights = self.preview_info.get("video_qualities") or []
-            index = self.quality_combo.currentIndex()
-            if index == 0:
-                quality = "best"
-            elif 0 < index <= len(heights):
-                quality = str(heights[index - 1])
-            else:
-                # fallback: парсим подпись
-                label = self.quality_combo.currentText()
-                digits = "".join(ch for ch in label if ch.isdigit())
-                quality = digits if digits else "best"
+        quality = self._selected_quality(mode)
+
+        # Фрагмент (1.0.5): передаём диапазон при включённой галочке и
+        # валидном состоянии. isVisible() НЕ проверяем: видимость зависит
+        # от родительских виджетов (сворачивание/переключение страниц), и
+        # при False валидный выбор молча отбросился бы — скачалось бы
+        # полное видео вместо выбранных 30 секунд.
+        time_range = None
+        precise_cut = False
+        if self.fragment_check.isChecked() and self._fragment_available():
+            start, end = self.range_slider.values()
+            if end - start >= MIN_FRAGMENT_SECONDS:
+                time_range = (start, end)
+                precise_cut = self.precise_check.isChecked()
 
         self.manager.add(
             url, mode=mode, quality=quality, output_dir=output_dir,
             playlist=self.playlist_check.isChecked(),
+            time_range=time_range, precise_cut=precise_cut,
         )
         self._reset_preview()
         self.url_edit.clear()
         self._rebuild_current()
+
+    def _selected_quality(self, mode):
+        """Выбранное качество («best» или высота в пикселях) — единая
+        точка для _start_download и _fragment_size (иначе расчётный
+        размер показался бы не от того качества)."""
+        if mode == "audio" or not self.preview_info:
+            return "best"
+        heights = self.preview_info.get("video_qualities") or []
+        index = self.quality_combo.currentIndex()
+        if index == 0:
+            return "best"
+        if 0 < index <= len(heights):
+            return str(heights[index - 1])
+        # fallback: цифры из подписи (как было в _start_download)
+        label = self.quality_combo.currentText()
+        digits = "".join(ch for ch in label if ch.isdigit())
+        return digits if digits else "best"
 
     # ---------- текущие загрузки ----------
 
@@ -775,7 +1225,20 @@ class QueueCard(CardWidget):
             STATUS_ERROR: "Ошибка",
         }.get(item.status, item.status)
 
+        # 1.0.5: фрагмент качается через ffmpeg-процесс (FFmpegFD) без
+        # progress-hooks — процента нет, но статус честный: «Скачивание
+        # фрагмента…» вместо зависшего «Анализ…». При точной обрезке
+        # (перекодирование) это может занять несколько минут.
+        if (item.time_range and item.status == STATUS_DOWNLOADING):
+            status_text = "Скачивание фрагмента…"
+            if item.precise_cut:
+                status_text += " Точная обрезка — может занять несколько минут"
+
         parts = [status_text]
+        if item.time_range:
+            # Фрагмент (1.0.5): метка в карточке задачи
+            start, end = item.time_range
+            parts.insert(0, f"фрагмент {fmt_timecode(start)}–{fmt_timecode(end)}")
         if item.status == STATUS_DOWNLOADING:
             self.bar.show()
             self.bar.setValue(int(item.progress))
@@ -814,9 +1277,16 @@ class QueueCard(CardWidget):
         self._last_status = item.status
 
         self._clear_actions()
+        # 1.0.5: у фрагмента пауза скрыта — yt-dlp качает секции через
+        # FFmpegFD (ffmpeg-процесс), progress-hooks не дергаются и
+        # посреди скачивания пауза/докачка .part неприменимы. «Отмена»
+        # остаётся и срабатывает сразу — её обрабатывает сторож
+        # (_fragment_watch в downloader.py), не дожидаясь конца ffmpeg.
+        can_pause = not item.time_range
         if item.status in (STATUS_DOWNLOADING, STATUS_QUEUED,
                            STATUS_ANALYZING):
-            self._add_action("Пауза", lambda: self.manager.pause(item.id))
+            if can_pause:
+                self._add_action("Пауза", lambda: self.manager.pause(item.id))
             self._add_action("Отмена", lambda: self.manager.cancel(item.id))
         elif item.status == STATUS_PAUSED:
             self._add_action("Продолжить",
@@ -965,12 +1435,14 @@ class LibraryRow(CardWidget):
             ("quality", entry.get("quality")),
             ("size", entry.get("size_text")),
             ("duration", entry.get("duration_text")),
+            ("fragment", entry.get("fragment")),
             ("format", entry.get("format")),
             ("source", entry.get("source")),
         ):
             if value:
                 label = {"quality": "Качество", "size": "Размер",
-                         "duration": "Длительность", "format": "Формат",
+                         "duration": "Длительность", "fragment": "Фрагмент",
+                         "format": "Формат",
                          "source": "Источник"}.get(key)
                 detail_parts.append(f"{label}: {value}")
         details = BodyLabel("  •  ".join(detail_parts) if detail_parts else "",
@@ -1770,6 +2242,13 @@ class MainWindow(FluentWindow):
         for path in item.files:
             if not os.path.isfile(path):
                 continue
+            # 1.0.5: фрагмент помечается в записи истории — Библиотека
+            # показывает, что это фрагмент (AC7); путь уникален за счёт
+            # суффикса [clip Ns-Ms], записи не вытесняют друг друга.
+            fragment = None
+            if item.time_range:
+                fragment = fmt_timecode(item.time_range[0]) + "-" + \
+                    fmt_timecode(item.time_range[1])
             config.add_history(self.settings, {
                 "url": item.url,
                 "source": source_from_url(item.url),
@@ -1777,6 +2256,7 @@ class MainWindow(FluentWindow):
                 "quality": item.quality if item.quality != "best" else "Лучшее",
                 "duration": item.duration,
                 "mode": item.mode,
+                "fragment": fragment,
                 "thumbnail": item.thumbnail,
                 "path": path,
             })
