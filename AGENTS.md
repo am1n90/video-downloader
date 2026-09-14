@@ -8,8 +8,35 @@
 очередь с паузой/докачкой, библиотека, автообновление через GitHub Releases.
 Пользователь — владелец репозитория am1n90. Язык общения — русский.
 
-## Текущее состояние (13 сентября 2026, v1.0.4 — релиз опубликован)
+## Текущее состояние (14 сентября 2026, v1.0.5 — релиз опубликован)
 
+- Версия: **1.0.5** (APP_VERSION в config.py). Изменения против 1.0.4:
+  скачивание фрагмента (галочка «Скачать только фрагмент», RangeSlider
+  двумя ручками, поля мм:сс/ч:мм:сс, ~размер, «Точная обрезка», имя
+  «[clip Ns-Ms]», сторож _fragment_watch, пауза скрыта, ContextVar-фикс
+  ffmpeg) + _kill_fragment_ffmpeg: отмена фрагмента убивает
+  ffmpeg-сироту (CIM Win32_Process, фильтр: ParentProcessId == наш PID
+  + [clip Ns-Ms] + normcase(output_dir), os.kill(pid, 9))
+- **Релиз v1.0.5 опубликован 14.09.2026 (Latest)**: коммит 7374b73
+  «1.0.5: fragment download + kill orphan ffmpeg on cancel» (push в
+  main) + 1a197f9 «sync: 2026-09-14-0747» (sync.bat закоммитил себя и
+  pull.bat). Порядок как в 1.0.4: draft → exe 180 880 028 байт (sha256
+  b62d0513…5eee) + latest.json → тройная сверка digest==sha256==
+  latest.json → --draft=false. Тег v1.0.5 → 7374b73 = main; алиас
+  latest/download/latest.json отдаёт 1.0.5; в релизе 2 ассета
+- **Сборка 1.0.5 выполнена 14.09.2026**: Output\VideoDownloader-
+  Setup-1.0.5.exe (180 880 028 байт) + latest.json (sha256 сошёлся);
+  все 7 шагов build.bat OK (curl_cffi-бинарники в dist, selftest exe).
+  Установка /VERYSILENT — INSTALL_EXIT=0; состав установленной копии
+  цел (exe/ffmpeg/ffprobe/deno/_wrapper.pyd/libcurl-impersonate),
+  selftest exit=0; backup settings.json.bak-20260914-070200.
+  Живые проверки установленной копии
+  (.vd-tests\check_installed_fragment.py — **10 PASS, 0 FAIL**):
+  YouTube-фрагмент 0:30–1:00 precise — отмена при РЕАЛЬНО работающем
+  ffmpeg (CIM-дочерний pid=17164, tasklist count=1) → задача ERROR
+  «Отменено» за 1.2 с, ffmpeg исчез из tasklist через 1.7 с — сироты
+  нет; полное видео 24.2 МБ webm + audio-поток (не сломано); MP3-
+  фрагмент 30.0 с + audio-поток
 - Версия: **1.0.4** (APP_VERSION в config.py). Изменения против 1.0.3:
   TikTok починен — curl_cffi==0.16.0 в requirements.txt (impersonation
   для yt-dlp, без него любая ссылка TikTok падает «Unexpected response
@@ -54,8 +81,9 @@
 - Рабочая машина: домашний ноутбук (свежий клон, см. «Историю» 11.09):
   Python 3.14.5 в PATH, build-venv пересоздан, requirements.txt стоит
   (PySide6 6.11.2, qfluentwidgets 1.11.3, curl_cffi 0.16.0 — колёса
-  под 3.14 есть); Inno Setup 6 и gh CLI НЕ установлены (для сборки/релиза понадобятся:
-  winget 1.29.290 / choco 2.7.2 доступны); GH_TOKEN не задан
+  под 3.14 есть); Inno Setup 6.7.3 и gh CLI 2.100.0 установлены (ISCC
+  в %LOCALAPPDATA%\Programs\Inno Setup 6; gh — keyring, am1n90, в bash
+  не в PATH — полный путь /c/Program Files/GitHub CLI/gh.exe)
 - Сборка 1.0.2: Output\VideoDownloader-Setup-1.0.2.exe (168 198 089
   байт) + latest.json (sha256 сходится) — на старой машине; релиз
   v1.0.2 опубликован 11.09.2026 (Latest), алиас latest отдаёт 1.0.2,
@@ -131,7 +159,8 @@
    фрагмента (отмена сразу; VK-зависание → понятная ошибка через
    10 мин без роста файлов), пауза скрыта (FFmpegFD без
    progress-hooks), ContextVar-фикс ffmpeg. Детали — «История»
-   13.09; сборка/релиз — по «ок» владельца
+   13.09; сборка/релиз — **ВЫПОЛНЕНО 14.09.2026** (см. «Текущее
+   состояние» и «Историю»)
 5. ~~**TikTok не работает в собранной программе**~~ — **ВЫПОЛНЕНО
    12.09.2026, v1.0.4**: curl_cffi ==0.16.0 в requirements.txt
    (рекомендация yt-dlp из METADATA pin-curl-cffi; проверен 12.09 на
@@ -167,6 +196,8 @@
     os.kill(pid, 9). Ошибки в yt-dlp.log, «не найдено» молча.
     Тесты: test_fragment §8 (4 сценария: три условия, OSError ×2,
     time_range=None).
+    (1.0.5 выпущен 14.09 — kill-сироты проверен вживую в установленной
+    копии: ffmpeg исчез из tasklist через 1.7 с после отмены).
     Осталось: **VK фрагмент прямым форматом (url1080)** —
     HLS-секция висит на медленном CDN, прямой формат url1080
     фрагмент качает (12.8 МБ, 30.08с, h264+aac, 3 кадра)
@@ -207,6 +238,16 @@
   в корне проекта
 - `set_version.ps1` — подстановка APP_VERSION в installer.iss (вызывается
   из build.bat; прежний inline powershell был сломан кавычками cmd)
+- `sync.bat` — точка синхронизации с GitHub: чистое дерево →
+  «Working tree is clean. Nothing to sync.» + log -1; грязное →
+  git add -A, коммит «sync: <yyyy-MM-dd-HHmm>», push origin main,
+  log -1, сверка main == origin/main. Только git + cmd builtins
+  (проверка грязи через %%~zA временного файла — БЕЗ find: в Git Bash
+  PATH GNU find затеняет Windows find.exe, из-за чего find /c /v
+  ломался)
+- `pull.bat` — обновление с GitHub: незакоммиченные изменения → STOP
+  (сначала коммит или sync.bat); чистое дерево → git pull --ff-only
+  origin main + log -1. Те же builtins, без find
 - `assets/app.ico` — иконка 16–256px
 
 ## Сборка (build.bat)
@@ -310,6 +351,36 @@ VideoDownloader`, без UAC, AppId фиксированный, RU/EN, ярлы�
   не повторять сразу
 
 ## История
+
+- **14.09.2026, v1.0.5 — сборка, установка, живые проверки, релиз
+  (draft-first), sync.bat/pull.bat**: сборка 07:10–07:19 (все 7 шагов
+  OK, exe 180 880 028 байт, sha256 b62d0513…45eee == latest.json),
+  установка /VERYSILENT INSTALL_EXIT=0, selftest установленной копии
+  exit=0, состав цел, backup settings.json.bak-20260914-070200.
+  Живые проверки (check_installed_fragment.py, 10 PASS): фрагмент BBB
+  0:30–1:00 precise → DOWNLOADING за 0.4с → ffmpeg реально работает
+  (CIM-дочерний нашего PID, tasklist count=1>0) → отмена → ERROR
+  «Отменено» за 1.2с, ffmpeg исчез из tasklist за 1.7с — kill сироты
+  работает (противоречие записи 13.09 «в 1.0.5 НЕ реализовано» снято:
+  код был в дереве 13.09, п.12 «Что осталось» верен, форма записи
+  введена в заблуждение черновиком «Истории»); полное видео 24.2 МБ
+  webm + audio-поток; MP3-фрагмент 30.0с + audio. Релиз: коммит
+  7374b73 → push → draft → ассеты (exe + latest.json) → тройная
+  сверка (digest==sha256==latest.json, размер байт-в-байт) →
+  --draft=false; тег v1.0.5 → 7374b73 = main; latest-алиас отдаёт
+  1.0.5. sync.bat + pull.bat (ASCII; git + cmd builtins, %%~zA без
+  find — GNU find из Git Bash PATH ломал find /c /v; проверены
+  вживую: pull STOP на грязном дереве exit 1, sync коммит «sync:
+  2026-09-14-0747» 1a197f9 + push + OK main==origin/main).
+  Инциденты дня: bash-терминал дважды зависал на heredoc-подаче
+  (первая «зависшая» команда в фоне всё же выполнилась и успела
+  запустить сборку — до повторных действий проверять процессы и
+  build-*.log, дубль не создавать); у edit-инструмента этой сессии
+  при создании файла нельзя передавать пустой old_text; файлы >6К
+  пишутся кусками. MSYS TEMP=/tmp: Python в WMI-запусках видит
+  настоящий %TEMP%, но в скриптах пути задавать абсолютными;
+  WMI cmd.exe /c ломается на кавычках в «Claude Projects» —
+  обёртка powershell -File
 
 - **13.09.2026, v1.0.5 «Фрагмент видео» — код + тесты, без сборки/релиза**:
   галочка «Скачать только фрагмент» (выкл. по умолчанию; доступна
