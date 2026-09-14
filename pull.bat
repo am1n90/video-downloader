@@ -30,11 +30,13 @@ if "%DIRTY%"=="1" (
 )
 
 git pull --ff-only origin main
-if errorlevel 1 (
-    echo FAIL: git pull --ff-only failed (diverged history or network?).
-    exit /b 1
-)
+if errorlevel 1 goto :pull_failed
 
 echo.
 git log -1 --oneline
 endlocal
+goto :eof
+
+:pull_failed
+echo FAIL: git pull --ff-only failed (diverged history or network?).
+exit /b 1

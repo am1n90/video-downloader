@@ -44,10 +44,7 @@ if errorlevel 1 (
 )
 
 git push origin main
-if errorlevel 1 (
-    echo FAIL: git push failed.
-    exit /b 1
-)
+if errorlevel 1 goto :push_failed
 
 echo.
 git log -1 --oneline
@@ -59,3 +56,8 @@ if "%L%"=="%R%" (
     echo WARN: main differs from origin/main - check git log.
 )
 endlocal
+goto :eof
+
+:push_failed
+echo FAIL: git push failed.
+exit /b 1
