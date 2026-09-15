@@ -43,7 +43,9 @@ def corrupt_copies(directory):
 
 def reset_flags():
     config._corrupt_backed_up = False
+    config._corrupt_backup_path = None
     config._skip_saving = False
+    config._load_warning = None
 
 
 def fresh(name):
@@ -62,6 +64,7 @@ try:
     s = config.load()
     check("1 missing: дефолты без исключений", s == config.DEFAULTS)
     check("1 missing: .corrupt-копии нет", corrupt_copies(d) == [])
+    check("1 missing: warning None (AC2)", config.consume_load_warning() is None)
     config.save({"theme": "dark"})
     check("1 missing: save работает", config.load().get("theme") == "dark")
 
@@ -79,9 +82,20 @@ try:
         check("2 битый JSON: копия == исходные байты", body == broken)
     check("2 битый JSON: app.log пишет о копии",
           "копия" in app_log_text()[base:])
+    warning = config.consume_load_warning()
+    check("2 битый JSON: warning не None", warning is not None, str(warning))
+    if warning is not None:
+        check("2 битый JSON: warning.skip_saving == False",
+              warning.get("skip_saving") is False)
+        check("2 битый JSON: warning.corrupt_path указывает на копию",
+              copies and warning.get("corrupt_path") == os.path.join(d, copies[0]))
+    check("2 битый JSON: consume второй раз -> None (AC3)",
+          config.consume_load_warning() is None)
     config.save({"theme": "dark"})
     check("2 битый JSON: save перезаписывает (копия есть)",
           config.load().get("theme") == "dark")
+    check("2 битый JSON: нормальный load -> warning None (AC2)",
+          config.consume_load_warning() is None)
 
     # ---- сценарий 3: обрыв записи ----
     p, d = fresh("s3")
@@ -175,6 +189,12 @@ try:
           len(lines) >= 2, str(lines[:2]))
     check("7 save-off: паузы >= 0.2с", elapsed >= 0.2, f"{elapsed:.2f}с")
     check("7 save-off: _skip_saving взведён", config._skip_saving is True)
+    warning7 = config.consume_load_warning()
+    check("7 save-off: warning.skip_saving == True",
+          warning7 is not None and warning7.get("skip_saving") is True,
+          str(warning7))
+    check("7 save-off: warning.corrupt_path is None (копия не вышла)",
+          warning7 is not None and warning7.get("corrupt_path") is None)
 
     # ---- сценарий 8: os.replace x2 -> успех ----
     p, d = fresh("s8")

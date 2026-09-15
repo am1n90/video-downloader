@@ -110,10 +110,12 @@
   правки владельца: без повторного скачивания после успешного
   extract_info, дисковые ошибки без повторов), manifest 4,
   check_installed_tiktok (AC3 в установленной копии), library (28 проверок), gui smoke,
-  p1 concurrency, config_robust 40, ytdlp_logger 8, e2e download,
-  live fetch_info, check_sources (analyze/download, range-фрагменты,
-  кадры; sources.local.txt — личное, в .gitignore) + вспомогательные
-  make_demo_data.py / live_demo_check.py. Запуск:
+  p1 concurrency, config_robust **48** (1.0.5: +8 на consume_load_warning,
+  п.9 «Что осталось»), config_warning_gui **7** новый (1.0.5: InfoBar
+  предупреждения о повреждённом settings.json, offscreen), ytdlp_logger 8,
+  e2e download, live fetch_info, check_sources (analyze/download,
+  range-фрагменты, кадры; sources.local.txt — личное, в .gitignore) +
+  вспомогательные make_demo_data.py / live_demo_check.py. Запуск:
   build-venv\Scripts\python.exe .vd-tests\<имя> с PYTHONIOENCODING=utf-8
   (GUI-тесты — с QT_QPA_PLATFORM=offscreen)
 - config (F1/F2/F3): load() никогда не бросает (ValueError=JSON+Unicode);
@@ -121,7 +123,13 @@
   запуск; если копия не вышла — save() отключён до перезапуска
   (_skip_saving: закрытие не затрёт данные); save() атомарен (tmp+fsync+
   os.replace, 3 ретрая с паузой 0.1с, ловит любой OSError + TypeError/
-  ValueError; исключение наружу не выходит — не блокирует closeEvent)
+  ValueError; исключение наружу не выходит — не блокирует closeEvent).
+  1.0.5 (п.9): load() кладёт результат в consume_load_warning()
+  ({"skip_saving": bool, "corrupt_path": str|None}, сбрасывается при
+  отдаче — одноразово за сессию); gui.run() показывает InfoBar один раз
+  при старте (MainWindow.show_config_warning): копия создана — warning
+  с кнопками «Открыть папку»/«Скопировать путь» на .corrupt-файл;
+  _skip_saving — error без кнопок (данные не сохранятся вообще)
 - ВАЖНО: старая сборка (от 14:40 09.09) НЕ читала settings.json с BOM
   (PowerShell 5.1 Set-Content пишет BOM). С 1.0.0 (16:54) чтение utf-8-sig.
   При ручном патче настроек — писать БЕЗ BOM. dev settings.json на этом
@@ -189,9 +197,10 @@
    merge, MP3, пауза/.part, кириллица/пробелы, деинсталляция
 8. Перевести build_ffmpeg.ps1 на ASCII (работает, но кириллица
    без BOM читается PS 5.1 как ANSI)
-9. Если settings.json не читается и сохранение отключено
+9. ~~Если settings.json не читается и сохранение отключено
    (_skip_saving) — показывать пользователю предупреждение в GUI
-   (InfoBar); сейчас это видно только в app.log
+   (InfoBar); сейчас это видно только в app.log~~ — **ВЫПОЛНЕНО
+   15.09.2026** (код + тесты, без сборки/релиза; см. «Историю»)
 10. ~~Защита от второго экземпляра (single instance)~~ — **ВЫПОЛНЕНО
    15.09.2026** (см. «Историю»)
 11. Дистрибуция: README для пользователей (SmartScreen), при желании
@@ -366,6 +375,40 @@ VideoDownloader`, без UAC, AppId фиксированный, RU/EN, ярлы�
   не повторять сразу
 
 ## История
+
+- **15.09.2026, GUI-предупреждение при повреждённом settings.json
+  (п.9 «Что осталось») — код + тесты, без сборки/релиза**: до этой
+  задачи load() только писал в app.log — пользователь не видел, что
+  сохранение в этом запуске частично или полностью отключено.
+  config.py: `_backup_corrupt()` теперь возвращает путь к .corrupt-копии
+  (или None), `load()` кладёт итог в модульную `_load_warning`
+  ({"skip_saving": bool, "corrupt_path": str|None}), новая функция
+  `consume_load_warning()` отдаёт и сразу сбрасывает — гарантия «один раз
+  за сессию» на стороне config, а не GUI. Важная находка при разборе
+  кода: `_skip_saving=True` ставится только когда .corrupt-копию
+  сохранить НЕ удалось (диск/права) — в обычном случае повреждённого,
+  но читаемого файла копия создаётся успешно и `_skip_saving` остаётся
+  False (save() продолжает работать, просто поверх пишутся дефолты
+  текущей сессии). Поэтому GUI-предупреждение показывается при любом
+  нечитаемом/повреждённом settings.json, а не только при _skip_saving —
+  иначе сценарий «битый JSON» из задачи не подсветился бы вовсе. gui.py:
+  `MainWindow.show_config_warning(warning)` вызывается один раз из
+  `run()` после `window.show()`; при `_skip_saving=True` — `InfoBar.error`
+  без кнопок («настройки не сохранятся, перезапустите»); при успешной
+  .corrupt-копии — `InfoBar.warning` с текстом без жаргона + две кнопки
+  (по образцу «Открыть папку» из Библиотеки): «Открыть папку»
+  (`QDesktopServices.openUrl` на директорию копии) и «Скопировать путь»
+  (`QGuiApplication.clipboard().setText`) — путь к .corrupt-файлу длинный,
+  копипаст текстом в один InfoBar неудобен. Тесты: test_config_robust
+  +8 (40->48: consume_load_warning для сценариев «битый JSON»/«copy не
+  вышла»/повторный consume->None/обычный load->None), новый
+  test_config_warning_gui.py (7 PASS, offscreen): обычный старт без
+  InfoBar, битый файл -> ровно один InfoBar с обеими кнопками и без
+  техжаргона в тексте, skip_saving -> отдельный InfoBar, повторный
+  consume в той же сессии не показывает второй раз. Весь офлайн-набор
+  зелёный (core 38, retry 42, manifest 4, library, gui smoke,
+  p1 concurrency, config_robust 48, ytdlp_logger 8, fragment 123,
+  single_instance 7, config_warning_gui 7).
 
 - **15.09.2026, single instance protection (п.10 «Что осталось») —
   код + тесты, без сборки/релиза**: новый `single_instance.py`

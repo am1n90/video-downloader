@@ -2348,6 +2348,55 @@ class MainWindow(FluentWindow):
         if self.settings.get("check_updates", True):
             QTimer.singleShot(2500, lambda: self.settings_page.check_updates(silent=True))
 
+    def show_config_warning(self, warning):
+        """Предупреждение о повреждённом settings.json (п.9 «Что осталось»).
+
+        warning — словарь из config.consume_load_warning() (см. run()):
+        {"skip_saving": bool, "corrupt_path": str|None}. Вызывается ровно
+        один раз при старте — сам config гарантирует, что второй вызов
+        consume_load_warning() в этой сессии вернёт None.
+        """
+        if warning is None:
+            return
+        corrupt_path = warning.get("corrupt_path")
+        if warning.get("skip_saving"):
+            title = "Настройки не сохранятся"
+            content = ("Файл настроек повреждён, и восстановить резервную "
+                       "копию не удалось. Все изменения в этом запуске "
+                       "программы (настройки, история загрузок) пропадут "
+                       "при закрытии — перезапустите программу.")
+            bar = InfoBar.error(
+                title=title, content=content, orient=Qt.Horizontal,
+                isClosable=True, position=InfoBarPosition.TOP,
+                duration=-1, parent=self,
+            )
+        else:
+            title = "Настройки были повреждены"
+            content = ("Файл настроек нельзя было прочитать, поэтому "
+                       "использованы значения по умолчанию. Ваши прежние "
+                       "настройки и история сохранены в отдельном файле — "
+                       "их можно восстановить вручную.")
+            bar = InfoBar.warning(
+                title=title, content=content, orient=Qt.Horizontal,
+                isClosable=True, position=InfoBarPosition.TOP,
+                duration=-1, parent=self,
+            )
+            if corrupt_path:
+                folder = os.path.dirname(corrupt_path)
+                folder_btn = PushButton("Открыть папку", bar)
+                folder_btn.clicked.connect(
+                    lambda: os.path.isdir(folder) and QDesktopServices.openUrl(
+                        QUrl.fromLocalFile(folder)
+                    )
+                )
+                bar.addWidget(folder_btn)
+                copy_btn = PushButton("Скопировать путь", bar)
+                copy_btn.clicked.connect(
+                    lambda: QGuiApplication.clipboard().setText(corrupt_path)
+                )
+                bar.addWidget(copy_btn)
+        bar.show()
+
     # ---------- навигация ----------
 
     def _setup_navigation(self):
@@ -2486,6 +2535,7 @@ def run():
         # показываем собственное окно вместо тихого выхода.
 
     settings = config.load()
+    config_warning = config.consume_load_warning()
     window = MainWindow(settings)
 
     signal_holder = _SingleInstanceSignal()
@@ -2500,6 +2550,7 @@ def run():
     single_instance.start_pipe_server(signal_holder.show_requested.emit)
 
     window.show()
+    window.show_config_warning(config_warning)
 
     geometry = settings.get("window_geometry")
     if geometry:

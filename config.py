@@ -64,7 +64,9 @@ _loggers = {}                 # имена уже созданных логге�
 _log_dir_cache = None         # каталог логов (кэшируется)
 
 _corrupt_backed_up = False    # .corrupt-копия: не больше одной за запуск
+_corrupt_backup_path = None   # путь .corrupt-копии этого запуска (для GUI)
 _skip_saving = False          # файл не читался и копии нет: не перезаписывать
+_load_warning = None          # предупреждение GUI о последнем load() (см. consume_load_warning)
 
 
 # ---------- единый механизм логов (config и downloader) ----------
@@ -167,25 +169,27 @@ def _backup_corrupt(reason):
     Копия — единственный шанс восстановить данные вручную: следующим
     save() файл будет перезаписан. Не больше одной копии за запуск:
     _corrupt_backed_up ставится только при успехе копии. Возвращает
-    True, если копия создана (в том числе ранее в этом же запуске —
-    повторный load() не должен отключать save()).
+    путь к копии, если она создана (в том числе ранее в этом же
+    запуске — повторный load() не должен отключать save() и не должен
+    плодить вторую копию), иначе None.
     """
-    global _corrupt_backed_up
+    global _corrupt_backed_up, _corrupt_backup_path
     if _corrupt_backed_up:
-        return True
+        return _corrupt_backup_path
     if not os.path.isfile(CONFIG_PATH):
-        return False
+        return None
     stamp = time.strftime("%Y%m%d-%H%M%S")
     copy_path = f"{CONFIG_PATH}.corrupt-{stamp}"
     try:
         shutil.copy2(CONFIG_PATH, copy_path)
     except OSError as exc:
         _app_log(f"не удалось сохранить копию повреждённого settings.json: {exc}")
-        return False
+        return None
     _corrupt_backed_up = True
+    _corrupt_backup_path = copy_path
     _app_log(f"settings.json повреждён ({reason}); копия: "
              f"settings.json.corrupt-{stamp}; загружены дефолты")
-    return True
+    return copy_path
 
 
 def load():
@@ -198,20 +202,28 @@ def load():
       - если копию сохранить не удалось — save() отключается до конца
         запуска (_skip_saving), чтобы закрытие приложения не затёрло
         файл дефолтами: данные должны оставаться целыми.
-    Никогда не бросает исключений (вызывается при старте приложения).
+    В обоих случаях выставляет _load_warning (см. consume_load_warning)
+    для предупреждения в GUI. Никогда не бросает исключений (вызывается
+    при старте приложения).
     """
-    global _skip_saving
+    global _skip_saving, _load_warning
     settings = dict(DEFAULTS)
     with _lock:
         data, exc = _read_settings()
         if data is _READ_MISSING:
+            _load_warning = None
             return settings
         if data is _READ_FAILED or not isinstance(data, dict):
             reason = f"{type(exc).__name__}: {exc}" if exc else "не словарь"
-            if not _backup_corrupt(reason):
+            corrupt_path = _backup_corrupt(reason)
+            if not corrupt_path:
                 _skip_saving = True
                 _app_log("settings.json не читался и резервная копия не "
                          "создана: сохранение отключено до перезапуска")
+            _load_warning = {
+                "skip_saving": _skip_saving,
+                "corrupt_path": corrupt_path,
+            }
             return settings
         settings.update({k: v for k, v in data.items() if k in DEFAULTS})
         # 1.0.3: у истории могла накопиться одна запись на путь (до 1.0.3
@@ -220,7 +232,23 @@ def load():
         # (add_history всегда вставляет в начало). Некорректные записи
         # (не dict / без path) не трогаем — их фильтрует get_history().
         settings["history"] = _dedup_history(settings.get("history"))
+        _load_warning = None
         return settings
+
+
+def consume_load_warning():
+    """Отдаёт предупреждение о settings.json из последнего load() и сбрасывает его.
+
+    Возвращает None (файл читался нормально или ещё не было load()) или
+    словарь {"skip_saving": bool, "corrupt_path": str|None} — GUI должен
+    показать его пользователю один раз при старте. Сброс после отдачи
+    гарантирует, что предупреждение не покажется повторно за сессию,
+    даже если consume_load_warning() вызовут больше одного раза.
+    """
+    global _load_warning
+    warning = _load_warning
+    _load_warning = None
+    return warning
 
 
 def _dedup_history(history):
