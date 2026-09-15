@@ -6,7 +6,7 @@
 ; ============================================================
 
 #define MyAppName "Video Downloader"
-#define MyAppVersion "1.0.6"
+#define MyAppVersion "1.0.7"
 #define MyAppPublisher "VideoDownloader"
 #define MyAppExeName "VideoDownloader.exe"
 #define MyAppId "{{8F5C2A71-3D64-4B7E-9A1F-6C2E8D4B7A90}"
@@ -21,7 +21,7 @@ DefaultGroupName={#MyAppName}
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
 OutputDir=Output
-OutputBaseFilename=VideoDownloader-Setup-1.0.6
+OutputBaseFilename=VideoDownloader-Setup-1.0.7
 SetupIconFile=assets\app.ico
 Compression=lzma2/max
 SolidCompression=yes
