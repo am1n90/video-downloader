@@ -125,7 +125,7 @@ def fmt_duration(seconds):
 
 
 def parse_timecode(text):
-    """«м:сс» / «ч:мм:сс» / «90» (голые секунды) -> секунды, иначе None.
+    r"""«м:сс» / «ч:мм:сс» / «90» (голые секунды) -> секунды, иначе None.
 
     Ведущие нули допустимы («0:35», «02:10», «1:00:00») — fmt_timecode
     пишет именно так, поля должны принимать свой же вывод. Для полей
@@ -455,6 +455,14 @@ class FramePreviewWorker(QThread):
     видео целиком. Сеть/декод — в фоне; при любой ошибке (нет ffmpeg,
     таймаут, площадка не даёт прямой URL) просто emit'ит пустой QImage —
     превью тихо не показывается, интерфейс не блокируется и не падает.
+
+    ffmpeg запускается через Popen (не run) специально ради stop():
+    на VK-формате (HLS) кадр иногда тянется ~17с — если пользователь
+    закрыл окно или дёрнул ползунок ещё раз раньше, run() должен
+    освободить поток НЕМЕДЛЕННО, а не ждать таймаут до конца. Без
+    этого процесс Python не завершался бы, пока ffmpeg сам не
+    досчитает (проверено: закрытие окна во время VK-превью держало
+    процесс живым ~14с вместо мгновенного выхода).
     """
 
     loaded = Signal(QImage)
@@ -464,6 +472,20 @@ class FramePreviewWorker(QThread):
         self.url = url
         self.headers = headers or {}
         self.second = max(0, int(second))
+        self._proc = None
+        self._stopped = False
+
+    def stop(self):
+        """Прервать досрочно: устаревший запрос (новее уже в пути) или
+        закрытие окна. Убивает ffmpeg, если он ещё жив — run() после
+        этого разблокируется сразу же на communicate()."""
+        self._stopped = True
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def run(self):
         image = QImage()
@@ -480,12 +502,17 @@ class FramePreviewWorker(QThread):
             kwargs = {}
             if sys.platform == "win32":
                 kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            result = subprocess.run(
+            self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                timeout=12, **kwargs,
+                **kwargs,
             )
-            if result.returncode == 0 and result.stdout:
-                image.loadFromData(result.stdout)
+            try:
+                stdout, _ = self._proc.communicate(timeout=20)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                stdout, _ = self._proc.communicate()
+            if self._proc.returncode == 0 and stdout and not self._stopped:
+                image.loadFromData(stdout)
         except Exception:
             image = QImage()
         self.loaded.emit(image)
@@ -892,6 +919,18 @@ class DownloadPage(QWidget):
         self._frag_inited_duration = None
         self._preview_debounce.stop()
         self.frag_preview_label.hide()
+        self._stop_preview_worker()
+
+    def _stop_preview_worker(self):
+        """Убить фоновый ffmpeg превью, если он ещё жив (устарел, ручку
+        отпустили, закрывается страница) — иначе он может держать поток
+        занятым до собственного таймаута вместо мгновенной остановки."""
+        if self._preview_worker is not None and self._preview_worker.isRunning():
+            try:
+                self._preview_worker.loaded.disconnect(self._on_frame_preview_loaded)
+            except (RuntimeError, TypeError):
+                pass
+            self._preview_worker.stop()
 
     def _set_status(self, text, kind="info"):
         """kind: info / error / ok; '' — скрыть."""
@@ -1061,6 +1100,7 @@ class DownloadPage(QWidget):
         self._update_fragment_summary()
         self._preview_debounce.stop()
         self.frag_preview_label.hide()
+        self._stop_preview_worker()
 
     def _sync_fields_from_slider(self):
         """Поля точного ввода над ручками <- слайдер (включая drag без
@@ -1090,8 +1130,7 @@ class DownloadPage(QWidget):
             return
         start, end = self.range_slider.values()
         second = start if which == "start" else end
-        if self._preview_worker is not None and self._preview_worker.isRunning():
-            self._preview_worker.loaded.disconnect(self._on_frame_preview_loaded)
+        self._stop_preview_worker()   # не копить фоновые ffmpeg-процессы
         self._preview_worker = FramePreviewWorker(
             fmt["url"], fmt.get("http_headers"), second, self
         )
@@ -2394,7 +2433,7 @@ class MainWindow(FluentWindow):
         # «QThread destroyed while thread is still running».
         # Сначала politely: cancel() у воркеров с отменой, затем wait().
         threads = []
-        for attr in ("_analyze_worker", "_thumb_worker"):
+        for attr in ("_analyze_worker", "_thumb_worker", "_preview_worker"):
             thread = getattr(self.download_page, attr, None)
             if thread is not None:
                 threads.append(thread)
@@ -2404,6 +2443,12 @@ class MainWindow(FluentWindow):
             threads.append(update_worker)
         for thread in threads:
             try:
+                # FramePreviewWorker: quit()/wait() тут бессильны — поток
+                # блокирован на ffmpeg (Popen), а не в цикле событий. Без
+                # явного stop() (kill процесса) выход держался бы до конца
+                # таймаута ffmpeg (замечено — до ~17-20с на VK).
+                if hasattr(thread, "stop"):
+                    thread.stop()
                 thread.quit()
                 thread.wait(2000)
             except Exception:

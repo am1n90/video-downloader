@@ -478,6 +478,64 @@ app.processEvents()   # доставить loaded (queued connection, поток
 check("gui: FramePreviewWorker на некорректном URL -> пустой QImage (не падает)",
       "image" in _fp_result and _fp_result["image"].isNull())
 
+# ---- 1.0.6: stop() должен прервать worker НЕМЕДЛЕННО, а не ждать таймаут
+# ffmpeg до конца (VK/HLS реально тянется ~17-20с - без stop() закрытие
+# окна держало бы процесс живым всё это время, см. отчёт по проверке) ----
+import subprocess as _subprocess
+import threading as _threading
+import time as _time_mod
+
+
+class _FakeSlowProc:
+    """Имитирует ffmpeg, который завис в communicate() - как реальный
+    Popen, разблокируется по kill()."""
+
+    def __init__(self):
+        self._killed = _threading.Event()
+        self.returncode = None
+
+    def poll(self):
+        return None if not self._killed.is_set() else -9
+
+    def kill(self):
+        self._killed.set()
+
+    def communicate(self, timeout=None):
+        got = self._killed.wait(timeout=timeout)
+        if not got:
+            raise _subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+        self.returncode = -9
+        return (b"", b"")
+
+
+_fake_proc = _FakeSlowProc()
+_orig_popen = gui.subprocess.Popen
+gui.subprocess.Popen = lambda *a, **kw: _fake_proc
+try:
+    _slow_worker = gui.FramePreviewWorker("http://fake/slow.mp4", {}, 5)
+    _slow_worker.start()
+    _time_mod.sleep(0.3)   # дать run() дойти до блокирующего communicate()
+    check("gui: worker реально 'висит' на communicate() до stop()",
+          _slow_worker.isRunning())
+    _t0 = _time_mod.monotonic()
+    _slow_worker.stop()
+    _finished = _slow_worker.wait(3000)
+    _elapsed = _time_mod.monotonic() - _t0
+    check("gui: stop() прерывает worker быстро (не ждёт таймаут ffmpeg)",
+          _finished and _elapsed < 2.0, f"elapsed={_elapsed:.2f}s")
+finally:
+    gui.subprocess.Popen = _orig_popen
+
+# ---- 1.0.6: MainWindow.closeEvent должен явно звать stop() у воркеров,
+# у которых он есть (FramePreviewWorker), а не только quit()/wait() ----
+import inspect as _inspect
+_close_src = _inspect.getsource(gui.MainWindow.closeEvent)
+check("gui: closeEvent зовёт stop() у воркеров с этим методом",
+      "hasattr(thread, \"stop\")" in _close_src
+      and "thread.stop()" in _close_src)
+check("gui: closeEvent следит и за _preview_worker",
+      "_preview_worker" in _close_src)
+
 # расчёт размера: «Лучшее» = 2160 (1000 байт — мелкий), 1080 = 500000
 page.quality_combo.setCurrentIndex(2)  # 1080
 page._update_fragment_summary()
