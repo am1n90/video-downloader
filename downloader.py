@@ -272,7 +272,28 @@ def fetch_info(url, playlist=False):
         "quality_sizes": size_map,        # {высота: байты}
         "audio_available": has_audio,
         "entries": [],
+        "preview_format": _pick_preview_format(formats),
     }
+
+
+def _pick_preview_format(formats):
+    """Формат-кандидат для превью кадра при перетаскивании ползунка
+    фрагмента (1.0.5): наименьшее по высоте видео с прямым URL, который
+    ffmpeg может открыть как единичный вход (прогрессивный http(s) или
+    HLS) — не DASH-сегменты (yt-dlp собирает их сам, ffmpeg с ними как
+    с одним входом работать не может). None, если такого нет
+    (например, только DASH — часть площадок отдаёт только его).
+    """
+    candidates = [
+        f for f in formats
+        if f.get("url")
+        and f.get("vcodec") not in (None, "none")
+        and f.get("protocol") in ("https", "http", "m3u8", "m3u8_native")
+    ]
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda f: f.get("height") or 10**9)
+    return {"url": best["url"], "http_headers": best.get("http_headers") or {}}
 
 
 class DownloadItem:

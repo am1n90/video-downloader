@@ -9,6 +9,8 @@
 """
 
 import os
+import re
+import subprocess
 import sys
 import threading
 import urllib.request
@@ -22,7 +24,7 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QDesktopServices, QGuiApplication, QImage
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -128,12 +130,18 @@ def parse_timecode(text):
     Ведущие нули допустимы («0:35», «02:10», «1:00:00») — fmt_timecode
     пишет именно так, поля должны принимать свой же вывод. Для полей
     точного ввода фрагмента (1.0.5).
+
+    Разделитель между группами цифр — любой символ, не только «:»
+    («1 22» -> 1:22, «1-22-54» -> 1:22:54): группы цифр находятся через
+    re.split(r"\D+", ...), сам символ-разделитель не проверяется (1.0.6).
+    Пустая группа (разделитель в начале/конце — «:35», «-5», «abc») —
+    невалидный ввод.
     """
     text = (text or "").strip()
     if not text:
         return None
-    parts = text.split(":")
-    if len(parts) > 3:
+    parts = re.split(r"\D+", text)
+    if len(parts) > 3 or any(p == "" for p in parts):
         return None
     for p in parts:
         if not p.isdigit():
@@ -230,6 +238,10 @@ class RangeSlider(QWidget):
 
     def values(self):
         return self.start, self.end
+
+    def active_handle(self):
+        """«start»/«end» — какую ручку сейчас тянут (drag), иначе None."""
+        return self._active
 
     # ---------- геометрия и события ----------
 
@@ -423,6 +435,59 @@ class ThumbWorker(QThread):
                     )
             except Exception:
                 image = QImage()
+        self.loaded.emit(image)
+
+
+def _ffmpeg_path():
+    """ffmpeg: рядом с exe в собранной версии (PyInstaller), иначе PATH
+    (dev-режим — тот же принцип, что и у downloader.py при sys.frozen)."""
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(sys.executable), "ffmpeg.exe")
+    return "ffmpeg"
+
+
+class FramePreviewWorker(QThread):
+    """Кадр видео на заданной секунде через ffmpeg — превью при
+    перетаскивании ручки слайдера фрагмента (1.0.6).
+
+    Тянет кадр напрямую из прямого URL формата (preview_format из
+    fetch_info, см. downloader._pick_preview_format), без скачивания
+    видео целиком. Сеть/декод — в фоне; при любой ошибке (нет ffmpeg,
+    таймаут, площадка не даёт прямой URL) просто emit'ит пустой QImage —
+    превью тихо не показывается, интерфейс не блокируется и не падает.
+    """
+
+    loaded = Signal(QImage)
+
+    def __init__(self, url, headers, second, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.headers = headers or {}
+        self.second = max(0, int(second))
+
+    def run(self):
+        image = QImage()
+        try:
+            cmd = [_ffmpeg_path(), "-y", "-ss", str(self.second)]
+            if self.headers:
+                cmd += ["-headers",
+                        "".join(f"{k}: {v}\r\n" for k, v in self.headers.items())]
+            cmd += [
+                "-i", self.url,
+                "-frames:v", "1", "-f", "image2", "-vcodec", "png",
+                "pipe:1",
+            ]
+            kwargs = {}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=12, **kwargs,
+            )
+            if result.returncode == 0 and result.stdout:
+                image.loadFromData(result.stdout)
+        except Exception:
+            image = QImage()
         self.loaded.emit(image)
 
 
@@ -726,40 +791,58 @@ class DownloadPage(QWidget):
         fb.setContentsMargins(0, SP_GROUP, 0, 0)
         fb.setSpacing(SP_GROUP)
 
-        # Подписи времени над ручками + длительность фрагмента посередине
+        # Поля времени над ручками (оба редактируемые, мм:сс / ч:мм:сс,
+        # связаны со слайдером в обе стороны) + длительность фрагмента
+        # посередине. Раньше здесь были label-подписи (только для чтения)
+        # и отдельный ряд с полями ввода ниже слайдера — задваивали одно
+        # и то же и накладывались друг на друга при перерисовке; теперь
+        # ряд один, поля точного ввода и подписи над ручками — одно и то
+        # же (1.0.6).
         lab_row = QHBoxLayout()
-        self.frag_start_label = BodyLabel("0:00", self.fragment_box)
+        self.frag_start_edit = LineEdit(self.fragment_box)
+        self.frag_start_edit.setPlaceholderText("мм:сс")
+        self.frag_start_edit.setFixedWidth(90)
+        self.frag_start_edit.editingFinished.connect(self._on_fields_done)
         self.frag_range_label = BodyLabel("", self.fragment_box)
         self.frag_range_label.setAlignment(Qt.AlignCenter)
-        self.frag_end_label = BodyLabel("0:00", self.fragment_box)
-        lab_row.addWidget(self.frag_start_label)
+        self.frag_end_edit = LineEdit(self.fragment_box)
+        self.frag_end_edit.setPlaceholderText("мм:сс")
+        self.frag_end_edit.setFixedWidth(90)
+        self.frag_end_edit.editingFinished.connect(self._on_fields_done)
+        lab_row.addWidget(self.frag_start_edit)
         lab_row.addStretch()
         lab_row.addWidget(self.frag_range_label, stretch=1)
         lab_row.addStretch()
-        lab_row.addWidget(self.frag_end_label)
+        lab_row.addWidget(self.frag_end_edit)
         fb.addLayout(lab_row)
 
         self.range_slider = RangeSlider(0, self.fragment_box)
         self.range_slider.rangeChanged.connect(self._on_slider_changed)
         self.range_slider.fieldsMoved.connect(self._sync_fields_from_slider)
+        self.range_slider.fieldsMoved.connect(self._on_slider_dragging)
         fb.addWidget(self.range_slider)
 
-        # Поля точного ввода (мм:сс / ч:мм:сс), связаны в обе стороны
-        # (placeholder обновляется после анализа — см. _on_analyze_ok)
-        fields_row = QHBoxLayout()
-        fields_row.addWidget(BodyLabel("Начало:", self.fragment_box))
-        self.frag_start_edit = LineEdit(self.fragment_box)
-        self.frag_start_edit.setPlaceholderText("мм:сс")
-        self.frag_start_edit.setFixedWidth(90)
-        self.frag_start_edit.editingFinished.connect(self._on_fields_done)
-        fields_row.addWidget(self.frag_start_edit)
-        fields_row.addWidget(BodyLabel("Конец:", self.fragment_box))
-        self.frag_end_edit = LineEdit(self.fragment_box)
-        self.frag_end_edit.setPlaceholderText("мм:сс")
-        self.frag_end_edit.setFixedWidth(90)
-        self.frag_end_edit.editingFinished.connect(self._on_fields_done)
-        fields_row.addStretch()
-        fb.addLayout(fields_row)
+        # Превью кадра ручки, которую сейчас тянут (1.0.6): скрыто, пока
+        # не начали drag; ffmpeg тянет кадр в фоне (см. FramePreviewWorker)
+        # с debounce — сеть/декод не блокируют интерфейс и не запускаются
+        # на каждый пиксель движения.
+        preview_row = QHBoxLayout()
+        preview_row.addStretch()
+        self.frag_preview_label = QLabel(self.fragment_box)
+        self.frag_preview_label.setFixedSize(160, 90)
+        self.frag_preview_label.setAlignment(Qt.AlignCenter)
+        self.frag_preview_label.setStyleSheet(
+            "background-color: rgba(0, 0, 0, 40); border-radius: 4px;"
+        )
+        self.frag_preview_label.hide()
+        preview_row.addWidget(self.frag_preview_label)
+        preview_row.addStretch()
+        fb.addLayout(preview_row)
+        self._preview_worker = None
+        self._preview_debounce = QTimer(self)
+        self._preview_debounce.setSingleShot(True)
+        self._preview_debounce.setInterval(250)
+        self._preview_debounce.timeout.connect(self._request_frame_preview)
 
         # Точная обрезка (медленнее)
         self.precise_check = CheckBox("Точная обрезка (медленнее)", card)
@@ -807,6 +890,8 @@ class DownloadPage(QWidget):
         self.fragment_box.hide()
         self.range_slider.set_duration(0)
         self._frag_inited_duration = None
+        self._preview_debounce.stop()
+        self.frag_preview_label.hide()
 
     def _set_status(self, text, kind="info"):
         """kind: info / error / ok; '' — скрыть."""
@@ -970,18 +1055,58 @@ class DownloadPage(QWidget):
         self._update_fragment_summary()
 
     def _on_slider_changed(self, start, end):
-        """Слайдер отпущен — обновить поля, подписи и сводку."""
+        """Слайдер отпущен — обновить поля и сводку, скрыть превью кадра
+        (превью нужно только во время самого перетаскивания)."""
         self._sync_fields_from_slider()
         self._update_fragment_summary()
+        self._preview_debounce.stop()
+        self.frag_preview_label.hide()
 
     def _sync_fields_from_slider(self):
-        """Поля точного ввода и подписи над ручками <- слайдер (включая
-        drag без отпускания: fieldsMoved)."""
+        """Поля точного ввода над ручками <- слайдер (включая drag без
+        отпускания: fieldsMoved)."""
         start, end = self.range_slider.values()
         self.frag_start_edit.setText(fmt_timecode(start))
         self.frag_end_edit.setText(fmt_timecode(end))
-        self.frag_start_label.setText(fmt_timecode(start))
-        self.frag_end_label.setText(fmt_timecode(end))
+
+    def _on_slider_dragging(self):
+        """Тик drag'а (fieldsMoved): запланировать обновление превью
+        кадра с debounce — ffmpeg лезет в сеть на каждый вызов, гонять
+        его на каждый пиксель движения ощутимо тормозит и не нужно
+        (см. FramePreviewWorker)."""
+        if self.range_slider.active_handle() is None:
+            return
+        self._preview_debounce.start()
+
+    def _request_frame_preview(self):
+        """Дёрнуть кадр в фоне для текущей активной ручки (после
+        debounce). Тихо ничего не делает, если нет прямого URL формата
+        для превью (не все площадки его отдают) или ручку уже отпустили."""
+        which = self.range_slider.active_handle()
+        if which is None:
+            return
+        fmt = (self.preview_info or {}).get("preview_format")
+        if not fmt or not fmt.get("url"):
+            return
+        start, end = self.range_slider.values()
+        second = start if which == "start" else end
+        if self._preview_worker is not None and self._preview_worker.isRunning():
+            self._preview_worker.loaded.disconnect(self._on_frame_preview_loaded)
+        self._preview_worker = FramePreviewWorker(
+            fmt["url"], fmt.get("http_headers"), second, self
+        )
+        self._preview_worker.loaded.connect(self._on_frame_preview_loaded)
+        self._preview_worker.start()
+
+    def _on_frame_preview_loaded(self, image):
+        if image.isNull():
+            return   # не удалось достать кадр — тихо, превью не блокирует UI
+        pix = QPixmap.fromImage(image).scaled(
+            self.frag_preview_label.width(), self.frag_preview_label.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        self.frag_preview_label.setPixmap(pix)
+        self.frag_preview_label.show()
 
     def _on_fields_done(self):
         """Поля (Enter/потеря фокуса) -> слайдер: с валидацией и клэмпами.

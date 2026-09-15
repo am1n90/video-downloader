@@ -59,6 +59,32 @@ check("timecode: '' -> None", gui.parse_timecode("") is None)
 check("timecode: -5 -> None", gui.parse_timecode("-5") is None)
 check("timecode: 0:0 -> 0", gui.parse_timecode("0:0") == 0)
 check("timecode: 2:0 -> 120", gui.parse_timecode("2:0") == 120)
+
+# ---- 1.0.6: разделитель между группами цифр — любой не-цифровой символ ----
+check("timecode: '1 22' (пробел) -> 82", gui.parse_timecode("1 22") == 82)
+check("timecode: '1 22 54' (пробел, ч:мм:сс) -> 4974",
+      gui.parse_timecode("1 22 54") == 4974)
+check("timecode: '1-22' (дефис) -> 82", gui.parse_timecode("1-22") == 82)
+check("timecode: '1.22' (точка) -> 82", gui.parse_timecode("1.22") == 82)
+check("timecode: '1,22,54' (запятая, ч:мм:сс) -> 4974",
+      gui.parse_timecode("1,22,54") == 4974)
+check("timecode: '1  22' (несколько пробелов подряд) -> 82",
+      gui.parse_timecode("1  22") == 82)
+check("timecode: ' 1 22 ' (внешние пробелы обрезаются) -> 82",
+      gui.parse_timecode(" 1 22 ") == 82)
+check("timecode: '02 10' (ведущий 0, пробел) -> 130",
+      gui.parse_timecode("02 10") == 130)
+check("timecode: '1 2 3 4' (4 группы) -> None",
+      gui.parse_timecode("1 2 3 4") is None)
+check("timecode: ' ' (только пробел) -> None",
+      gui.parse_timecode("  ") is None)
+check("timecode: ':35' (разделитель в начале) -> None",
+      gui.parse_timecode(":35") is None)
+check("timecode: '35:' (разделитель в конце) -> None",
+      gui.parse_timecode("35:") is None)
+check("timecode: '1 2a' (буква среди цифр группы) -> None",
+      gui.parse_timecode("1 2a") is None)
+
 check("fmt_timecode: 35 -> '0:35'", gui.fmt_timecode(35) == "0:35")
 check("fmt_timecode: 130 -> '2:10'", gui.fmt_timecode(130) == "2:10")
 check("fmt_timecode: 3725 -> '1:02:05'", gui.fmt_timecode(3725) == "1:02:05")
@@ -334,6 +360,25 @@ check("gui: поля = '0:00' / '9:56'",
       page.frag_start_edit.text() == "0:00"
       and page.frag_end_edit.text() == "9:56")
 
+# ---- 1.0.6: редизайн — один ряд редактируемых полей над ползунком,
+# отдельный нижний ряд "Начало:/Конец:" убран, оба поля — LineEdit ----
+from qfluentwidgets import LineEdit as _LineEdit
+
+check("gui: старые label-подписи над ручками удалены (не задваиваются)",
+      not hasattr(page, "frag_start_label")
+      and not hasattr(page, "frag_end_label"))
+check("gui: поле начала — редактируемый LineEdit",
+      isinstance(page.frag_start_edit, _LineEdit))
+check("gui: поле конца — тоже редактируемый LineEdit (не просто текст)",
+      isinstance(page.frag_end_edit, _LineEdit))
+check("gui: нижнего ряда 'Начало:'/'Конец:' больше нет в блоке фрагмента",
+      not any(
+          w.text() in ("Начало:", "Конец:")
+          for w in page.fragment_box.findChildren(gui.BodyLabel)
+      ))
+check("gui: превью кадра скрыто по умолчанию",
+      not page.frag_preview_label.isVisible())
+
 # поля -> слайдер (AC2)
 page.frag_start_edit.setText("1:30")
 page.frag_end_edit.setText("2:10")
@@ -370,6 +415,68 @@ page._sync_fields_from_slider()
 check("gui: слайдер -> поля '0:30'/'1:30'",
       page.frag_start_edit.text() == "0:30"
       and page.frag_end_edit.text() == "1:30")
+
+# ---- 1.0.6: ввод с пробелом как разделителем через реальное поле ----
+page.frag_start_edit.setText("1 05")
+page.frag_end_edit.setText("2 10")
+page._on_fields_done()
+check("gui: поле '1 05'/'2 10' (пробел) -> слайдер (65, 130)",
+      page.range_slider.values() == (65, 130))
+
+page.range_slider.set_values(30, 90)
+page.frag_start_edit.setText("1 2a")   # невалидно (буква в группе)
+page._on_fields_done()
+check("gui: поле с буквой внутри группы — не применяется",
+      page.range_slider.values() == (30, 90))
+
+# ---- 1.0.6: превью кадра при drag — active_handle(), debounce, worker ----
+check("gui: active_handle() вне drag -> None",
+      page.range_slider.active_handle() is None)
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QMouseEvent
+
+def _press_on_handle(which):
+    x = page.range_slider._time_to_x(
+        page.range_slider.start if which == "start" else page.range_slider.end
+    )
+    y = page.range_slider.height() / 2
+    ev = QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress, QPointF(x, y), QPointF(x, y),
+        Qt.LeftButton, Qt.LeftButton, Qt.NoModifier,
+    )
+    page.range_slider.mousePressEvent(ev)
+
+_press_on_handle("start")
+check("gui: после press на ручке start — active_handle() == 'start'",
+      page.range_slider.active_handle() == "start")
+check("gui: press на ручке — debounce превью запущен",
+      page._preview_debounce.isActive())
+page.range_slider.mouseReleaseEvent(QMouseEvent(
+    QMouseEvent.Type.MouseButtonRelease, QPointF(0, 0), QPointF(0, 0),
+    Qt.LeftButton, Qt.NoButton, Qt.NoModifier,
+))
+check("gui: после release — active_handle() снова None",
+      page.range_slider.active_handle() is None)
+check("gui: после release — превью скрыто, debounce остановлен",
+      not page.frag_preview_label.isVisible()
+      and not page._preview_debounce.isActive())
+
+# _request_frame_preview без preview_format в preview_info — no-op тихо
+check("gui: без preview_format в preview_info -> _request_frame_preview no-op",
+      "preview_format" not in (page.preview_info or {}))
+page._request_frame_preview()   # не должно бросать исключение
+check("gui: _request_frame_preview() не упал без preview_format", True)
+
+# FramePreviewWorker: ошибка (нет ffmpeg / битый URL) -> emit пустой QImage,
+# не бросает исключение наружу (сеть/декод не блокируют GUI-поток)
+_fp_result = {}
+_fp_worker = gui.FramePreviewWorker("http://127.0.0.1:1/nope.mp4", {}, 5)
+_fp_worker.loaded.connect(lambda img: _fp_result.update(image=img))
+_fp_worker.start()
+_fp_worker.wait(15000)
+app.processEvents()   # доставить loaded (queued connection, поток -> GUI)
+check("gui: FramePreviewWorker на некорректном URL -> пустой QImage (не падает)",
+      "image" in _fp_result and _fp_result["image"].isNull())
 
 # расчёт размера: «Лучшее» = 2160 (1000 байт — мелкий), 1080 = 500000
 page.quality_combo.setCurrentIndex(2)  # 1080
