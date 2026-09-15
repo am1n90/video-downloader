@@ -11,14 +11,15 @@ build-venv/
 build-ffmpeg-cache/
 proto-venv/
 
-# Прототипы вне кода приложения (торрент-стриминг, Этап 0): в git только
-# код и текстовые входные данные; venv, результаты замеров (results/,
-# RESULTS.md) и тестовые видео/torrent (в %TEMP%) — нет
+# Прототипы вне кода приложения (торрент-стриминг, Этап 0): в git код,
+# текстовые входные данные и сводка RESULTS.md (решение владельца 15.09);
+# venv, сырые замеры results/*.jsonl и тестовые видео/torrent (в %TEMP%) — нет
 .vd-proto/*
 !.vd-proto/torrent/
 .vd-proto/torrent/*
 !.vd-proto/torrent/*.py
 !.vd-proto/torrent/README_PROTO.md
+!.vd-proto/torrent/RESULTS.md
 !.vd-proto/torrent/media/
 .vd-proto/torrent/media/*
 !.vd-proto/torrent/media/*.srt
