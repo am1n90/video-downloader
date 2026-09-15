@@ -201,7 +201,9 @@ class RangeSlider(QWidget):
     (клэмпы в _set_handle). Сигналы: rangeChanged(start, end) — по
     завершении перемещения (отпускание мыши / стрелка клавиатуры);
     fieldsMoved() — на каждом тике drag'а (поля точного ввода
-    обновляются мгновенно, над ручками — подписи времени).
+    обновляются мгновенно, над ручками — подписи времени);
+    resized() — после изменения размера (превью кадра над ручкой
+    переставляется вслед за ней).
     Тесты: set_values() НЕ эмитит сигналы — программная установка из
     полей ввода не должна зацикливать связь слайдер <-> поля.
     """
@@ -211,6 +213,7 @@ class RangeSlider(QWidget):
 
     rangeChanged = Signal(int, int)
     fieldsMoved = Signal()
+    resized = Signal()
 
     def __init__(self, duration=0, parent=None):
         super().__init__(parent)
@@ -244,6 +247,14 @@ class RangeSlider(QWidget):
     def active_handle(self):
         """«start»/«end» — какую ручку сейчас тянут (drag), иначе None."""
         return self._active
+
+    def handle_x(self, which):
+        """x центра ручки «start»/«end» в координатах слайдера."""
+        return self._time_to_x(self.start if which == "start" else self.end)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.resized.emit()
 
     # ---------- геометрия и события ----------
 
@@ -460,20 +471,24 @@ class FramePreviewWorker(QThread):
 
     ffmpeg запускается через Popen (не run) специально ради stop():
     на VK-формате (HLS) кадр иногда тянется ~17с — если пользователь
-    закрыл окно или дёрнул ползунок ещё раз раньше, run() должен
+    закрыл окно или сменил видео раньше, run() должен
     освободить поток НЕМЕДЛЕННО, а не ждать таймаут до конца. Без
     этого процесс Python не завершался бы, пока ffmpeg сам не
     досчитает (проверено: закрытие окна во время VK-превью держало
-    процесс живым ~14с вместо мгновенного выхода).
+    процесс живым ~14с вместо мгновенного выхода). Во время drag
+    ffmpeg НЕ убивается (см. DownloadPage._request_frame_preview).
     """
 
-    loaded = Signal(QImage)
+    # (воркер, кадр): по воркеру страница отличает актуальный результат
+    # от устаревшего (сброс фрагмента / смена видео)
+    loaded = Signal(object, QImage)
 
-    def __init__(self, url, headers, second, parent=None):
+    def __init__(self, url, headers, second, handle=None, parent=None):
         super().__init__(parent)
         self.url = url
         self.headers = headers or {}
         self.second = max(0, int(second))
+        self.handle = handle       # «start»/«end» — чей это кадр
         self._proc = None
         self._stopped = False
 
@@ -517,7 +532,7 @@ class FramePreviewWorker(QThread):
                 image.loadFromData(stdout)
         except Exception:
             image = QImage()
-        self.loaded.emit(image)
+        self.loaded.emit(self, image)
 
 
 class UpdateWorker(QThread):
@@ -845,33 +860,39 @@ class DownloadPage(QWidget):
         lab_row.addWidget(self.frag_end_edit)
         fb.addLayout(lab_row)
 
-        self.range_slider = RangeSlider(0, self.fragment_box)
-        self.range_slider.rangeChanged.connect(self._on_slider_changed)
-        self.range_slider.fieldsMoved.connect(self._sync_fields_from_slider)
-        self.range_slider.fieldsMoved.connect(self._on_slider_dragging)
-        fb.addWidget(self.range_slider)
-
-        # Превью кадра ручки, которую сейчас тянут (1.0.6): скрыто, пока
-        # не начали drag; ffmpeg тянет кадр в фоне (см. FramePreviewWorker)
-        # с debounce — сеть/декод не блокируют интерфейс и не запускаются
-        # на каждый пиксель движения.
-        preview_row = QHBoxLayout()
-        preview_row.addStretch()
-        self.frag_preview_label = QLabel(self.fragment_box)
+        # Превью кадра над ручкой, которую тянут: полоса фиксированной
+        # высоты прямо над слайдером, кадр ставится в ней по x ручки.
+        # Высота зарезервирована заранее — появление кадра не сдвигает
+        # слайдер, а оверлей закрыл бы поля времени (кадр остаётся на
+        # экране и после отпускания). Полоса скрыта, если площадка не
+        # дала прямой формат для превью (см. _init_fragment_ui).
+        self.frag_preview_strip = QWidget(self.fragment_box)
+        self.frag_preview_strip.setFixedHeight(90)
+        self.frag_preview_label = QLabel(self.frag_preview_strip)
         self.frag_preview_label.setFixedSize(160, 90)
         self.frag_preview_label.setAlignment(Qt.AlignCenter)
         self.frag_preview_label.setStyleSheet(
             "background-color: rgba(0, 0, 0, 40); border-radius: 4px;"
         )
         self.frag_preview_label.hide()
-        preview_row.addWidget(self.frag_preview_label)
-        preview_row.addStretch()
-        fb.addLayout(preview_row)
+        fb.addWidget(self.frag_preview_strip)
+
+        self.range_slider = RangeSlider(0, self.fragment_box)
+        self.range_slider.rangeChanged.connect(self._on_slider_changed)
+        self.range_slider.fieldsMoved.connect(self._sync_fields_from_slider)
+        self.range_slider.fieldsMoved.connect(self._on_slider_dragging)
+        self.range_slider.resized.connect(self._place_frame_preview)
+        fb.addWidget(self.range_slider)
+
+        # ffmpeg тянет кадр в фоне (см. FramePreviewWorker) с throttle:
+        # не больше одного процесса за раз и не чаще раза в 250 мс.
         self._preview_worker = None
-        self._preview_debounce = QTimer(self)
-        self._preview_debounce.setSingleShot(True)
-        self._preview_debounce.setInterval(250)
-        self._preview_debounce.timeout.connect(self._request_frame_preview)
+        self._preview_handle = None      # ручка, чей кадр показываем
+        self._preview_requested = None   # (ручка, секунда) последнего запуска
+        self._preview_throttle = QTimer(self)
+        self._preview_throttle.setSingleShot(True)
+        self._preview_throttle.setInterval(250)
+        self._preview_throttle.timeout.connect(self._request_frame_preview)
 
         # Точная обрезка (медленнее)
         self.precise_check = CheckBox("Точная обрезка (медленнее)", card)
@@ -919,20 +940,21 @@ class DownloadPage(QWidget):
         self.fragment_box.hide()
         self.range_slider.set_duration(0)
         self._frag_inited_duration = None
-        self._preview_debounce.stop()
+        self._preview_throttle.stop()
         self.frag_preview_label.hide()
         self._stop_preview_worker()
+        self._preview_handle = None
+        self._preview_requested = None
 
     def _stop_preview_worker(self):
-        """Убить фоновый ffmpeg превью, если он ещё жив (устарел, ручку
-        отпустили, закрывается страница) — иначе он может держать поток
-        занятым до собственного таймаута вместо мгновенной остановки."""
-        if self._preview_worker is not None and self._preview_worker.isRunning():
-            try:
-                self._preview_worker.loaded.disconnect(self._on_frame_preview_loaded)
-            except (RuntimeError, TypeError):
-                pass
-            self._preview_worker.stop()
+        """Убить фоновый ffmpeg превью (сброс фрагмента / смена видео) и
+        забыть воркер: его поздний loaded отбросится проверкой
+        worker is self._preview_worker. Во время drag не зовётся — там
+        устаревший ffmpeg дорабатывает (см. _request_frame_preview)."""
+        worker = self._preview_worker
+        self._preview_worker = None
+        if worker is not None and worker.isRunning():
+            worker.stop()
 
     def _set_status(self, text, kind="info"):
         """kind: info / error / ok; '' — скрыть."""
@@ -1090,19 +1112,19 @@ class DownloadPage(QWidget):
             self.range_slider.set_duration(duration)
             # Дефолт: 0 .. duration (всё видео)
             self._sync_fields_from_slider()
+        self.frag_preview_strip.setVisible(self._preview_format() is not None)
         placeholder = "ч:мм:сс" if duration >= 3600 else "мм:сс"
         self.frag_start_edit.setPlaceholderText(placeholder)
         self.frag_end_edit.setPlaceholderText(placeholder)
         self._update_fragment_summary()
 
     def _on_slider_changed(self, start, end):
-        """Слайдер отпущен — обновить поля и сводку, скрыть превью кадра
-        (превью нужно только во время самого перетаскивания)."""
+        """Слайдер отпущен (или сдвинут стрелкой) — обновить поля и
+        сводку. Превью кадра не скрываем: оно остаётся над ручкой до
+        следующего касания, кадр дозапрашивается для финальной позиции."""
         self._sync_fields_from_slider()
         self._update_fragment_summary()
-        self._preview_debounce.stop()
-        self.frag_preview_label.hide()
-        self._stop_preview_worker()
+        self._refresh_frame_preview()
 
     def _sync_fields_from_slider(self):
         """Поля точного ввода над ручками <- слайдер (включая drag без
@@ -1112,42 +1134,96 @@ class DownloadPage(QWidget):
         self.frag_end_edit.setText(fmt_timecode(end))
 
     def _on_slider_dragging(self):
-        """Тик drag'а (fieldsMoved): запланировать обновление превью
-        кадра с debounce — ffmpeg лезет в сеть на каждый вызов, гонять
-        его на каждый пиксель движения ощутимо тормозит и не нужно
-        (см. FramePreviewWorker)."""
-        if self.range_slider.active_handle() is None:
-            return
-        self._preview_debounce.start()
-
-    def _request_frame_preview(self):
-        """Дёрнуть кадр в фоне для текущей активной ручки (после
-        debounce). Тихо ничего не делает, если нет прямого URL формата
-        для превью (не все площадки его отдают) или ручку уже отпустили."""
+        """Тик drag'а (fieldsMoved, в т.ч. само нажатие на ручку): кадр
+        едет за ручкой, новый запрашивается сразу (throttle — в
+        _request_frame_preview)."""
         which = self.range_slider.active_handle()
         if which is None:
             return
+        if which != self._preview_handle:
+            self._preview_handle = which
+            self.frag_preview_label.hide()   # кадр другой ручки не показываем
+        self._place_frame_preview()
+        self._request_frame_preview()
+
+    def _refresh_frame_preview(self):
+        """Значения сменились без drag (отпускание, стрелки, поля ввода):
+        если кадр уже показывали — переставить и обновить его."""
+        if self._preview_handle is None:
+            return
+        self._place_frame_preview()
+        self._request_frame_preview()
+
+    def _preview_format(self):
+        """Прямой формат для превью кадра или None (не все площадки его
+        отдают, см. downloader._pick_preview_format)."""
         fmt = (self.preview_info or {}).get("preview_format")
-        if not fmt or not fmt.get("url"):
+        return fmt if fmt and fmt.get("url") else None
+
+    def _request_frame_preview(self):
+        """Кадр для текущей позиции ручки _preview_handle, с throttle.
+
+        Пока ffmpeg работает или не прошло 250 мс с прошлого запуска —
+        ничего: актуальная позиция подхватится по таймеру или по
+        завершении ffmpeg (_on_frame_preview_loaded). Работающий ffmpeg
+        не убиваем: на HLS YouTube кадр идёт 1-2 с, и при убийстве на
+        каждом движении/отпускании он не доезжал до экрана ни разу.
+        """
+        which = self._preview_handle
+        fmt = self._preview_format()
+        if which is None or fmt is None:
+            return
+        if self._preview_worker is not None or self._preview_throttle.isActive():
             return
         start, end = self.range_slider.values()
         second = start if which == "start" else end
-        self._stop_preview_worker()   # не копить фоновые ffmpeg-процессы
-        self._preview_worker = FramePreviewWorker(
-            fmt["url"], fmt.get("http_headers"), second, self
+        # ffmpeg -ss <длительность> не отдаёт ни одного кадра (rc 69),
+        # а ручка конца по умолчанию стоит ровно на конце видео
+        duration = int((self.preview_info or {}).get("duration") or 0)
+        second = max(0, min(second, duration - 1))
+        if (which, second) == self._preview_requested:
+            return
+        self._preview_requested = (which, second)
+        worker = FramePreviewWorker(
+            fmt["url"], fmt.get("http_headers"), second, which, self
         )
-        self._preview_worker.loaded.connect(self._on_frame_preview_loaded)
-        self._preview_worker.start()
+        worker.loaded.connect(self._on_frame_preview_loaded)
+        worker.finished.connect(worker.deleteLater)
+        self._preview_worker = worker
+        self._preview_throttle.start()
+        worker.start()
 
-    def _on_frame_preview_loaded(self, image):
-        if image.isNull():
-            return   # не удалось достать кадр — тихо, превью не блокирует UI
-        pix = QPixmap.fromImage(image).scaled(
-            self.frag_preview_label.width(), self.frag_preview_label.height(),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation,
+    def _on_frame_preview_loaded(self, worker, image):
+        """Кадр готов (пустой QImage — не удался). Результат устаревшего
+        воркера (сброс фрагмента / смена видео) отбрасывается; после
+        актуального — запрос свежей позиции: ручка могла уехать, пока
+        ffmpeg работал."""
+        if worker is not self._preview_worker:
+            return
+        self._preview_worker = None
+        if not image.isNull() and worker.handle == self._preview_handle:
+            pix = QPixmap.fromImage(image).scaled(
+                self.frag_preview_label.width(),
+                self.frag_preview_label.height(),
+                Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+            self.frag_preview_label.setPixmap(pix)
+            self._place_frame_preview()
+            self.frag_preview_label.show()
+        self._request_frame_preview()
+
+    def _place_frame_preview(self):
+        """Кадр по центру над ручкой _preview_handle; у краёв прижат,
+        чтобы не обрезался."""
+        if self._preview_handle is None:
+            return
+        slider = self.range_slider
+        width = self.frag_preview_label.width()
+        left = int(slider.handle_x(self._preview_handle) - width / 2)
+        left = max(0, min(left, slider.width() - width))
+        self.frag_preview_label.move(
+            left + slider.x() - self.frag_preview_strip.x(), 0
         )
-        self.frag_preview_label.setPixmap(pix)
-        self.frag_preview_label.show()
 
     def _on_fields_done(self):
         """Поля (Enter/потеря фокуса) -> слайдер: с валидацией и клэмпами.
@@ -1172,6 +1248,7 @@ class DownloadPage(QWidget):
         self.range_slider.set_values(start_s, end_s)
         self._sync_fields_from_slider()
         self._update_fragment_summary()
+        self._refresh_frame_preview()
 
     def _update_fragment_summary(self):
         """Длительность фрагмента + примерный размер (видео)."""

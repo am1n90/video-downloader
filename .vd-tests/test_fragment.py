@@ -14,6 +14,10 @@
   - GUI (offscreen): галочка/блок, синхронизация слайдер <-> поля в обе
     стороны, клэмпы полей, мин. 1с, расчёт размера, _start_download,
     плейлист — галочка скрыта (AC2)
+  - превью кадра при drag (сценарии A-D на медленном фейк-ffmpeg):
+    кадр доезжает при быстром/непрерывном drag, остаётся после
+    отпускания, ffmpeg не убивается и не плодится, клэмп duration-1,
+    кадр над активной ручкой
   - история: fragment-поле в записи, фрагмент не вытесняет запись
     полного видео (AC7)
 
@@ -599,17 +603,19 @@ def _press_on_handle(which):
 _press_on_handle("start")
 check("gui: после press на ручке start — active_handle() == 'start'",
       page.range_slider.active_handle() == "start")
-check("gui: press на ручке — debounce превью запущен",
-      page._preview_debounce.isActive())
+check("gui: press на ручке — ручка превью запомнена",
+      page._preview_handle == "start")
 page.range_slider.mouseReleaseEvent(QMouseEvent(
     QMouseEvent.Type.MouseButtonRelease, QPointF(0, 0), QPointF(0, 0),
     Qt.LeftButton, Qt.NoButton, Qt.NoModifier,
 ))
 check("gui: после release — active_handle() снова None",
       page.range_slider.active_handle() is None)
-check("gui: после release — превью скрыто, debounce остановлен",
-      not page.frag_preview_label.isVisible()
-      and not page._preview_debounce.isActive())
+check("gui: без preview_format — ffmpeg не запускался, превью скрыто",
+      page._preview_worker is None
+      and not page.frag_preview_label.isVisible())
+check("gui: без preview_format — полоса превью скрыта (не занимает место)",
+      not page.frag_preview_strip.isVisibleTo(page))
 
 # _request_frame_preview без preview_format в preview_info — no-op тихо
 check("gui: без preview_format в preview_info -> _request_frame_preview no-op",
@@ -621,7 +627,7 @@ check("gui: _request_frame_preview() не упал без preview_format", True)
 # не бросает исключение наружу (сеть/декод не блокируют GUI-поток)
 _fp_result = {}
 _fp_worker = gui.FramePreviewWorker("http://127.0.0.1:1/nope.mp4", {}, 5)
-_fp_worker.loaded.connect(lambda img: _fp_result.update(image=img))
+_fp_worker.loaded.connect(lambda _w, img: _fp_result.update(image=img))
 _fp_worker.start()
 _fp_worker.wait(15000)
 app.processEvents()   # доставить loaded (queued connection, поток -> GUI)
@@ -765,6 +771,251 @@ check("gui: плейлист -> галочка фрагмента скрыта",
       not page.fragment_check.isVisibleTo(page))
 check("gui: плейлист -> _fragment_available False",
       page._fragment_available() is False)
+
+# ---- превью кадра при drag, сценарии A-D. ffmpeg подменён медленным
+# фейком (0.8с на кадр — как HLS 144p YouTube, 1.2-1.8с живьём), который
+# отдаёт настоящий PNG. Раньше (debounce + kill при отпускании) кадр не
+# доезжал до экрана в A/B/D, а в C исчезал при отпускании ----
+import threading as _thr
+import time as _time2
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint
+from PySide6.QtGui import QImage as _QImage
+from PySide6.QtTest import QTest
+
+_png_img = _QImage(32, 18, _QImage.Format_RGB32)
+_png_img.fill(0x3366CC)
+_png_ba = QByteArray()
+_png_buf = QBuffer(_png_ba)
+_png_buf.open(QIODevice.WriteOnly)
+_png_img.save(_png_buf, "PNG")
+_png_buf.close()
+_PNG = bytes(_png_ba.data())
+FAKE_FFMPEG_DELAY = 0.8
+
+
+class _FakeFrameProc:
+    """ffmpeg-кадр: через FAKE_FFMPEG_DELAY отдаёт PNG (rc 0), по kill() —
+    сразу rc -9. Считает запуски, убийства и одновременные процессы."""
+    lock = _thr.Lock()
+    log = []
+    active = 0
+    max_active = 0
+
+    @classmethod
+    def reset(cls):
+        cls.log = []
+        cls.max_active = 0
+
+    def __init__(self, cmd):
+        self.second = int(cmd[cmd.index("-ss") + 1])
+        self.killed = False
+        self.returncode = None
+        self._kill_evt = _thr.Event()
+        cls = _FakeFrameProc
+        with cls.lock:
+            cls.log.append(self)
+            cls.active += 1
+            cls.max_active = max(cls.max_active, cls.active)
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self._kill_evt.set()
+
+    def communicate(self, timeout=None):
+        try:
+            if self._kill_evt.wait(FAKE_FFMPEG_DELAY):
+                self.returncode = -9
+                return (b"", b"")
+            self.returncode = 0
+            return (_PNG, b"")
+        finally:
+            with _FakeFrameProc.lock:
+                _FakeFrameProc.active -= 1
+
+
+_drag_x = {}
+
+
+def _mouse(kind, x, buttons, button=Qt.LeftButton):
+    y = page.range_slider.height() / 2
+    return QMouseEvent(kind, QPointF(x, y), QPointF(x, y), button, buttons,
+                       Qt.NoModifier)
+
+
+def _press(which):
+    _drag_x["x"] = page.range_slider.handle_x(which)
+    page.range_slider.mousePressEvent(_mouse(
+        QMouseEvent.Type.MouseButtonPress, _drag_x["x"], Qt.LeftButton))
+
+
+def _moves(steps, step_px, every_ms):
+    """Движения с зажатой кнопкой -> было ли превью видно по ходу."""
+    seen = False
+    for _ in range(steps):
+        _drag_x["x"] += step_px
+        page.range_slider.mouseMoveEvent(_mouse(
+            QMouseEvent.Type.MouseMove, _drag_x["x"], Qt.LeftButton,
+            Qt.NoButton))
+        QTest.qWait(every_ms)
+        seen = seen or page.frag_preview_label.isVisible()
+    return seen
+
+
+def _hold(ms):
+    seen = False
+    t_end = _time2.monotonic() + ms / 1000
+    while _time2.monotonic() < t_end:
+        QTest.qWait(50)
+        seen = seen or page.frag_preview_label.isVisible()
+    return seen
+
+
+def _release():
+    page.range_slider.mouseReleaseEvent(_mouse(
+        QMouseEvent.Type.MouseButtonRelease, _drag_x["x"], Qt.NoButton))
+
+
+def _settle(max_s=6.0):
+    """Дождаться, пока превью затихнет (ни ffmpeg, ни таймера throttle)."""
+    t_end = _time2.monotonic() + max_s
+    while _time2.monotonic() < t_end:
+        QTest.qWait(100)
+        if (page._preview_worker is None
+                and not page._preview_throttle.isActive()):
+            return True
+    return False
+
+
+def _preview_over_handle(which):
+    """Кадр над слайдером, по центру над ручкой (у края — прижат к краю)."""
+    s, lab = page.range_slider, page.frag_preview_label
+    strip = page.frag_preview_strip
+    lab_left = lab.mapTo(page, QPoint(0, 0)).x()
+    lab_right = lab_left + lab.width()
+    lab_bottom = lab.mapTo(page, QPoint(0, lab.height())).y()
+    strip_left = strip.mapTo(page, QPoint(0, 0)).x()
+    strip_right = strip_left + strip.width()
+    hx = s.mapTo(page, QPoint(int(s.handle_x(which)), 0)).x()
+    s_top = s.mapTo(page, QPoint(0, 0)).y()
+    centered = abs((lab_left + lab_right) / 2 - hx) <= 1
+    pinned = lab_left == strip_left or lab_right == strip_right
+    return (lab_bottom <= s_top and strip_left <= lab_left
+            and lab_right <= strip_right and (centered or pinned))
+
+
+def _seconds():
+    return [p.second for p in _FakeFrameProc.log]
+
+
+_orig_popen2 = gui.subprocess.Popen
+gui.subprocess.Popen = lambda cmd, *a, **kw: _FakeFrameProc(cmd)
+try:
+    page._on_analyze_ok(dict(preview, preview_format={
+        "url": "http://fake/v.m3u8", "http_headers": {}}))
+    page.fragment_check.setChecked(True)
+    QTest.qWait(100)
+    slider = page.range_slider
+    check("preview: полоса превью видна, когда есть preview_format",
+          page.frag_preview_strip.isVisibleTo(page))
+
+    # A: быстрый drag 0.6с и сразу отпустил
+    slider.set_values(60, 400)
+    _FakeFrameProc.reset()
+    _press("start")
+    _moves(15, 3, 40)
+    _release()
+    settled = _settle()
+    check("preview A: быстрый drag+release -> кадр виден после отпускания",
+          settled and page.frag_preview_label.isVisible(),
+          f"seconds={_seconds()}")
+    check("preview A: последний кадр — финальная позиция ручки",
+          _seconds()[-1:] == [slider.start],
+          f"seconds={_seconds()} start={slider.start}")
+    check("preview A: работающий ffmpeg не убивался",
+          not any(p.killed for p in _FakeFrameProc.log))
+    check("preview A: кадр над ручкой start", _preview_over_handle("start"))
+
+    # B: непрерывный drag ~3с (движение раз в 150 мс, debounce не срабатывал)
+    slider.set_values(60, 400)
+    _FakeFrameProc.reset()
+    page.frag_preview_label.hide()
+    _press("start")
+    seen_b = _moves(20, 3, 150)
+    _release()
+    _settle()
+    check("preview B: непрерывный drag -> кадр появился до отпускания",
+          seen_b)
+    check("preview B: throttle — не больше 1 ffmpeg за раз, не на каждый тик",
+          _FakeFrameProc.max_active == 1 and 2 <= len(_seconds()) <= 7,
+          f"max_active={_FakeFrameProc.max_active} seconds={_seconds()}")
+    check("preview B: ffmpeg не убивался",
+          not any(p.killed for p in _FakeFrameProc.log))
+    check("preview B: последний кадр — финальная позиция ручки",
+          _seconds()[-1:] == [slider.start],
+          f"seconds={_seconds()} start={slider.start}")
+
+    # C: сдвинул и держит неподвижно
+    slider.set_values(60, 400)
+    _FakeFrameProc.reset()
+    page.frag_preview_label.hide()
+    _press("start")
+    _moves(10, 3, 40)
+    seen_c = _hold(2500)
+    n_mid = len(_seconds())
+    _hold(1500)
+    n_hold = len(_seconds())
+    _release()
+    _settle()
+    check("preview C: держит неподвижно -> кадр виден", seen_c)
+    check("preview C: пока держит на месте — новых ffmpeg нет",
+          n_hold == n_mid, f"n_mid={n_mid} n_hold={n_hold}")
+    check("preview C: отпустил на том же месте — кадр остался, без запроса",
+          page.frag_preview_label.isVisible() and len(_seconds()) == n_hold)
+
+    # D: ручка конца на самом конце видео (дефолт) — клэмп duration-1
+    slider.set_values(60, 596)
+    _FakeFrameProc.reset()
+    page.frag_preview_label.hide()
+    _press("end")
+    seen_d = _hold(1500)
+    _release()
+    _settle()
+    check("preview D: ручка конца на конце -> кадр с 595 (не -ss 596)",
+          _seconds() == [595], f"seconds={_seconds()}")
+    check("preview D: кадр показан и остался после отпускания",
+          seen_d and page.frag_preview_label.isVisible())
+    check("preview D: кадр над ручкой end (прижат к правому краю)",
+          _preview_over_handle("end"))
+
+    # поле ввода после drag: кадр обновляется для новой позиции
+    _FakeFrameProc.reset()
+    page.frag_end_edit.setText("5:00")
+    page._on_fields_done()
+    _settle()
+    check("preview: ввод в поле -> кадр для новой позиции (300)",
+          _seconds() == [300] and page.frag_preview_label.isVisible()
+          and _preview_over_handle("end"),
+          f"seconds={_seconds()}")
+
+    # сброс фрагмента во время работы ffmpeg: убит, поздний кадр не показан
+    slider.set_values(60, 400)
+    _FakeFrameProc.reset()
+    _press("start")
+    QTest.qWait(100)
+    _release()
+    running = page._preview_worker is not None
+    page._reset_fragment_state()
+    QTest.qWait(1500)
+    check("preview: сброс фрагмента убивает работающий ffmpeg",
+          running and _FakeFrameProc.log and _FakeFrameProc.log[-1].killed)
+    check("preview: поздний результат после сброса не показан",
+          not page.frag_preview_label.isVisible()
+          and page._preview_worker is None)
+finally:
+    gui.subprocess.Popen = _orig_popen2
 
 # ============ 7. история: fragment-поле и вытеснение ============
 
