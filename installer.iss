@@ -62,8 +62,9 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}
 Type: filesandordirs; Name: "{app}"
 
 [Code]
-var
-    DeleteUserData: Boolean;
+const
+    // = single_instance.MUTEX_NAME (создаётся запущенной программой)
+    AppRunningMutex = 'Local\VideoDownloader-SingleInstance-Mutex';
 
 function LaunchAfterUpdate: Boolean;
 begin
@@ -75,20 +76,33 @@ end;
 function InitializeUninstall(): Boolean;
 begin
     Result := True;
-    DeleteUserData := False;
-    // В интерактивном режиме спрашиваем; в /VERYSILENT данные сохраняем
-    if not UninstallSilent then begin
-        if MsgBox(
-               'Удалить также данные пользователя (настройки и историю загрузок)?',
-               mbConfirmation, MB_YESNO) = IDYES then
-            DeleteUserData := True;
+    // Запущенная программа держит exe/DLL и логи: удаление прошло бы
+    // частично (файлы остаются, а запись в «Приложениях» и ярлыки сняты).
+    // Проверка только здесь, не AppMutex: тот проверяется и установщиком,
+    // а автообновление запускает тихий setup, пока программа ещё работает.
+    // Тихое удаление при запущенной программе — отмена (IDCANCEL).
+    while CheckForMutexes(AppRunningMutex) do begin
+        if SuppressibleMsgBox(
+               'Video Downloader сейчас запущен.' + #13#10 +
+               'Закройте программу и нажмите «Повтор».',
+               mbError, MB_RETRYCANCEL, IDCANCEL) = IDCANCEL then begin
+            Result := False;
+            Exit;
+        end;
     end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
-    if (CurUninstallStep = usUninstall) and DeleteUserData then begin
-        DelTree(ExpandConstant('{localappdata}\VideoDownloader'), True,
-                True, True);
+    // Вопрос о данных — на шаге usUninstall, то есть ПОСЛЕ стандартного
+    // «Вы действительно хотите удалить…?». Из InitializeUninstall он
+    // появлялся первым, и «Да» легко нажимали как подтверждение удаления.
+    // В интерактивном режиме спрашиваем; в /VERYSILENT данные сохраняем
+    if (CurUninstallStep = usUninstall) and not UninstallSilent then begin
+        if MsgBox(
+               'Удалить также данные пользователя (настройки и историю загрузок)?',
+               mbConfirmation, MB_YESNO) = IDYES then
+            DelTree(ExpandConstant('{localappdata}\VideoDownloader'), True,
+                    True, True);
     end;
 end;
