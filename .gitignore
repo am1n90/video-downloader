@@ -1,6 +1,8 @@
 # Данные пользователя
 settings.json
 .vd-tests/sources.local.txt
+# fastresume и прочие данные торрент-движка в dev-режиме
+torrent-data/
 
 # Python
 __pycache__/
