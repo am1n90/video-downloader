@@ -8,6 +8,7 @@ import ctypes.wintypes as wt
 import datetime
 import json
 import os
+import threading
 import time
 
 import libtorrent as lt
@@ -121,14 +122,17 @@ class Report:
         self.path = os.path.join(RESULTS_DIR, f"{name}-{stamp}.jsonl")
         self.t0 = time.monotonic()
         self._alert_counts = {}
+        self._lock = threading.Lock()   # запись из потоков HTTP-сервера
 
     def log(self, msg):
         print(f"[{time.monotonic() - self.t0:8.2f}] {msg}", flush=True)
 
     def record(self, quiet=False, **data):
         data["t"] = round(time.monotonic() - self.t0, 3)
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        line = json.dumps(data, ensure_ascii=False) + "\n"
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(line)
         if not quiet:
             self.log("RESULT " + json.dumps(data, ensure_ascii=False))
 
