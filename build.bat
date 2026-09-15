@@ -3,7 +3,7 @@ REM ============================================================
 REM  Video Downloader — сборка установщика Windows
 REM
 REM  Требования:
-REM    - Python 3.10+ в PATH (для создания venv)
+REM    - Python 3.13 (py launcher: py -3.13)
 REM    - Inno Setup 6 (ISCC.exe) в стандартном расположении
 REM    - Доступ в сеть (pip-пакеты, ffmpeg ~80 МБ, deno ~40 МБ)
 REM
@@ -15,7 +15,8 @@ cd /d "%~dp0"
 
 echo [1/7] Создание изолированного venv для сборки...
 if exist "build-venv" rmdir /s /q "build-venv"
-python -m venv build-venv || goto :fail
+REM Python 3.13 via py launcher: libtorrent has no cp314 wheel
+py -3.13 -m venv build-venv || goto :fail
 call "build-venv\Scripts\activate.bat" || goto :fail
 
 echo [2/7] Установка зависимостей...
