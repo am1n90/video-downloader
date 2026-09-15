@@ -32,3 +32,8 @@ settings.json.corrupt-*
 *.log
 *.tmp
 CLAUDE.md
+
+# Черновики лицензии/README — решение по лицензии отложено, хранятся вне git
+/README.md
+/LICENSE
+/NOTICE.md
