@@ -115,6 +115,9 @@
   p1 concurrency, config_robust **48** (1.0.5: +8 на consume_load_warning,
   п.9 «Что осталось»), config_warning_gui **7** новый (1.0.5: InfoBar
   предупреждения о повреждённом settings.json, offscreen), ytdlp_logger 8,
+  mode_switch **51** новый (торрент-стриминг 1.1: переключатель режимов,
+  offscreen), check_mode_switch_live (1.1: НАСТОЯЩЕЕ окно, реальные клики
+  мышью win32 и снимки экрана QScreen.grabWindow -> %TEMP%\vd-mode-live),
   e2e download, live fetch_info, check_sources (analyze/download,
   range-фрагменты, кадры; sources.local.txt — личное, в .gitignore) +
   вспомогательные make_demo_data.py / live_demo_check.py. Запуск:
@@ -230,6 +233,23 @@
 14. **Торрент-стриминг фильмов/сериалов** — большая задача на 17-23
     сессии, начата 15.09.2026; решения и план — раздел «Торрент-
     стриминг» ниже. Текущий этап — там же («Статус»)
+15. single_instance.force_foreground() всегда вызывает
+    ShowWindow(SW_RESTORE): если окно первого экземпляра развёрнуто на
+    весь экран, повторный запуск программы вернёт его в обычный размер
+    (найдено 16.09.2026 при проверке 1.1, живой диагностикой: окно после
+    разворота возвращалось в обычный размер при force_foreground). Не
+    исправлено — решение владельца; вероятный фикс — SW_RESTORE только
+    если IsIconic(hwnd), иначе SW_SHOW
+16. Возможное падение при выходе из-за проверки обновлений (найдено
+    16.09.2026 при разборе падения test_mode_switch): QThread
+    UpdateWorker, который ещё работает к моменту выхода процесса и
+    которого никто не дождался, роняет процесс с 0xC0000409 — доказано
+    опытом (3/3 падения; без проверки и с wait() — 3/3 код 0).
+    MainWindow.closeEvent ждёт поток проверки только wait(2000), а
+    cancel() не прерывает уже идущий сетевой запрос — если GitHub
+    отвечает дольше 2 с и пользователь закрывает окно в первые секунды
+    после старта, вероятно то же падение. В приложении НЕ
+    воспроизводилось; не исправлено — решение владельца
 
 ## Торрент-стриминг (план, утверждён владельцем 15.09.2026)
 
@@ -383,6 +403,11 @@ lt.create_torrent, раздача по 127.0.0.1) + открытые фильм�
   сервер, mpv/VLC, ffprobe по URL, упаковка в exe, вход. соединения,
   exe без прав админа — итоги RESULTS.md и «История» 16.09). Этап 0
   завершён — далее Этап 1 (1.1: каркас переключателя режимов)
+- 16.09.2026: **сессия 1.1 выполнена (код + тесты, без сборки/релиза)**:
+  переключатель «Video Downloader | Torrent» в заголовке окна, страницы-
+  заглушки режима Torrent (gui_torrent.py), settings["app_mode"], общие
+  «Настройки» с группами Общие / Video Downloader / Torrent. Далее 1.2:
+  torrent_engine.py без GUI
 - Находки 0.1 для Этапа 1 (подробно в RESULTS.md):
   1. alert.message() на русской Windows может бросить UnicodeDecodeError
      (libtorrent обрезает текст ошибки посреди буквы) — всегда через
@@ -501,7 +526,14 @@ lt.create_torrent, раздача по 127.0.0.1) + открытые фильм�
 - `main.py` — точка входа → `gui.run()`; `-selftest` — сборочный режим
   (окно + авто-выход через 8с, exit-код для build.bat)
 - `gui.py` — PySide6 + qfluentwidgets (FluentWindow): страницы
-  Загрузка/Библиотека/Настройки; `Bridge(QObject)` (itemChanged/
+  Загрузка/Библиотека/Настройки; с 1.1 торрент-стриминга — переключатель
+  режимов «Video Downloader | Torrent» (SegmentedWidget в titleBar,
+  надпись заголовка скрыта): MainWindow._mode_pages / set_mode /
+  _reset_history (история qrouter начинается с текущей страницы режима) /
+  _onCurrentInterfaceChanged (последняя страница режима); пункты
+  навигации чужого режима скрыты setVisible; settings["app_mode"]
+  (video/torrent, неизвестное -> video); «Настройки» общие, группы
+  Общие / Video Downloader / Torrent; `Bridge(QObject)` (itemChanged/
   queueChanged) передаёт события фоновых потоков в GUI; QThread-воркеры:
   AnalyzeWorker, ThumbWorker, UpdateWorker (check/download, cancel()),
   LibraryThumbWorker; LibraryPage: rows_vbox + кеш миниатюр + чекбоксы
@@ -548,6 +580,9 @@ lt.create_torrent, раздача по 127.0.0.1) + открытые фильм�
   Windows через AttachThreadInput (activateWindow()/raise_() из
   PySide6 сами по себе не выводят окно поверх активного стороннего —
   см. «Историю» 15.09)
+- `gui_torrent.py` — страницы режима «Torrent» (1.1: заглушки
+  TorrentPage / TorrentLibraryPage); импортируется внутри
+  MainWindow.__init__, т.к. сам импортирует gui (общие виджеты/отступы)
 - `assets/app.ico` — иконка 16–256px
 
 ## Сборка (build.bat)
@@ -658,6 +693,47 @@ VideoDownloader`, без UAC, AppId фиксированный, RU/EN, ярлы�
   не повторять сразу
 
 ## История
+
+- **16.09.2026, торрент-стриминг: сессия 1.1 — каркас переключателя
+  режимов (код + тесты, без сборки/релиза)**: вариант B плана — одно
+  FluentWindow, все страницы в stackedWidget, пункты навигации чужого
+  режима скрыты setVisible (removeInterface/addSubInterface и вложенные
+  оболочки отклонены). Разобрано по исходникам qfluentwidgets 1.11.3:
+  qrouter хранит историю окна целиком, первый элемент стека — страница
+  по умолчанию («Загрузка») -> при смене режима история сбрасывается на
+  текущую страницу (иначе «Назад» уводит в скрытый режим); панель
+  навигации при collapse/expand сама скрытые пункты не показывает;
+  FluentWindow.switchTo без анимации выхода меняет страницу синхронно;
+  qframelesswindow на Windows обрабатывает WM_NCHITTEST только для рамок
+  -> полоса заголовка — клиентская область, клики доходят до
+  переключателя. Правки: config.DEFAULTS["app_mode"]="video"; gui.py —
+  MODE_VIDEO/MODE_TORRENT/APP_MODES, _setup_mode_switcher (SegmentedWidget
+  в titleBar, надпись заголовка скрыта), set_mode, _reset_history,
+  _onCurrentInterfaceChanged (последняя страница режима), switch_to для 5
+  страниц, «Настройки»: группы Общие (тема+обновления) / Video Downloader
+  / Torrent (заглушка); gui_torrent.py — TorrentPage/TorrentLibraryPage.
+  Тесты: test_mode_switch.py **51 PASS**, 10 прогонов подряд код 0;
+  check_mode_switch_live.py 9 PASS (реальные клики мышью: смена режима в
+  обе стороны и в светлой теме, двойной клик по заголовку разворачивает
+  окно; снимки экрана тёмная/светлая тема); весь прежний регресс зелёный
+  (core 38, retry 42, manifest 4, library, smoke, p1, config_robust 48,
+  config_warning_gui 7, ytdlp_logger 8, fragment 154, single_instance 7,
+  e2e, net); main.py -selftest код 0. Три ловушки проверки (записаны,
+  чтобы не повторять): (1) widget.grab() теряет Mica-фон — белый текст
+  тёмной темы на белом, снимать QScreen.grabWindow; (2) синтетический
+  двойной клик QTest на НАСТОЯЩЕМ окне теряет отпускание кнопки — для
+  живых проверок кликать через win32 SetCursorPos+mouse_event;
+  (3) test_mode_switch падал при выходе 0xC0000409 10/10 — причина
+  (доказана опытом 3x3: без проверки / поток работает / с wait()): QThread
+  автопроверки обновлений (QTimer 2.5 с в MainWindow) стартует у уже
+  закрытого окна теста, при выходе не дождан; первая версия «подмена
+  mouseDoubleClickEvent» опровергнута. Лечение в тестах —
+  check_updates=False. Попутно найдено в приложении (не исправлено, «Что
+  осталось» 15-16): force_foreground разворачивает окно из максимума в
+  обычный размер; closeEvent ждёт поток проверки обновлений только 2 с.
+  Инцидент: код выхода внутри $( ... ) через ${PIPESTATUS[0]} не
+  передаётся — первый прогон опыта показал ложные 0, перезапущен с
+  прямым $?
 
 - **15.09.2026 (вечер), торрент-стриминг: план + сессия 0.1 (домашняя
   машина)**: решения разведки 1-7 и план этапов записаны (раздел

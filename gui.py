@@ -64,6 +64,7 @@ from qfluentwidgets import (
     FluentIcon as FIF,
     setTheme,
 )
+from qfluentwidgets.common.router import qrouter
 
 import config
 import single_instance
@@ -90,6 +91,12 @@ except ImportError:
     ImageLabel = QLabel
 
 APP_NAME = "Video Downloader"
+
+# Режимы приложения — переключатель в заголовке окна (торрент-стриминг,
+# Этап 1.1): у каждого режима свой набор вкладок, «Настройки» общие.
+MODE_VIDEO = "video"
+MODE_TORRENT = "torrent"
+APP_MODES = {MODE_VIDEO: "Video Downloader", MODE_TORRENT: "Torrent"}
 
 MODE_LABELS = {"video": "Видео (MP4)", "audio": "Аудио (MP3)"}
 QUALITY_LABEL = "Лучшее"
@@ -2086,21 +2093,21 @@ class SettingsPage(TransparentScrollArea):
         self.vbox.setContentsMargins(0, 0, 0, 0)
         self.vbox.addWidget(TitleLabel("Настройки"))
 
-        # Внешний вид
-        group = SettingCardGroup("Внешний вид", self)
+        # Одна страница на оба режима приложения (решение владельца,
+        # торрент-стриминг 1.1): «Общие» / «Video Downloader» / «Torrent»
+        group = SettingCardGroup("Общие", self)
         group.addSettingCard(self._theme_card(inner))
+        for card in self._update_cards(inner):
+            group.addSettingCard(card)
         self.vbox.addWidget(group)
 
-        # Загрузки
-        group2 = SettingCardGroup("Загрузки", self)
+        group2 = SettingCardGroup("Video Downloader", self)
         for card in self._download_cards(inner):
             group2.addSettingCard(card)
         self.vbox.addWidget(group2)
 
-        # Обновления
-        group3 = SettingCardGroup("Обновления", self)
-        for card in self._update_cards(inner):
-            group3.addSettingCard(card)
+        group3 = SettingCardGroup("Torrent", self)
+        group3.addSettingCard(self._torrent_placeholder_card(inner))
         self.vbox.addWidget(group3)
 
         self.vbox.addStretch(1)
@@ -2139,6 +2146,13 @@ class SettingsPage(TransparentScrollArea):
         cards.append(auto_card)
 
         return cards
+
+    def _torrent_placeholder_card(self, parent):
+        return SettingCard(
+            FIF.CLOUD_DOWNLOAD, "Раздел в разработке",
+            "Папка загрузок, раздача после скачивания и порт появятся "
+            "вместе с режимом Torrent", parent,
+        )
 
     def _theme_card(self, parent):
         card = SettingCard(
@@ -2403,9 +2417,34 @@ class MainWindow(FluentWindow):
         self.settings_page = SettingsPage(self.settings, self.bridge, self)
         self.settings_page.setObjectName("settingsInterface")
 
+        # Режим «Torrent» (1.1: только каркас — страницы-заглушки).
+        # Импорт здесь, а не вверху: gui_torrent сам импортирует gui.
+        import gui_torrent
+        self.torrent_page = gui_torrent.TorrentPage(self)
+        self.torrent_page.setObjectName("torrentInterface")
+        self.torrent_library_page = gui_torrent.TorrentLibraryPage(self)
+        self.torrent_library_page.setObjectName("torrentLibraryInterface")
+
         self.download_page.parent_window = self
 
+        # Страницы по режимам; «Настройки» не принадлежат ни одному
+        self._mode_pages = {
+            MODE_VIDEO: [self.download_page, self.library_page],
+            MODE_TORRENT: [self.torrent_page, self.torrent_library_page],
+        }
+        self._page_mode = {
+            page.objectName(): mode
+            for mode, pages in self._mode_pages.items() for page in pages
+        }
+        self._last_page = {
+            mode: pages[0] for mode, pages in self._mode_pages.items()
+        }
+        self.app_mode = None
+        self._reset_history_pending = False
+
         self._setup_navigation()
+        self._setup_mode_switcher()
+        self.set_mode(self.settings.get("app_mode"), save=False)
         self._apply_theme(self.settings["theme"], save=False)
 
         self.settings_page.themeChanged.connect(self._apply_theme)
@@ -2487,6 +2526,14 @@ class MainWindow(FluentWindow):
             position=NavigationItemPosition.TOP,
         )
         self.addSubInterface(
+            self.torrent_page, FIF.CLOUD_DOWNLOAD, "Торренты",
+            position=NavigationItemPosition.TOP,
+        )
+        self.addSubInterface(
+            self.torrent_library_page, FIF.LIBRARY, "Библиотека",
+            position=NavigationItemPosition.TOP,
+        )
+        self.addSubInterface(
             self.settings_page, FIF.SETTING, "Настройки",
             position=NavigationItemPosition.BOTTOM,
         )
@@ -2496,15 +2543,101 @@ class MainWindow(FluentWindow):
         self.navigationInterface.setCollapsible(True)
 
     def switch_to(self, route_key):
-        """Переключиться на страницу (виджет напрямую)."""
+        """Переключиться на страницу (виджет напрямую). Страница другого
+        режима сначала переключает режим."""
         pages = {
             "download": self.download_page,
             "library": self.library_page,
+            "torrents": self.torrent_page,
+            "torrent_library": self.torrent_library_page,
             "settings": self.settings_page,
         }
         widget = pages.get(route_key)
-        if widget is not None:
-            self.stackedWidget.setCurrentWidget(widget)
+        if widget is None:
+            return
+        mode = self._page_mode.get(widget.objectName())
+        if mode is not None and mode != self.app_mode:
+            self.set_mode(mode)
+        self.stackedWidget.setCurrentWidget(widget)
+
+    # ---------- режимы приложения ----------
+
+    def _setup_mode_switcher(self):
+        """Переключатель «Video Downloader | Torrent» в заголовке окна.
+
+        Отдельной навигации у режимов нет: все страницы живут в одном
+        FluentWindow, смена режима скрывает пункты навигации чужого режима
+        (вариант B плана торрент-стриминга — без removeInterface и без
+        вложенных оболочек). Надпись заголовка скрыта: она дублировала бы
+        первый пункт переключателя; заголовок окна для панели задач
+        остаётся APP_NAME.
+        """
+        self.mode_switch = SegmentedWidget(self.titleBar)
+        for mode, text in APP_MODES.items():
+            self.mode_switch.addItem(mode, text)
+        self.mode_switch.currentItemChanged.connect(self.set_mode)
+        self.titleBar.titleLabel.hide()
+        layout = self.titleBar.hBoxLayout
+        layout.insertSpacing(2, SP_BLOCK)
+        layout.insertWidget(3, self.mode_switch, 0,
+                            Qt.AlignLeft | Qt.AlignVCenter)
+
+    def set_mode(self, mode, save=True):
+        """Сменить режим: пункты навигации чужого режима скрываются,
+        открывается последняя страница нового режима, история «Назад»
+        начинается заново. Неизвестный режим -> «Video Downloader»."""
+        if mode not in APP_MODES:
+            mode = MODE_VIDEO
+        changed = mode != self.app_mode
+        self.app_mode = mode
+        for page_mode, pages in self._mode_pages.items():
+            for page in pages:
+                item = self.navigationInterface.widget(page.objectName())
+                if item is not None:
+                    item.setVisible(page_mode == mode)
+        if self.mode_switch.currentRouteKey() != mode:
+            self.mode_switch.blockSignals(True)
+            self.mode_switch.setCurrentItem(mode)
+            self.mode_switch.blockSignals(False)
+
+        target = self._last_page[mode]
+        if self.stackedWidget.currentWidget() is target:
+            self._reset_history()
+        else:
+            # Сброс — после того, как FluentWindow запишет новую страницу
+            # в историю (см. _onCurrentInterfaceChanged)
+            self._reset_history_pending = True
+            self.switchTo(target)
+
+        self.settings["app_mode"] = mode
+        if save and changed:
+            config.save(self.settings)
+
+    def _reset_history(self):
+        """История «Назад» начинается с текущей страницы.
+
+        qrouter (qfluentwidgets) хранит историю окна целиком, а первый
+        элемент стека — страница по умолчанию («Загрузка»). Без сброса
+        «Назад» в режиме Torrent возвращала бы на скрытые страницы
+        Video Downloader.
+        """
+        self._reset_history_pending = False
+        current = self.stackedWidget.currentWidget()
+        stack = qrouter.stackHistories.get(self.stackedWidget)
+        if stack is not None and current is not None:
+            stack.history = [current.objectName()]
+        qrouter.history = [item for item in qrouter.history
+                           if item.stacked is not self.stackedWidget]
+        qrouter.emptyChanged.emit(not qrouter.history)
+
+    def _onCurrentInterfaceChanged(self, index):
+        super()._onCurrentInterfaceChanged(index)
+        widget = self.stackedWidget.widget(index)
+        if widget is not None and \
+                self._page_mode.get(widget.objectName()) == self.app_mode:
+            self._last_page[self.app_mode] = widget
+        if self._reset_history_pending:
+            self._reset_history()
 
     # ---------- темы ----------
 
