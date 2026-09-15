@@ -190,6 +190,156 @@ check("opts: аудио+фрагмент -> суффикс в outtmpl + MP3-по
       "[clip 30s-60s]" in opts_audio["outtmpl"]
       and opts_audio["format"] == "bestaudio/best")
 
+# ============ 4.5 VK-фрагмент: прямой формат (п.12) ============
+
+# _is_vk_url: разбор хоста (домены экстрактора VK в yt-dlp)
+vk_cases = [
+    ("https://vk.com/video-1_2", True),
+    ("https://m.vk.com/video-1_2", True),
+    ("https://new.vk.com/video-1_2", True),
+    ("https://vk.ru/video-1_2", True),
+    ("https://vkvideo.ru/video-1_2", True),
+    ("https://vksport.vkvideo.ru/video-1_2", True),
+    ("HTTPS://VK.COM/video-1_2", True),
+    ("vkvideo.ru/video-1_2", True),
+    ("https://notvk.com/video", False),
+    ("https://vk.com.evil.org/video", False),
+    ("https://www.youtube.com/watch?v=x?vk.com", False),
+    ("https://www.tiktok.com/@u/video/1", False),
+    ("", False),
+    (None, False),
+]
+bad_vk = [u for u, want in vk_cases if downloader._is_vk_url(u) != want]
+check("_is_vk_url: хост vk.com/vk.ru/vkvideo.ru + поддомены, чужие — нет",
+      not bad_vk, f"ошибки: {bad_vk}")
+
+VK_URL = "https://vkvideo.ru/video-220754053_456242855"
+FULL_FMT = {"best": "bestvideo+bestaudio/best",
+            "720": "bestvideo[height<=720]+bestaudio/best[height<=720]/best"}
+
+
+def _fmt_of(url, mode="video", quality="best", time_range=(0, 30)):
+    return mgr._build_options(
+        mgr.add(url, mode, quality, "C:/d", False, time_range=time_range)
+    )["format"]
+
+
+check("vk-fmt: VK+фрагмент best -> прямой формат первым, прежний после /",
+      _fmt_of(VK_URL) == "best[protocol~='^https?$']/" + FULL_FMT["best"],
+      _fmt_of(VK_URL))
+check("vk-fmt: VK+фрагмент 720 -> прямой [height<=720], прежний после /",
+      _fmt_of(VK_URL, quality="720")
+      == "best[protocol~='^https?$'][height<=720]/" + FULL_FMT["720"],
+      _fmt_of(VK_URL, quality="720"))
+check("vk-fmt: VK+фрагмент аудио -> прямой формат, затем bestaudio/best",
+      _fmt_of(VK_URL, mode="audio")
+      == "best[protocol~='^https?$']/bestaudio/best",
+      _fmt_of(VK_URL, mode="audio"))
+check("vk-fmt: VK без фрагмента -> формат не менялся (best и 720)",
+      _fmt_of(VK_URL, time_range=None) == FULL_FMT["best"]
+      and _fmt_of(VK_URL, quality="720", time_range=None) == FULL_FMT["720"])
+check("vk-fmt: VK без фрагмента аудио -> bestaudio/best",
+      _fmt_of(VK_URL, mode="audio", time_range=None) == "bestaudio/best")
+other_bad = []
+for other in ("https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+              "https://www.tiktok.com/@u/video/1",
+              "https://www.instagram.com/reel/abc/"):
+    for mode, quality, want in (("video", "best", FULL_FMT["best"]),
+                                ("video", "720", FULL_FMT["720"]),
+                                ("audio", "best", "bestaudio/best")):
+        got = _fmt_of(other, mode=mode, quality=quality)
+        if got != want:
+            other_bad.append((other, mode, quality, got))
+check("vk-fmt: YouTube/TikTok/Instagram + фрагмент -> формат не менялся",
+      not other_bad, f"{other_bad}")
+
+# Реальный выбор yt-dlp (без сети): форматы как у VK-видео 15.09
+# (vk_fmt_probe): url* https (видео+звук, кодеки не указаны), dash_sep-*
+# https (отдельные дорожки), hls/hls_fmp4 m3u8_native.
+from yt_dlp import YoutubeDL as _YDL
+
+
+def _vk_formats(direct=True, dash=True, hls=True):
+    fmts = []
+    if dash or hls:
+        for i in range(2):
+            if dash:
+                fmts.append({"format_id": f"dash_sep-a{i}", "ext": "m4a",
+                             "protocol": "https", "vcodec": "none",
+                             "acodec": "mp4a.40.2", "tbr": 64 + 64 * i,
+                             "url": f"https://cdn.example/a{i}.m4a"})
+            if hls:
+                fmts.append({"format_id": f"hls_fmp4-Audio{i}", "ext": "mp4",
+                             "protocol": "m3u8_native", "vcodec": "none",
+                             "tbr": 64 + 64 * i,
+                             "url": f"https://cdn.example/a{i}.m3u8"})
+    for h in (360, 720, 1080):
+        if hls:
+            fmts.append({"format_id": f"hls-{h}", "ext": "mp4", "height": h,
+                         "protocol": "m3u8_native", "tbr": h * 4,
+                         "url": f"https://cdn.example/{h}.m3u8"})
+            fmts.append({"format_id": f"hls_fmp4-{h}", "ext": "mp4",
+                         "height": h, "protocol": "m3u8_native",
+                         "vcodec": "avc1.640028", "acodec": "none",
+                         "tbr": h * 4,
+                         "url": f"https://cdn.example/v{h}.m3u8"})
+        if dash:
+            fmts.append({"format_id": f"dash_sep-{h}", "ext": "mp4",
+                         "height": h, "protocol": "https",
+                         "vcodec": "avc1.640028", "acodec": "none",
+                         "tbr": h * 4, "url": f"https://cdn.example/v{h}.mp4"})
+        if direct:
+            fmts.append({"format_id": f"url{h}", "ext": "mp4", "height": h,
+                         "source_preference": 1,
+                         "url": f"https://cdn.example/url{h}.mp4"})
+    return fmts
+
+
+class _QuietLog:
+    def debug(self, msg):
+        pass
+
+    warning = error = info = debug
+
+
+def _chosen(fmt, formats):
+    info = {"id": "vk1", "title": "vk", "extractor": "vk",
+            "extractor_key": "VK", "webpage_url": VK_URL,
+            "formats": [dict(f) for f in formats]}
+    with _YDL({"quiet": True, "no_warnings": True, "format": fmt,
+               "logger": _QuietLog()}) as ydl:
+        res = ydl.process_ie_result(info, download=False)
+    return [f["format_id"]
+            for f in (res.get("requested_formats") or [res])]
+
+
+all_fmts = _vk_formats()
+check("vk-select: прямой+DASH+HLS, фрагмент best -> url1080",
+      _chosen(_fmt_of(VK_URL), all_fmts) == ["url1080"],
+      str(_chosen(_fmt_of(VK_URL), all_fmts)))
+check("vk-select: прямой+DASH+HLS, фрагмент 720 -> url720",
+      _chosen(_fmt_of(VK_URL, quality="720"), all_fmts) == ["url720"],
+      str(_chosen(_fmt_of(VK_URL, quality="720"), all_fmts)))
+check("vk-select: прямой+DASH+HLS, фрагмент аудио -> url1080 (mp4 -> MP3)",
+      _chosen(_fmt_of(VK_URL, mode="audio"), all_fmts) == ["url1080"],
+      str(_chosen(_fmt_of(VK_URL, mode="audio"), all_fmts)))
+check("vk-select: полное скачивание VK -> прежний выбор (не url*)",
+      not any(fid.startswith("url")
+              for fid in _chosen(_fmt_of(VK_URL, time_range=None), all_fmts)),
+      str(_chosen(_fmt_of(VK_URL, time_range=None), all_fmts)))
+fallback_bad = []
+for label, fmts in (("только HLS", _vk_formats(direct=False, dash=False)),
+                    ("HLS+DASH", _vk_formats(direct=False))):
+    for mode, quality in (("video", "best"), ("video", "720"),
+                          ("audio", "best")):
+        new = _chosen(_fmt_of(VK_URL, mode=mode, quality=quality), fmts)
+        old = _chosen(_fmt_of(VK_URL, mode=mode, quality=quality,
+                              time_range=None), fmts)
+        if new != old or not new:
+            fallback_bad.append((label, mode, quality, new, old))
+check("vk-select: без прямого формата -> тот же выбор, что прежний селектор",
+      not fallback_bad, f"{fallback_bad}")
+
 # ============ 5. yt-dlp санитизация имени (эмодзи/кириллица) ============
 
 from yt_dlp.utils import sanitize_filename

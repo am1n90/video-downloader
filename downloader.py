@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 
 from yt_dlp import YoutubeDL
 
@@ -79,11 +80,29 @@ FRAGMENT_STALL_TIMEOUT = 600.0    # 10 минут без роста файлов
 FRAGMENT_WATCH_POLL = 1.0        # период опроса сторожа
 
 
+# Домены VK — как _VALID_URL экстрактора yt-dlp (yt_dlp/extractor/vk.py):
+# vk.com, vk.ru, vkvideo.ru и их поддомены (m., new., vksport.).
+VK_HOSTS = ("vk.com", "vk.ru", "vkvideo.ru")
+
+# Прямой (не HLS/DASH-сегментный) формат: протокол http/https. У VK это
+# url144…url1080 — цельный mp4 с видео и звуком. HLS — m3u8_native;
+# dash_sep-* тоже https, но это отдельные дорожки (только видео или
+# только звук), и селектор best (видео+звук в одном формате) их не берёт.
+DIRECT_FORMAT_FILTER = "[protocol~='^https?$']"
+
+
 def _is_vk_url(url):
-    """VK-ссылка (для текста ошибки зависания фрагмента; как
-    source_from_url в gui)."""
-    low = (url or "").lower()
-    return "vk.com" in low or "vkvideo" in low
+    """VK-ссылка: разбор хоста, а не поиск подстроки (vk.ru раньше не
+    распознавался, а «notvk.com» распознался бы). Используется для
+    выбора формата фрагмента и текста ошибки сторожа."""
+    url = (url or "").strip()
+    if "://" not in url:
+        url = "//" + url
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == d or host.endswith("." + d) for d in VK_HOSTS)
 
 
 # Переходящие сбои (1.0.4): сеть (таймауты, обрывы, SSL, 5xx) и сбои
@@ -589,6 +608,19 @@ class DownloadManager:
                 f"bestvideo[height<={item.quality}]+bestaudio/"
                 f"best[height<={item.quality}]/best"
             )
+
+        # VK + фрагмент: сначала прямой mp4 (url1080 и т.п.). Прежний
+        # селектор берёт dash_sep-видео + HLS-аудио, и FFmpegFD висит на
+        # HLS-секции на медленном CDN (17+ минут без роста файла), а
+        # прямой формат фрагмент качает (12.8 МБ за 30с, h264+aac).
+        # Нет прямого формата -> yt-dlp берёт прежний селектор после «/»
+        # (дальше — сторож). Полное скачивание VK и другие сайты — без
+        # изменений. Аудио: из прямого mp4 ffmpeg извлечёт MP3 фрагмента.
+        if item.time_range and _is_vk_url(item.url):
+            direct = "best" + DIRECT_FORMAT_FILTER
+            if item.mode != "audio" and item.quality != "best":
+                direct += f"[height<={item.quality}]"
+            fmt = f"{direct}/{fmt}"
 
         options = {
             "format": fmt,

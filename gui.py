@@ -77,6 +77,7 @@ from downloader import (
     STATUS_PAUSED,
     STATUS_PROCESSING,
     STATUS_QUEUED,
+    _is_vk_url,
     fetch_info,
     fmt_eta,
     fmt_speed,
@@ -1504,7 +1505,7 @@ def source_from_url(url):
         return "Другое"
     if "youtube" in host or "youtu.be" in host:
         return "YouTube"
-    if "vk.com" in host or "vkvideo" in host:
+    if _is_vk_url(url):
         return "VK"
     if "instagram" in host:
         return "Instagram"
