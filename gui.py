@@ -66,6 +66,7 @@ from qfluentwidgets import (
 )
 
 import config
+import single_instance
 import updater
 from downloader import (
     DownloadManager,
@@ -2466,13 +2467,38 @@ class MainWindow(FluentWindow):
         super().closeEvent(event)
 
 
+class _SingleInstanceSignal(QObject):
+    show_requested = Signal()
+
+
 def run():
     """Точка входа GUI."""
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
 
+    # _mutex_handle держим живым до конца процесса — иначе мьютекс
+    # освободится досрочно и второй экземпляр решит, что первого нет.
+    _mutex_handle, already_running = single_instance.acquire_mutex()
+    if already_running:
+        if single_instance.send_show_request():
+            sys.exit(0)
+        # Первый экземпляр не отвечает (завис) — не зависаем сами,
+        # показываем собственное окно вместо тихого выхода.
+
     settings = config.load()
     window = MainWindow(settings)
+
+    signal_holder = _SingleInstanceSignal()
+
+    def _bring_to_front():
+        window.showNormal()
+        window.activateWindow()
+        window.raise_()
+        single_instance.force_foreground(int(window.winId()))
+
+    signal_holder.show_requested.connect(_bring_to_front)
+    single_instance.start_pipe_server(signal_holder.show_requested.emit)
+
     window.show()
 
     geometry = settings.get("window_geometry")
