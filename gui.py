@@ -412,7 +412,70 @@ class RangeSlider(QWidget):
         return isDarkTheme()
 
 
-class AnalyzeWorker(QThread):
+class WorkerCancelled(Exception):
+    """Фоновая операция отменена (закрытие окна) — результат не нужен."""
+
+
+def _call_interruptible(func, cancel_event, poll=0.1):
+    """Выполнить блокирующий вызов (сеть, yt-dlp) во вспомогательном
+    daemon-потоке; QThread ждёт результат, проверяя cancel_event.
+
+    Зачем: QThread, который к выходу процесса ещё сидит в сетевом вызове,
+    роняет приложение при завершении (0xC0000409), а сам вызов прервать
+    нельзя (urlopen, DNS, yt-dlp). closeEvent ставит cancel_event ->
+    QThread возвращается за ~0.1 с и успевает завершиться; вспомогательный
+    daemon-поток доделывает вызов или обрывается вместе с процессом.
+    Воспроизведено 16.09.2026 на настоящем окне: закрытие во время анализа
+    ссылки на молчащий сервер — 4/4 падения, во время медленной проверки
+    обновлений — 2/4.
+
+    Возвращает результат func() или бросает его исключение; при отмене —
+    WorkerCancelled.
+    """
+    box = {}
+
+    def target():
+        try:
+            box["result"] = func()
+        except BaseException as exc:  # передаём в QThread как есть
+            box["error"] = exc
+
+    helper = threading.Thread(target=target, daemon=True)
+    helper.start()
+    while helper.is_alive():
+        if cancel_event.is_set():
+            raise WorkerCancelled()
+        helper.join(poll)
+    if "error" in box:
+        raise box["error"]
+    return box.get("result")
+
+
+def _read_url(url, timeout):
+    with urllib.request.urlopen(url, timeout=timeout) as resp:
+        return resp.read()
+
+
+class _CancellableWorker(QThread):
+    """QThread, который при закрытии окна освобождается сразу.
+
+    Блокирующую работу выполнять через self._call(...): после cancel()
+    она бросает WorkerCancelled, run() завершается без сигналов.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def _call(self, func, *args, **kwargs):
+        return _call_interruptible(lambda: func(*args, **kwargs),
+                                   self.cancel_event)
+
+
+class AnalyzeWorker(_CancellableWorker):
     """Анализ ссылки в фоне."""
 
     done = Signal(object)
@@ -425,13 +488,16 @@ class AnalyzeWorker(QThread):
 
     def run(self):
         try:
-            info = fetch_info(self.url, playlist=self.playlist)
-            self.done.emit(info)
+            info = self._call(fetch_info, self.url, playlist=self.playlist)
+        except WorkerCancelled:
+            return
         except Exception as exc:
             self.failed.emit(str(exc))
+            return
+        self.done.emit(info)
 
 
-class ThumbWorker(QThread):
+class ThumbWorker(_CancellableWorker):
     """Загрузка миниатюры в фоне."""
 
     loaded = Signal(QImage)
@@ -445,7 +511,7 @@ class ThumbWorker(QThread):
         image = QImage()
         if self.url:
             try:
-                data = urllib.request.urlopen(self.url, timeout=10).read()
+                data = self._call(_read_url, self.url, 10)
                 image = QImage()
                 image.loadFromData(data)
                 if not image.isNull():
@@ -453,6 +519,8 @@ class ThumbWorker(QThread):
                         self.size[0], self.size[1],
                         Qt.KeepAspectRatio, Qt.SmoothTransformation,
                     )
+            except WorkerCancelled:
+                return
             except Exception:
                 image = QImage()
         self.loaded.emit(image)
@@ -542,7 +610,7 @@ class FramePreviewWorker(QThread):
         self.loaded.emit(self, image)
 
 
-class UpdateWorker(QThread):
+class UpdateWorker(_CancellableWorker):
     """Проверка/скачивание обновления в фоне (по образцу AnalyzeWorker).
 
     mode='check': fetch_manifest + is_newer.
@@ -562,15 +630,11 @@ class UpdateWorker(QThread):
         self.manifest_url = manifest_url
         self.manifest = manifest
         self.dest = dest
-        self.cancel_event = threading.Event()
-
-    def cancel(self):
-        self.cancel_event.set()
 
     def run(self):
         try:
             if self.mode == "check":
-                manifest = updater.fetch_manifest(self.manifest_url)
+                manifest = self._call(updater.fetch_manifest, self.manifest_url)
                 if manifest and updater.is_newer(
                     manifest.get("version", ""), config.APP_VERSION
                 ):
@@ -583,10 +647,13 @@ class UpdateWorker(QThread):
                 dest = self.dest
 
                 def on_progress(percent, downloaded, total):
-                    self.downloadProgress.emit(percent, downloaded, total)
+                    # вызывается из вспомогательного потока _call; после
+                    # отмены окно закрывается — прогресс уже не нужен
+                    if not self.cancel_event.is_set():
+                        self.downloadProgress.emit(percent, downloaded, total)
 
-                updater.download_file(
-                    url, dest, progress_cb=on_progress,
+                self._call(
+                    updater.download_file, url, dest, progress_cb=on_progress,
                     cancel_event=self.cancel_event,
                 )
                 if not updater.verify_file(
@@ -596,7 +663,7 @@ class UpdateWorker(QThread):
                         "Контрольная сумма не совпала — файл повреждён"
                     )
                 self.downloadDone.emit(dest)
-        except updater.DownloadCancelled:
+        except (updater.DownloadCancelled, WorkerCancelled):
             pass  # отмена: тихо, без ошибок
         except updater.ManifestError as exc:
             # Отличаем «проверить не вышло» от «обновлений нет» (BUG-10)
@@ -1602,7 +1669,7 @@ def source_from_url(url):
     return host
 
 
-class LibraryThumbWorker(QThread):
+class LibraryThumbWorker(_CancellableWorker):
     """Миниатюра для карточки библиотеки."""
 
     loaded = Signal(str, QImage)
@@ -1616,7 +1683,7 @@ class LibraryThumbWorker(QThread):
         image = QImage()
         if self.url:
             try:
-                data = urllib.request.urlopen(self.url, timeout=8).read()
+                data = self._call(_read_url, self.url, 8)
                 img = QImage()
                 img.loadFromData(data)
                 if not img.isNull():
@@ -1624,6 +1691,8 @@ class LibraryThumbWorker(QThread):
                         self.size[0], self.size[1],
                         Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation,
                     )
+            except WorkerCancelled:
+                return
             except Exception:
                 image = QImage()
         self.loaded.emit(self.url, image)
@@ -2057,6 +2126,7 @@ class LibraryPage(TransparentScrollArea):
         """Остановить все воркеры миниатюр (при закрытии окна)."""
         for worker in list(self._thumb_workers):
             try:
+                worker.cancel()
                 worker.quit()
                 worker.wait(1500)
             except Exception:
@@ -2700,7 +2770,6 @@ class MainWindow(FluentWindow):
                 threads.append(thread)
         update_worker = getattr(self.settings_page, "_update_worker", None)
         if update_worker is not None:
-            update_worker.cancel()          # тихая остановка проверок/скачивания
             threads.append(update_worker)
         for thread in threads:
             try:
@@ -2710,6 +2779,11 @@ class MainWindow(FluentWindow):
                 # таймаута ffmpeg (замечено — до ~17-20с на VK).
                 if hasattr(thread, "stop"):
                     thread.stop()
+                # Сетевые воркеры (_CancellableWorker): отмена освобождает
+                # поток за ~0.1 с. Без неё wait(2000) истекал, поток
+                # оставался в сети, и процесс падал при выходе (0xC0000409).
+                if hasattr(thread, "cancel"):
+                    thread.cancel()
                 thread.quit()
                 thread.wait(2000)
             except Exception:
