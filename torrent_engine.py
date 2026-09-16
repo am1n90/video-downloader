@@ -549,15 +549,25 @@ class TorrentEngine:
         handle.resume()
 
     def _files_of(self, tid, handle):
+        """Файлы раздачи; пути и размеры кэшируются, приоритеты — нет.
+
+        prioritize_files асинхронный (находка 21): сразу после set_files
+        libtorrent ещё отдаёт СТАРЫЕ приоритеты, поэтому кэш, собранный в
+        этот момент, оставался неверным навсегда — выбор файлов применялся
+        (качался только выбранный), но в снимке и в дереве с галочками
+        по-прежнему числились все. Сверяем приоритеты на каждом снимке и
+        пересобираем кортеж, только когда они действительно изменились.
+        """
+        priorities = handle.get_file_priorities()
         with self._lock:
             cached = self._files.get(tid)
-        if cached is not None:
+        if cached is not None and len(cached) == len(priorities) and all(
+                f.priority == p for f, p in zip(cached, priorities)):
             return cached
         ti = handle.torrent_file()
         if ti is None:
-            return ()
+            return cached or ()
         fs = ti.files()
-        priorities = handle.get_file_priorities()
         files = tuple(
             TorrentFile(i, fs.file_path(i), fs.file_size(i),
                         priorities[i] if i < len(priorities) else 4)

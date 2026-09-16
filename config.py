@@ -29,6 +29,11 @@ DEFAULTS = {
     "history": [],                           # завершённые загрузки
     "check_updates": True,                   # автопроверка при старте
     "app_mode": "video",                     # режим приложения: video / torrent
+    # Режим Torrent. torrent_port 0 — libtorrent выберет свободный сам;
+    # раздача после скачивания включена по умолчанию (решение №4).
+    "torrent_folder": os.path.join(os.path.expanduser("~"), "Downloads"),
+    "torrent_seed_after_download": True,
+    "torrent_port": 0,
     # Стабильный алиас latest (не URL конкретного релиза — иначе старые
     # билды не увидят новые версии). Переопределяется в settings.json
     # только для локального теста цикла обновления.
