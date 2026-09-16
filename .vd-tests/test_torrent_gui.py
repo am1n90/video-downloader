@@ -12,6 +12,8 @@
 карточка и её подпись; кнопки по состояниям (пауза/продолжение/ошибка);
 дерево файлов с галочками; применение выбора файлов; удаление с файлами;
 группа «Torrent» в Настройках и её связь с живым движком; closeEvent.
+Сессия 2.2 добавила сценарий 9: диалог «что смотреть» для раздачи с
+несколькими видеофайлами и индикатор подготовки плеера.
 """
 import dataclasses
 import hashlib
@@ -35,6 +37,7 @@ from PySide6.QtWidgets import QApplication
 import gui
 import gui_torrent
 import torrent_engine as te
+import torrent_stream as ts
 
 PASS, FAIL = [], []
 
@@ -425,6 +428,20 @@ def fake_resolve(configured=""):
 gui_torrent.player.resolve = fake_resolve
 gui_torrent.player.launch = lambda target, exe: LAUNCHED.append((target, exe))
 
+# В раздаче два видеофайла, и с 2.2 «Смотреть» спрашивает, какой из них
+# открыть. Здесь отвечаем за пользователя тем же файлом, что выбирался
+# сам в 2.1 (самый большой), — сам диалог и развилка «спрашивать или
+# нет» проверяются сценарием 9.
+ASKED = []
+
+
+def pick_biggest(self, item, targets):
+    ASKED.append([f.index for f in targets])
+    return max(targets, key=lambda f: f.size)
+
+
+gui_torrent.TorrentPage.ask_watch_file = pick_biggest
+
 VIDEO_INDEX = next(i for i, p in enumerate(FILE_ORDER)
                    if os.path.basename(p) == "видео 1.mkv")
 VIDEO_REL = FILE_ORDER[VIDEO_INDEX]
@@ -461,9 +478,13 @@ check("7 просмотр активен и виден в карточке",
       page7.is_watching(IH)
       and page7._stream.active == (IH, VIDEO_INDEX), str(page7._stream.active))
 card7 = page7._cards.get(IH)
+# Плеер поддельный, к серверу он не обратится, поэтому подпись здесь —
+# «запускаем плеер…», а не «идёт просмотр»: с 2.2 карточка показывает
+# подготовку, пока плеер не дал о себе знать (сценарий 9)
 check("7 в карточке «Остановить просмотр» и пометка в подписи",
       buttons(card7)[0] == "Остановить просмотр"
-      and "идёт просмотр" in card7.meta_label.text(),
+      and page7.watch_status(IH) == "запускаем плеер…"
+      and "запускаем плеер…" in card7.meta_label.text(),
       f"{buttons(card7)} | {card7.meta_label.text()}")
 
 # 7в. Ссылка действительно отдаёт байты файла — весь путь целиком
@@ -603,6 +624,155 @@ check("7 closeEvent закрыл и сервер просмотра, и движ
 reader8.join(3)
 check("7 висевший запрос завершился, поток не остался",
       not reader8.is_alive(), str(holder8.keys()))
+seed.h.set_upload_limit(0)
+
+# ---- 9: диалог «что смотреть» и индикатор подготовки плеера (2.2) ----
+page9, eng9, save9 = make_page("s9")
+page9.show()
+pump(0.3)
+seed.h.set_upload_limit(96 * 1024)
+page9.magnet_edit.setText(magnet())
+page9.add_magnet()
+started9 = wait_until(lambda: (page9.engine.get(IH) is not None)
+                      and page9.engine.get(IH).has_metadata
+                      and 0 <= page9.engine.get(IH).progress < 1.0, 30)
+item9 = page9.engine.get(IH)
+check("9 раздача добавлена и ещё качается", started9,
+      "" if item9 is None else str(item9.state))
+
+# 9а. Сам диалог: дерево то же, выбор одиночный
+targets9 = ts.watchable_files(item9.files)
+check("9 к просмотру предложены оба видеофайла, txt — нет",
+      [os.path.basename(f.path) for f in targets9]
+      == ["видео 1.mkv", "видео 2.mp4"],
+      str([f.path for f in targets9]))
+dlg9 = gui_torrent.WatchFileDialog(item9, targets9,
+                                   page9.engine.file_progress(IH), page9)
+root9 = dlg9.tree.invisibleRootItem()
+folder9 = root9.child(0)
+check("9 диалог показывает всю раздачу, включая невидеофайлы",
+      root9.childCount() == 1 and folder9.childCount() == 3,
+      f"{root9.childCount()} / {folder9.childCount()}")
+disabled9 = [folder9.child(i).text(0) for i in range(folder9.childCount())
+             if folder9.child(i).isDisabled()]
+check("9 невидеофайл выбрать нельзя", disabled9 == ["описание.txt"],
+      str(disabled9))
+chosen9 = dlg9._current_file()
+check("9 предвыбран самый большой видеофайл",
+      chosen9 is not None and chosen9.index == VIDEO_INDEX,
+      "" if chosen9 is None else chosen9.path)
+check("9 «Смотреть» доступна при выбранном видео", dlg9.yesButton.isEnabled())
+other9 = next(f for f in targets9 if f.index != VIDEO_INDEX)
+check("9 выбор другого файла меняет ответ диалога",
+      dlg9.select(other9.index)
+      and dlg9._current_file().index == other9.index)
+# У каждого видео видно, сколько уже скачано, — по этому выбирают, что
+# пойдёт быстрее
+shares9 = [folder9.child(i).text(2) for i in range(folder9.childCount())]
+check("9 у видеофайлов показан процент скачанного",
+      all(s.endswith("%") or s == "скачан" for s in shares9[:2])
+      and shares9[2] == "", str(shares9))
+check("9 без подтверждения диалог ничего не отдаёт", dlg9.chosen() is None)
+dlg9.close()
+dlg9.deleteLater()
+
+# 9б. Развилка: одно видео — без вопроса, два — с вопросом
+ASKED.clear()
+LAUNCHED.clear()
+one_video = dataclasses.replace(
+    item9, files=tuple(f for f in item9.files
+                       if not f.path.endswith(".mp4")))
+page9.engine.get = lambda tid: one_video if tid == IH else None
+check("9 при одном видеофайле диалог не показывается",
+      page9.watch(IH) and not ASKED and len(LAUNCHED) == 1, str(ASKED))
+page9.stop_watch()
+del page9.engine.get                    # обратно к методу движка
+
+ASKED.clear()
+LAUNCHED.clear()
+check("9 при двух видеофайлах диалог показывается",
+      page9.watch(IH) and ASKED == [[f.index for f in targets9]], str(ASKED))
+check("9 смотрится тот файл, который выбрали в диалоге",
+      page9._stream.active == (IH, VIDEO_INDEX), str(page9._stream.active))
+page9.stop_watch()
+
+ASKED.clear()
+LAUNCHED.clear()
+gui_torrent.TorrentPage.ask_watch_file = lambda self, item, targets: None
+check("9 отмена диалога не запускает ни поток, ни плеер",
+      page9.watch(IH) is False and not LAUNCHED
+      and not page9.is_watching(IH))
+gui_torrent.TorrentPage.ask_watch_file = pick_biggest
+
+# 9в. Индикатор подготовки плеера
+LAUNCHED.clear()
+check("9 просмотр запущен", page9.watch(IH) and page9.is_watching(IH))
+card9 = page9._cards.get(IH)
+check("9 сразу после запуска — «запускаем плеер…»",
+      page9.watch_status(IH) == "запускаем плеер…"
+      and "запускаем плеер…" in card9.meta_label.text(),
+      card9.meta_label.text())
+# Плеер тут поддельный, к серверу он не обратится: сдвигаем начало отсчёта
+# вместо того, чтобы ждать вживую
+HINTS9 = []
+page9._notify = lambda kind, text: HINTS9.append((kind, text))
+page9._watch_started -= gui_torrent.PREPARE_HINT_S
+page9._poll_player()
+check("9 после PREPARE_HINT_S карточка показывает «готовим плеер…»",
+      page9.watch_status(IH).startswith("готовим плеер…")
+      and page9.watch_status(IH) in card9.meta_label.text(),
+      f"{page9.watch_status(IH)} | {card9.meta_label.text()}")
+check("9 причина задержки объяснена отдельным сообщением, один раз",
+      len(HINTS9) == 1 and HINTS9[0][0] == "info"
+      and "Windows" in HINTS9[0][1], str(HINTS9))
+page9._poll_player()
+check("9 подсказка не повторяется на каждом тике", len(HINTS9) == 1,
+      str(len(HINTS9)))
+del page9._notify
+check("9 пока плеер молчит, кнопка остаётся «Остановить просмотр»",
+      buttons(card9)[0] == "Остановить просмотр", str(buttons(card9)))
+
+# Настоящий запрос к потоку — то самое событие, которого ждёт индикатор
+req9 = urllib.request.Request(LAUNCHED[-1][0], headers={"Range": "bytes=0-65535"})
+got9 = {}
+
+
+def read9():
+    try:
+        with urllib.request.urlopen(req9, timeout=60) as resp:
+            got9["body"] = resp.read()
+    except Exception as exc:
+        got9["error"] = type(exc).__name__
+
+
+reader9 = __import__("threading").Thread(target=read9, daemon=True)
+reader9.start()
+ok9 = wait_until(lambda: page9.watch_status(IH) == "идёт просмотр", 60)
+check("9 первое обращение плеера переводит в «идёт просмотр»", ok9,
+      page9.watch_status(IH))
+check("9 таймер подготовки после этого остановлен",
+      not page9._prepare_timer.isActive())
+reader9.join(5)
+
+# Молчание дольше PREPARE_TIMEOUT_S — говорим честно, поток не рвём
+page9.stop_watch()
+LAUNCHED.clear()
+NOTES9 = []
+page9._notify = lambda kind, text: NOTES9.append((kind, text))
+page9.watch(IH)
+page9._watch_started -= gui_torrent.PREPARE_TIMEOUT_S
+page9._poll_player()
+check("9 после PREPARE_TIMEOUT_S карточка сообщает, что плеер не отозвался",
+      page9.watch_status(IH) == "плеер не отозвался"
+      and NOTES9 and NOTES9[-1][0] == "warning", str(NOTES9[-1:]))
+check("9 просмотр при этом НЕ снят, ссылка в буфере обмена",
+      page9.is_watching(IH)
+      and gui_torrent.QApplication.clipboard().text().startswith(
+          "http://127.0.0.1:"),
+      gui_torrent.QApplication.clipboard().text()[:40])
+check("9 остановка просмотра гасит индикатор",
+      page9.stop_watch() and page9.watch_status(IH) == ""
+      and not page9._prepare_timer.isActive())
 seed.h.set_upload_limit(0)
 
 # ---- завершение: не оставить работающих потоков ----

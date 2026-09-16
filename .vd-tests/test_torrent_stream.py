@@ -308,6 +308,44 @@ def main():
           getattr(picked, "path", None))
     check("20b. Без видеофайлов — смотреть нечего",
           ts.choose_video_file((F(0, "a/описание.txt", 10),)) is None, "")
+    # 2.2: диалогу нужен ВЕСЬ список, в порядке раздачи (серии по
+    # порядку), а не один самый большой файл
+    watchable = ts.watchable_files(files)
+    check("20c. Для диалога — все выбранные видео в порядке раздачи",
+          [f.index for f in watchable] == [0, 1],
+          str([f.path for f in watchable]))
+
+    # 20d. Счётчики на ключ потока: по ним индикатор «готовим плеер»
+    # понимает, обратился ли плеер именно к ЭТОМУ потоку
+    stats_srv = ts.StreamServer()
+    stats_url = stats_srv.serve("k1", FakeSource(name="фильм.mp4"))
+    stats_srv.serve("k2", FakeSource(name="другой.mp4"))
+    fresh = stats_srv.stats("k1")
+    check("20d. До обращения плеера: запросов 0, первого запроса нет",
+          fresh.requests == 0 and fresh.first_request is None
+          and fresh.bytes == 0, str(fresh.requests))
+    body = urllib.request.urlopen(
+        urllib.request.Request(stats_url, headers={"Range": "bytes=0-1023"}),
+        timeout=10).read()
+    # Клиент дочитывает ответ раньше, чем серверный поток досчитает
+    # счётчик: write() идёт до add_bytes(). Ждём, а не проверяем сразу
+    deadline = time.monotonic() + 5
+    while stats_srv.stats("k1").bytes < len(body) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    one, two = stats_srv.stats("k1"), stats_srv.stats("k2")
+    check("20e. Запрос учтён в СВОЁМ ключе, соседний не тронут",
+          one.requests == 1 and one.bytes == len(body) == 1024
+          and two.requests == 0 and two.bytes == 0,
+          f"k1: {one.requests}/{one.bytes}, k2: {two.requests}/{two.bytes}")
+    check("20f. Отмечено время первого запроса и первого байта",
+          one.first_request is not None and one.first_byte is not None
+          and one.first_byte >= one.first_request,
+          f"{one.first_request:.3f} / {one.first_byte:.3f}")
+    check("20g. Снимок не меняется задним числом",
+          fresh.requests == 0 and stats_srv.stats("нет такого") is None, "")
+    stats_srv.drop("k1")
+    check("20h. drop() убирает и счётчики", stats_srv.stats("k1") is None, "")
+    stats_srv.shutdown(timeout=1.0)
 
     # 21. StreamService поверх поддельного движка
     class FakeEngine:
@@ -333,6 +371,8 @@ def main():
           and watch_url.startswith(f"http://127.0.0.1:{service.server.port}/")
           and watch_url.endswith("%D1%84%D0%B8%D0%BB%D1%8C%D0%BC.mp4"),
           watch_url)
+    check("21b. stats() активного просмотра — счётчики этого потока",
+          getattr(service.stats(), "requests", None) == 0, "")
     check("21b. active и is_watching",
           service.active == ("aa" * 20, 3)
           and service.is_watching("aa" * 20)
@@ -341,6 +381,8 @@ def main():
           service.stop() and service.active is None
           and engine.closed == [("aa" * 20, 3)], str(engine.closed))
     check("21d. Повторный stop() ничего не делает", not service.stop(), "")
+    check("21e. stats() без активного просмотра — None",
+          service.stats() is None, "")
     service.shutdown(timeout=1.0)
 
     print(f"\nPASS {len(PASS)} / FAIL {len(FAIL)}", flush=True)

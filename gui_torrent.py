@@ -3,7 +3,9 @@
 Страница «Торренты» поверх torrent_engine: добавление magnet/.torrent,
 выбор файлов раздачи, карточки очереди, пауза/продолжение/удаление
 (1.3) и «Смотреть» — просмотр во время закачки во внешнем плеере
-(2.1: torrent_stream + player). «Библиотека» режима — заглушка.
+(2.1: torrent_stream + player). В 2.2 к просмотру добавились диалог
+«что смотреть» для раздач с несколькими видеофайлами и индикатор
+подготовки плеера. «Библиотека» режима — заглушка.
 
 Импортируется из gui.MainWindow.__init__, а не с верхнего уровня gui.py:
 модуль сам берёт общие виджеты и отступы из gui.
@@ -13,8 +15,9 @@
 """
 
 import os
+import time
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
@@ -44,6 +47,20 @@ ACTIVE_STATES = (te.STATE_METADATA, te.STATE_CHECKING, te.STATE_DOWNLOADING)
 DONE_STATES = (te.STATE_SEEDING, te.STATE_FINISHED)
 
 PRIORITY_ON = 4      # обычный приоритет; 0 — файл не качать
+
+# Подготовка плеера (2.2). Между запуском плеера и первым его
+# обращением к нашему серверу бывает ~20 с: Защитник проверяет файлы
+# плеера при первом запуске после установки (находка 11 Этапа 0.2).
+# Кнопка «Смотреть» без отклика в это время выглядит как «ничего не
+# произошло», поэтому показываем подготовку, а через PREPARE_HINT_S —
+# и её причину.
+PREPARE_TICK_MS = 500
+PREPARE_HINT_S = 8
+PREPARE_TIMEOUT_S = 45
+
+WATCH_STARTING = "starting"   # плеер запущен, к серверу ещё не обращался
+WATCH_READY = "ready"         # первый запрос пришёл — плеер читает поток
+WATCH_SILENT = "silent"       # не отозвался: сказать честно, поток не рвать
 
 
 def fmt_size(size):
@@ -76,6 +93,33 @@ class _PlaceholderPage(TransparentScrollArea):
         vbox.addWidget(self.placeholder_label)
         vbox.addStretch(1)
         self.setWidget(inner)
+
+
+def _build_folders(tree, files):
+    """Построить папки раздачи в дереве.
+
+    Общая часть двух деревьев — «что качать» (TorrentFilesDialog) и «что
+    смотреть» (WatchFileDialog): разбор пути по разделителям и узлы
+    папок. Листья каждый диалог делает свои: у первого галочки и сумма
+    выбранного, у второго одиночный выбор и «сколько скачано», — общего
+    там нет, а иерархия одна и та же.
+
+    Возвращает ([(родитель, имя файла)] по порядку files, [узлы папок]).
+    """
+    folders = {}
+    parents = []
+    for file in files:
+        parts = file.path.replace("\\", "/").split("/")
+        parent = tree.invisibleRootItem()
+        for depth in range(len(parts) - 1):
+            key = tuple(parts[:depth + 1])
+            node = folders.get(key)
+            if node is None:
+                node = QTreeWidgetItem(parent, [parts[depth], ""])
+                folders[key] = node
+            parent = node
+        parents.append((parent, parts[-1]))
+    return parents, list(folders.values())
 
 
 class TorrentFilesDialog(MessageBoxBase):
@@ -113,20 +157,12 @@ class TorrentFilesDialog(MessageBoxBase):
     def _build_tree(self):
         self._guard = True
         try:
-            folders = {}
-            for file in self._files:
-                parts = file.path.replace("\\", "/").split("/")
-                parent = self.tree.invisibleRootItem()
-                for depth in range(len(parts) - 1):
-                    key = tuple(parts[:depth + 1])
-                    node = folders.get(key)
-                    if node is None:
-                        node = QTreeWidgetItem(parent, [parts[depth], ""])
-                        node.setFlags(node.flags() | Qt.ItemIsUserCheckable)
-                        node.setCheckState(0, Qt.Unchecked)
-                        folders[key] = node
-                    parent = node
-                leaf = QTreeWidgetItem(parent, [parts[-1], fmt_size(file.size)])
+            parents, folders = _build_folders(self.tree, self._files)
+            for node in folders:
+                node.setFlags(node.flags() | Qt.ItemIsUserCheckable)
+                node.setCheckState(0, Qt.Unchecked)
+            for file, (parent, name) in zip(self._files, parents):
+                leaf = QTreeWidgetItem(parent, [name, fmt_size(file.size)])
                 leaf.setFlags(leaf.flags() | Qt.ItemIsUserCheckable)
                 leaf.setData(0, Qt.UserRole, file.index)
                 leaf.setCheckState(
@@ -182,6 +218,107 @@ class TorrentFilesDialog(MessageBoxBase):
         # Снять все галочки — значит не качать ничего: раздача просто
         # встанет, поэтому «Применить» в этом случае недоступна
         self.yesButton.setEnabled(selected > 0)
+
+
+class WatchFileDialog(MessageBoxBase):
+    """Какой файл раздачи смотреть (2.2, многофайловые раздачи).
+
+    То же дерево, что у выбора «что качать» (общий _build_folders), но
+    выбор ОДИНОЧНЫЙ: смотрят один файл за раз, и галочки с частично
+    отмеченными папками здесь только мешали бы. Невидеофайлы и папки
+    показываем — так видно устройство раздачи, — но выбрать нельзя.
+
+    Предвыбран самый большой видеофайл: это правило 2.1, и для раздачи
+    «фильм + трейлер» Enter сразу даёт то, что нужно.
+    """
+
+    def __init__(self, item, targets, progress=(), parent=None):
+        super().__init__(parent)
+        self._files = list(item.files)
+        self._targets = {f.index: f for f in targets}
+        self._nodes = {}            # индекс файла -> лист дерева
+        self._chosen = None
+
+        self.viewLayout.addWidget(SubtitleLabel("Что смотреть", self))
+        self.tree = QTreeWidget(self)
+        self.tree.setHeaderLabels(["Файл", "Размер", "Скачано"])
+        self.tree.setColumnWidth(0, 340)
+        self.tree.setColumnWidth(1, 100)
+        self.tree.setMinimumSize(560, 320)
+        self.tree.setRootIsDecorated(True)
+        self._build_tree(progress)
+        self.tree.expandAll()
+        self.tree.itemSelectionChanged.connect(self._on_selection)
+        self.tree.itemDoubleClicked.connect(self._on_double_click)
+        self.viewLayout.addWidget(self.tree)
+
+        self.hint_label = CaptionLabel(
+            "Файл можно смотреть, не дожидаясь конца закачки — "
+            "нужные куски программа запросит первыми", self)
+        self.hint_label.setWordWrap(True)
+        self.viewLayout.addWidget(self.hint_label)
+
+        self.yesButton.setText("Смотреть")
+        self.cancelButton.setText("Отмена")
+        self._preselect(targets)
+
+    def _build_tree(self, progress):
+        parents, _folders = _build_folders(self.tree, self._files)
+        for file, (parent, name) in zip(self._files, parents):
+            done = progress[file.index] if file.index < len(progress) else 0
+            share = ""
+            if file.index in self._targets and file.size:
+                share = ("скачан" if done >= file.size
+                         else f"{done * 100 // file.size}%")
+            node = QTreeWidgetItem(parent, [name, fmt_size(file.size), share])
+            if file.index in self._targets:
+                node.setData(0, Qt.UserRole, file.index)
+                self._nodes[file.index] = node
+            else:
+                # Не видео или снята галочка «качать» — показываем, но
+                # выбрать нельзя: смотреть там нечего
+                node.setDisabled(True)
+
+    def _preselect(self, targets):
+        biggest = max(targets, key=lambda f: f.size) if targets else None
+        if biggest is not None:
+            node = self._nodes.get(biggest.index)
+            if node is not None:
+                self.tree.setCurrentItem(node)
+        self._on_selection()
+
+    def _current_file(self):
+        node = self.tree.currentItem()
+        if node is None or node.isDisabled():
+            return None
+        index = node.data(0, Qt.UserRole)
+        return self._targets.get(index)
+
+    def select(self, index):
+        """Выбрать файл по индексу — для offscreen-тестов и живых
+        проверок: мышью в них никто не кликает."""
+        node = self._nodes.get(index)
+        if node is None:
+            return False
+        self.tree.setCurrentItem(node)
+        self._on_selection()
+        return True
+
+    def _on_selection(self):
+        self.yesButton.setEnabled(self._current_file() is not None)
+
+    def _on_double_click(self, node, column):
+        if node is not None and not node.isDisabled():
+            self.accept()
+
+    def chosen(self):
+        """Выбранный файл или None (диалог закрыли/отменили)."""
+        return self._chosen
+
+    def exec(self):
+        ok = super().exec()
+        self._chosen = self._current_file() if ok else None
+        return ok
 
 
 class ConfirmRemoveTorrentDialog(MessageBoxBase):
@@ -338,8 +475,9 @@ class TorrentCard(CardWidget):
 
     def _meta_parts(self, item):
         parts = [STATE_TEXT.get(item.state, item.state)]
-        if self.page.is_watching(item.id):
-            parts.append("идёт просмотр")
+        watch = self.page.watch_status(item.id)
+        if watch:
+            parts.append(watch)
         if item.state == te.STATE_ERROR:
             if item.error:
                 parts.append(item.error[:120])
@@ -382,6 +520,16 @@ class TorrentPage(TransparentScrollArea):
         self._stream = stream
         self._player_offered = False
         self._cards = {}
+        # Подготовка плеера: состояние, момент запуска и сам процесс —
+        # если он закроется, не открыв поток, ждать 45 с незачем
+        self._watch_state = ""
+        self._watch_started = 0.0
+        self._watch_url = ""
+        self._hint_shown = False
+        self._player_proc = None
+        self._prepare_timer = QTimer(self)
+        self._prepare_timer.setInterval(PREPARE_TICK_MS)
+        self._prepare_timer.timeout.connect(self._poll_player)
 
         self.setViewportMargins(SP_WINDOW, SP_WINDOW, SP_WINDOW, SP_WINDOW)
         self.setWidgetResizable(True)
@@ -544,17 +692,24 @@ class TorrentPage(TransparentScrollArea):
     def watch(self, tid):
         """Открыть видео раздачи во внешнем плеере.
 
-        2.1: файл выбирается сам — самый большой из выбранных видео
-        (диалог выбора будет в 2.2). Скачанный целиком файл открываем
-        напрямую: HTTP-сервер и кэш кусков для него не нужны.
+        Видео одно — открываем сразу (клик в один шаг для обычного
+        фильма); два и более (сериал) — спрашиваем диалогом (2.2).
+        Скачанный целиком файл открываем напрямую: HTTP-сервер и кэш
+        кусков для него не нужны.
         """
         item = self.engine.get(tid)
         if item is None:
             return False
-        target = ts.choose_video_file(item.files)
-        if target is None:
+        targets = ts.watchable_files(item.files)
+        if not targets:
             self._notify("warning", "В раздаче нет видеофайла для просмотра")
             return False
+        if len(targets) == 1:
+            target = targets[0]
+        else:
+            target = self.ask_watch_file(item, targets)
+            if target is None:
+                return False
         local = self.local_path(item, target)
         if local:
             return self._launch(local, os.path.basename(local), url="")
@@ -564,7 +719,9 @@ class TorrentPage(TransparentScrollArea):
             self._notify("warning", f"Не удалось начать просмотр: {exc}")
             return False
         started = self._launch(url, os.path.basename(target.path), url=url)
-        if not started and not self._player_offered:
+        if started:
+            self._begin_prepare(url)
+        elif not self._player_offered:
             self.stop_watch()        # плеер не запустился — поток не нужен
         self.refresh()
         return started
@@ -572,8 +729,77 @@ class TorrentPage(TransparentScrollArea):
     def stop_watch(self):
         if self._stream is None or not self._stream.stop():
             return False
+        self._end_prepare()
         self.refresh()
         return True
+
+    # ------------------------------------------------ подготовка плеера
+
+    def _begin_prepare(self, url):
+        """Ждать, пока плеер обратится к потоку (см. PREPARE_* выше)."""
+        self._watch_state = WATCH_STARTING
+        self._watch_started = time.monotonic()
+        self._watch_url = url
+        self._hint_shown = False
+        self._prepare_timer.start()
+
+    def _end_prepare(self):
+        self._prepare_timer.stop()
+        self._watch_state = ""
+        self._watch_url = ""
+        self._player_proc = None
+
+    def _poll_player(self):
+        """Тик подготовки. Отдельный таймер, а не тики движка: те идут,
+        только пока раздача качается, а ждать плеер приходится и у
+        готовой раздачи."""
+        stats = self._stream.stats() if self._stream is not None else None
+        if stats is None:                   # просмотр уже сняли
+            self._end_prepare()
+        elif stats.requests:
+            self._watch_state = WATCH_READY
+            self._prepare_timer.stop()
+        elif self._player_proc is not None and self._player_proc.poll() \
+                is not None:
+            self._watch_state = WATCH_SILENT
+            self._prepare_timer.stop()
+            self._notify("warning", "Плеер закрылся, не открыв поток. "
+                                    "Проверьте плеер в Настройках")
+        elif time.monotonic() - self._watch_started >= PREPARE_TIMEOUT_S:
+            self._watch_state = WATCH_SILENT
+            self._prepare_timer.stop()
+            # Поток не рвём: ссылка рабочая, её можно открыть чем угодно
+            self._copy_link(self._watch_url)
+            self._notify(
+                "warning",
+                f"Плеер не обратился к потоку за {PREPARE_TIMEOUT_S} с. "
+                "Проверьте плеер в Настройках; ссылка на просмотр "
+                "скопирована в буфер обмена")
+        elif not self._hint_shown \
+                and time.monotonic() - self._watch_started >= PREPARE_HINT_S:
+            # Один раз объясняем, почему плеер молчит: разовая задержка
+            # после установки, а не зависшая кнопка (находка 11)
+            self._hint_shown = True
+            self._notify("info",
+                         "Плеер ещё открывается. Первый запуск после "
+                         "установки бывает долгим: Windows проверяет его "
+                         "файлы. Просмотр начнётся сам")
+        self.refresh()
+
+    def watch_status(self, tid):
+        """Подпись просмотра для карточки; "" — просмотра нет."""
+        if not self.is_watching(tid):
+            return ""
+        if self._watch_state == WATCH_SILENT:
+            return "плеер не отозвался"
+        if self._watch_state != WATCH_STARTING:
+            return "идёт просмотр"
+        waiting = time.monotonic() - self._watch_started
+        if waiting < PREPARE_HINT_S:
+            return "запускаем плеер…"
+        # Причина задержки — в отдельном сообщении (_poll_player), иначе
+        # подпись карточки разрасталась бы на три строки
+        return f"готовим плеер… {waiting:.0f} с"
 
     def local_path(self, item, target):
         """Путь к файлу, если он уже скачан ЦЕЛИКОМ, иначе ""."""
@@ -599,7 +825,7 @@ class TorrentPage(TransparentScrollArea):
             self._offer_link(str(exc), url)
             return False
         try:
-            player.launch(target, exe)
+            self._player_proc = player.launch(target, exe)
         except OSError as exc:
             self._notify("warning", f"Плеер не запустился: {exc}")
             return False
@@ -613,12 +839,19 @@ class TorrentPage(TransparentScrollArea):
         продолжает работать, её можно открыть чем угодно."""
         self._player_offered = bool(url)
         text = f"{reason}. Укажите плеер в Настройках"
-        if url:
-            clipboard = QApplication.clipboard()
-            if clipboard is not None:
-                clipboard.setText(url)
+        if self._copy_link(url):
             text += ". Ссылка на просмотр скопирована в буфер обмена"
         self._notify("warning", text)
+
+    @staticmethod
+    def _copy_link(url):
+        if not url:
+            return False
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return False
+        clipboard.setText(url)
+        return True
 
     def _engine_call(self, call):
         try:
@@ -641,13 +874,27 @@ class TorrentPage(TransparentScrollArea):
         dialog = TorrentFilesDialog(item, self.window())
         return dialog.priorities() if dialog.exec() else None
 
+    def ask_watch_file(self, item, targets):
+        """Какой файл смотреть; None — отменили. Показываем, сколько уже
+        скачано у каждого: по этому видно, что пойдёт быстрее."""
+        try:
+            progress = self.engine.file_progress(item.id)
+        except Exception:
+            progress = ()
+        dialog = WatchFileDialog(item, targets, progress, self.window())
+        dialog.exec()
+        return dialog.chosen()
+
     def _notify(self, kind, text):
-        bar = InfoBar.warning if kind == "warning" else InfoBar.success
+        bar = {"warning": InfoBar.warning, "info": InfoBar.info}.get(
+            kind, InfoBar.success)
+        # Предупреждение висит, пока его не закроют; подсказку про
+        # подготовку плеера читать дольше, чем «открываем в VLC»
+        duration = {"warning": -1, "info": 6000}.get(kind, 4000)
         bar(
             title="Торренты", content=text, orient=Qt.Horizontal,
             isClosable=True, position=InfoBarPosition.TOP,
-            duration=-1 if kind == "warning" else 4000,
-            parent=self.window(),
+            duration=duration, parent=self.window(),
         )
 
     # ----------------------------------------------------------- список
@@ -663,6 +910,7 @@ class TorrentPage(TransparentScrollArea):
         active = self._stream.active if self._stream is not None else None
         if active is not None and active[0] not in items:
             self._stream.stop()
+            self._end_prepare()
         for tid in list(self._cards):
             if tid not in items:
                 card = self._cards.pop(tid)

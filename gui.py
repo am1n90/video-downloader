@@ -2932,6 +2932,9 @@ class MainWindow(FluentWindow):
         # ограничитель, окно не должно зависеть от плеера. Плеер при
         # этом не убиваем: он отдельный процесс (решение №6).
         try:
+            # Таймер подготовки плеера — до сервиса: иначе его тик успел
+            # бы дёрнуть refresh() уже по закрывающемуся движку
+            self.torrent_page._end_prepare()
             self.torrent_stream.shutdown(timeout=1.0)
         except Exception:
             pass

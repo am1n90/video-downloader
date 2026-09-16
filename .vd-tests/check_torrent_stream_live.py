@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -30,9 +31,10 @@ config.save = lambda settings: None
 
 import libtorrent as lt
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 
 import gui
+import gui_torrent
 import player
 import torrent_stream as ts
 
@@ -59,6 +61,22 @@ FFMPEG = os.path.join(ROOT, "build-ffmpeg-cache", "extracted",
 # занятом exe, если в это время идёт сборка (правило из AGENTS.md)
 FF = os.path.join(BASE, "ffmpeg.exe")
 VIDEO = os.path.join(CONTENT, "котики 1080p.mkv")
+# Второй видеофайл — ради диалога выбора 2.2: он показывается только
+# когда смотреть есть из чего (как у сериала на несколько серий)
+VIDEO2 = os.path.join(CONTENT, "котики серия 2.mkv")
+
+
+def make_one(path, seconds, bitrate):
+    cmd = [FF, "-v", "error", "-y",
+           "-f", "lavfi",
+           "-i", f"testsrc2=size=1280x720:rate=25:duration={seconds}",
+           "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+           "-c:v", "libx264", "-preset", "veryfast", "-b:v", bitrate,
+           "-c:a", "aac", "-shortest", path]
+    result = subprocess.run(cmd, capture_output=True)
+    if result.returncode:
+        return result.stderr.decode("utf-8", "replace")[:300]
+    return ""
 
 
 def make_video():
@@ -66,15 +84,7 @@ def make_video():
         return "ffmpeg не найден — запустите build.bat или build_ffmpeg.ps1"
     import shutil
     shutil.copy2(FFMPEG, FF)
-    cmd = [FF, "-v", "error", "-y",
-           "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=25:duration=120",
-           "-f", "lavfi", "-i", "sine=frequency=440:duration=120",
-           "-c:v", "libx264", "-preset", "veryfast", "-b:v", "6M",
-           "-c:a", "aac", "-shortest", VIDEO]
-    result = subprocess.run(cmd, capture_output=True)
-    if result.returncode:
-        return result.stderr.decode("utf-8", "replace")[:300]
-    return ""
+    return make_one(VIDEO, 120, "6M") or make_one(VIDEO2, 30, "4M")
 
 
 error = make_video()
@@ -146,6 +156,12 @@ def shot(name):
     return path
 
 
+def buttons_of(card):
+    layout = card.actions_widget.layout()
+    return [layout.itemAt(i).widget().text() for i in range(layout.count())
+            if layout.itemAt(i).widget() is not None]
+
+
 def wait_until(pred, timeout):
     end_at = time.monotonic() + timeout
     while time.monotonic() < end_at:
@@ -184,6 +200,38 @@ check("выбран самый большой видеофайл",
       target is not None and target.path.endswith("котики 1080p.mkv"),
       getattr(target, "path", None))
 
+# ---- 2.2: диалог выбора файла на настоящем окне ----
+# Диалог модальный: exec() остановил бы проверку, поэтому показываем его
+# сам, снимаем и отвечаем за пользователя. Настоящий здесь — виджет и
+# его отрисовка: именно её offscreen-тест не видит (находка 32).
+TARGETS = ts.watchable_files(item.files)
+check("к просмотру предложены оба видеофайла",
+      len(TARGETS) == 2,
+      str([os.path.basename(f.path) for f in TARGETS]))
+SECOND = min(TARGETS, key=lambda f: f.size)
+dialog_shot = {}
+
+
+def live_ask(item_arg, targets):
+    dialog = gui_torrent.WatchFileDialog(
+        item_arg, targets, page.engine.file_progress(item_arg.id),
+        window)
+    dialog.show()
+    pump(0.6)
+    dialog_shot["path"] = shot("02-диалог-что-смотреть")
+    dialog_shot["preselected"] = dialog._current_file()
+    # Берём НЕ предвыбранный файл: так видно, что ответ диалога и правда
+    # доходит до просмотра, а не совпал с прежним «сам выберу»
+    dialog.select(SECOND.index)
+    chosen = dialog._current_file()
+    dialog.close()
+    dialog.deleteLater()
+    pump(0.3)
+    return chosen
+
+
+page.ask_watch_file = live_ask
+
 # Запускаем НАСТОЯЩИЙ плеер, но без окна: проверяем чтение, не картинку
 LOG = os.path.join(OUT, "player.log")
 launched = {}
@@ -217,10 +265,42 @@ check("«Смотреть» запустил плеер", started and "url" in l
 check("карточка показывает «Остановить просмотр»",
       page.is_watching(IH), str(page._stream.active))
 
+# 2.2: диалог сработал и его ответ дошёл до просмотра
+pre = dialog_shot.get("preselected")
+check("в диалоге предвыбран самый большой файл",
+      pre is not None and pre.index == target.index,
+      getattr(pre, "path", None))
+check("смотрится тот файл, который выбрали в диалоге",
+      page._stream.active == (IH, SECOND.index),
+      f"{page._stream.active}, ждали индекс {SECOND.index}")
+check("ссылка плеера ведёт на выбранный файл",
+      os.path.basename(SECOND.path)
+      in urllib.parse.unquote(launched.get("url", "")),
+      launched.get("url", ""))
+
+# 2.2: индикатор подготовки. До первого обращения плеера карточка
+# показывает подготовку, а не молчит (находка 11: до ~20 с)
+card = page._cards.get(IH)
+# Снимку нужен цикл событий: без него grabWindow берёт ПРЕЖНИЙ
+# отрисованный кадр — на первом прогоне 2.2 снимок показал карточку до
+# нажатия «Смотреть», хотя проверка уже видела новое состояние
+pump(0.4)
+check("пока плеер не отозвался — карточка показывает подготовку",
+      (page.watch_status(IH) == "запускаем плеер…"
+       or page.watch_status(IH).startswith("готовим плеер…"))
+      and page.watch_status(IH) in card.meta_label.text()
+      and buttons_of(card)[0] == "Остановить просмотр",
+      f"{page.watch_status(IH)} | {buttons_of(card)} | "
+      f"{card.meta_label.text()}")
+shot("03-готовим-плеер")
+
 served = window.torrent_stream.server
 ok = wait_until(lambda: served.requests > 0, 60)
 first_request = time.monotonic() - t0
 check("плеер обратился к нашему серверу", ok, f"через {first_request:.1f} с")
+ready = wait_until(lambda: page.watch_status(IH) == "идёт просмотр", 10)
+check("индикатор сам сменился на «идёт просмотр»", ready,
+      f"{page.watch_status(IH)} | подготовка длилась {first_request:.1f} с")
 
 # Плеер читает поток: ждём, пока отдадим заметный объём
 ok = wait_until(lambda: served.bytes > 8 * MB, 90)
@@ -228,7 +308,18 @@ playing = time.monotonic() - t0
 check("плеер вычитал первые мегабайты потока", ok,
       f"{served.bytes / MB:.1f} МБ за {playing:.1f} с, "
       f"запросов {served.requests}")
-shot("02-идёт-просмотр")
+pump(0.4)
+check("карточка во время просмотра: «идёт просмотр» и кнопка остановки",
+      "идёт просмотр" in card.meta_label.text()
+      and buttons_of(card)[0] == "Остановить просмотр",
+      f"{buttons_of(card)} | {card.meta_label.text()}")
+shot("04-идёт-просмотр")
+# Кнопки карточки не должны накапливаться (регресс на находку 32)
+stale = [w for w in card.actions_widget.findChildren(QPushButton)
+         if w.parent() is card.actions_widget]
+in_layout = card.actions_widget.layout().count()
+check("старые кнопки карточки не остаются поверх новых",
+      len(stale) == in_layout, f"детей {len(stale)}, в раскладке {in_layout}")
 
 pump(8.0)
 after = window.torrent_stream.server.bytes

@@ -58,13 +58,25 @@ def is_video(path):
     return os.path.splitext(path)[1].lower() in VIDEO_EXTS
 
 
-def choose_video_file(files):
-    """Что смотреть: самый большой видеофайл среди ВЫБРАННЫХ.
+def watchable_files(files):
+    """Что вообще можно смотреть: видеофайлы среди ВЫБРАННЫХ.
 
-    Решение владельца для 2.1 — без диалога выбора (он в 2.2). Файлы со
-    снятой галочкой не предлагаем: их libtorrent не качает.
+    Порядок — как в раздаче: у сериала имена серий обычно идут по
+    порядку, и пользователю в диалоге (2.2) привычнее видеть их так, а
+    не по размеру. Файлы со снятой галочкой не предлагаем: их libtorrent
+    не качает.
     """
-    videos = [f for f in files if f.priority > 0 and is_video(f.path)]
+    return [f for f in files if f.priority > 0 and is_video(f.path)]
+
+
+def choose_video_file(files):
+    """Что смотреть, когда выбирать не из чего (или не у кого спросить):
+    самый большой видеофайл среди выбранных.
+
+    С 2.2 при двух и более видео GUI показывает диалог; это правило
+    осталось умолчанием для одного файла и предвыбором в диалоге.
+    """
+    videos = watchable_files(files)
     if not videos:
         return None
     return max(videos, key=lambda f: f.size)
@@ -93,6 +105,37 @@ def parse_range(header, size):
     return start, end, True
 
 
+class StreamStats:
+    """Счётчики одного потока (одного ключа сервера).
+
+    Общих счётчиков сервера для 2.2 не хватает: индикатор «готовим
+    плеер» должен знать, обратился ли плеер именно к ЭТОМУ потоку, а
+    замеры на рое — сколько байт и за сколько пришло по конкретному
+    файлу. Время первого запроса и первого байта — по монотонным часам
+    от момента serve().
+    """
+
+    __slots__ = ("started", "requests", "active", "bytes", "seconds",
+                 "first_request", "first_byte")
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.requests = 0
+        self.active = 0
+        self.bytes = 0
+        self.seconds = 0.0
+        self.first_request = None       # с момента started, секунды
+        self.first_byte = None
+
+    def snapshot(self):
+        """Копия для чтения из GUI: сам объект меняется в потоках
+        сервера, читать его по полю снаружи — гонка."""
+        copy = StreamStats.__new__(StreamStats)
+        for name in StreamStats.__slots__:
+            setattr(copy, name, getattr(self, name))
+        return copy
+
+
 class _Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "VideoDownloader-stream/1.0"
@@ -119,25 +162,26 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def _source(self):
+        """(ключ, источник) либо (None, None) — ответ уже отправлен."""
         owner = self.server.vd_owner
         port = self.server.server_port
         host = self.headers.get("Host", "")
         if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
             owner.rejected += 1
             self._empty(403)
-            return None
+            return None, None
         parts = urllib.parse.unquote(
             urllib.parse.urlsplit(self.path).path).strip("/").split("/")
         if len(parts) < 2 or not secrets.compare_digest(parts[0], owner.token):
             owner.rejected += 1
             self._empty(404)
-            return None
+            return None, None
         source = owner.lookup(parts[1])
         if source is None or source.closed:
             # Раздачу удалили или сняли галочку с файла, пока плеер играл
             self._empty(404)
-            return None
-        return source
+            return None, None
+        return parts[1], source
 
     def do_HEAD(self):
         self._serve(head=True)
@@ -146,7 +190,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._serve(head=False)
 
     def _serve(self, head):
-        source = self._source()
+        key, source = self._source()
         if source is None:
             return
         size = source.size
@@ -167,14 +211,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             return
         owner = self.server.vd_owner
         rid = source.open_request()
-        owner.begin_request()
+        owner.begin_request(key)
         t0 = time.monotonic()
         sent = 0
         try:
             for chunk in source.iter_range(rid, start, end):
                 self.wfile.write(chunk)
                 sent += len(chunk)
-                owner.add_bytes(len(chunk))
+                owner.add_bytes(key, len(chunk))
         except (ConnectionError, OSError):
             self.close_connection = True        # плеер ушёл — это штатно
         except TimeoutError as exc:
@@ -185,7 +229,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
         finally:
             source.close_request(rid)
-            owner.finish_request(sent, time.monotonic() - t0)
+            owner.finish_request(key, sent, time.monotonic() - t0)
             if sent != end - start + 1:
                 self.close_connection = True
 
@@ -199,6 +243,7 @@ class StreamServer:
         self._srv = None
         self._lock = threading.Lock()
         self._sources = {}
+        self._stats = {}            # ключ -> StreamStats (см. serve)
         self.token = ""
         self.requests = 0
         self.active = 0
@@ -246,6 +291,7 @@ class StreamServer:
             srv, self._srv = self._srv, None
             sources = list(self._sources.values())
             self._sources.clear()
+            self._stats.clear()
         for source in sources:
             try:
                 source.close()
@@ -276,6 +322,11 @@ class StreamServer:
         self.start()
         with self._lock:
             self._sources[key] = source
+            # Счётчики нового просмотра начинаются с нуля: повторное
+            # «Смотреть» тот же файл не должно выглядеть как «плеер уже
+            # обратился» (индикатор подготовки ждёт именно первого
+            # обращения ЭТОГО просмотра)
+            self._stats[key] = StreamStats()
         return self.url_for(key, source.name)
 
     def lookup(self, key):
@@ -284,6 +335,7 @@ class StreamServer:
 
     def drop(self, key):
         with self._lock:
+            self._stats.pop(key, None)
             return self._sources.pop(key, None)
 
     def url_for(self, key, name):
@@ -296,19 +348,40 @@ class StreamServer:
     # воспроизведения, и счётчик «по завершении» показывал 1 МБ там, где
     # реально шли десятки (живая проверка 16.09.2026)
 
-    def begin_request(self):
+    def begin_request(self, key=None):
         with self._lock:
             self.requests += 1
             self.active += 1
+            stats = self._stats.get(key)
+            if stats is not None:
+                stats.requests += 1
+                stats.active += 1
+                if stats.first_request is None:
+                    stats.first_request = time.monotonic() - stats.started
 
-    def add_bytes(self, count):
+    def add_bytes(self, key, count):
         with self._lock:
             self.bytes += count
+            stats = self._stats.get(key)
+            if stats is not None:
+                stats.bytes += count
+                if stats.first_byte is None:
+                    stats.first_byte = time.monotonic() - stats.started
 
-    def finish_request(self, sent, seconds):
+    def finish_request(self, key, sent, seconds):
         with self._lock:
             self.active -= 1
             self.seconds += seconds
+            stats = self._stats.get(key)
+            if stats is not None:
+                stats.active -= 1
+                stats.seconds += seconds
+
+    def stats(self, key):
+        """Снимок счётчиков потока или None, если такого ключа нет."""
+        with self._lock:
+            stats = self._stats.get(key)
+            return stats.snapshot() if stats is not None else None
 
 
 class StreamService:
@@ -339,6 +412,18 @@ class StreamService:
     @staticmethod
     def _key(tid, index):
         return f"{tid}-{index}"
+
+    def stats(self):
+        """Счётчики активного просмотра (StreamStats) или None.
+
+        По ним GUI понимает, ожил ли плеер: между его запуском и первым
+        обращением к серверу бывает ~20 с — Защитник проверяет файлы
+        плеера при первом запуске (находка 11 Этапа 0.2).
+        """
+        active = self.active
+        if active is None:
+            return None
+        return self.server.stats(self._key(*active))
 
     def watch(self, tid, index):
         """Открыть поток и начать его отдавать; возвращает URL."""
