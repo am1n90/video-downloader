@@ -40,6 +40,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
     GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+[InstallDelete]
+; Установка кладёт файлы поверх, но НЕ убирает лишние от прежней сборки:
+; после перехода 3.14->3.13 в установленной копии осталось 145 файлов /
+; 22 МБ (python314.dll, *.cp314*.pyd, *.cpython-314.pyc) — не грузятся,
+; но копятся у всех при автообновлении (находка 6). _internal целиком
+; принадлежит сборке и создаётся заново из [Files]; данные пользователя
+; лежат не здесь, а в {localappdata}\VideoDownloader.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
 Source: "dist\VideoDownloader\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 

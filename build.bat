@@ -34,6 +34,7 @@ pyinstaller --noconsole --onedir --name VideoDownloader ^
   --collect-all yt_dlp ^
   --collect-all yt_dlp_ejs ^
   --collect-all curl_cffi ^
+  --collect-all libtorrent ^
   main.py || goto :fail
 if not exist "dist\VideoDownloader\VideoDownloader.exe" (
   echo FAIL: dist\VideoDownloader\VideoDownloader.exe not created
@@ -52,6 +53,16 @@ if errorlevel 1 (
   goto :fail
 )
 echo OK: curl_cffi collected with native binaries
+
+REM libtorrent is a package whose __init__ IS the compiled module
+REM (libtorrent\__init__.cp313-win_amd64.pyd, 13 MB) — without it Torrent
+REM mode cannot start at all. Wildcard: the cpXXX tag follows the Python.
+dir /b "dist\VideoDownloader\_internal\libtorrent\__init__*.pyd" >nul 2>&1
+if errorlevel 1 (
+  echo FAIL: libtorrent __init__*.pyd missing in dist
+  goto :fail
+)
+echo OK: libtorrent collected with its native module
 
 echo [4/7] Скачивание ffmpeg (BtbN win64-gpl)...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0build_ffmpeg.ps1" || goto :fail
