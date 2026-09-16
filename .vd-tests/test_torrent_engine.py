@@ -406,6 +406,222 @@ check("10 битый fastresume: движок стартует, файл пер�
       and os.path.isfile(os.path.join(bad_dir, "0" * 40 + te.RESUME_EXT + ".corrupt")),
       str(started))
 
+# ---- 11: просмотр во время закачки (2.1) ----
+# Главное здесь — побайтовая сверка с источником: в прототипе первая
+# версия сервера отдавала плееру НУЛИ (находка 7 — have_piece() истинно
+# сразу после проверки хэша, а запись ещё в очереди дискового потока).
+# Поэтому файл берём недокачанным и сверяем именно те куски, которых
+# на диске ещё нет.
+eng11, ev11 = engine("s11")
+ENGINES.append(eng11)
+eng11.start()
+save11 = os.path.join(BASE, "просмотр")
+seed.limit(256 * 1024)               # чтобы файл не скачался мгновенно
+VIDEO = "видео 1.bin"                # самый большой файл раздачи
+VIDEO_INDEX = next(i for i, p in enumerate(FILE_ORDER)
+                   if os.path.basename(p) == VIDEO)
+VIDEO_SIZE = SIZES[VIDEO]
+VIDEO_REL = FILE_ORDER[VIDEO_INDEX]
+with open(os.path.join(SRC_ROOT, VIDEO_REL), "rb") as f:
+    VIDEO_BYTES = f.read()
+
+te.PIECE_WAIT_TIMEOUT = 30           # в тесте не ждём боевые 120 с
+tid11 = eng11.add_torrent_file(TORRENT, save11,
+                               peers=[("127.0.0.1", seed.port)])
+check("11 метаданные раздачи получены",
+      wait_for(lambda: eng11.get(tid11).has_metadata, 20))
+
+# Смотреть можно и файл, с которого снята галочка: просмотр его включает.
+# Остальные файлы оставляем выбранными — раздача со ВСЕМИ снятыми сразу
+# становится завершённой, и сид отключается как от такого же раздающего
+# (реконнект занял 15 с в диагностике; из GUI это состояние недостижимо —
+# «Применить» с пустым выбором заблокировано, находка сессии 1.3)
+off = [4] * len(FILE_ORDER)
+off[VIDEO_INDEX] = 0
+eng11.set_files(tid11, off)
+wait_for(lambda: eng11.get(tid11).files[VIDEO_INDEX].priority == 0, 10)
+try:
+    eng11.open_stream(tid11, 99)
+    bad_index = "нет ошибки"
+except IndexError as exc:
+    bad_index = ""
+except Exception as exc:
+    bad_index = repr(exc)
+check("11 open_stream с несуществующим файлом -> IndexError", not bad_index,
+      bad_index)
+
+stream = eng11.open_stream(tid11, VIDEO_INDEX)
+check("11 поток открыт: имя, размер, окно чтения",
+      stream.name == VIDEO and stream.size == VIDEO_SIZE
+      and te.READAHEAD_MIN_PIECES <= stream.readahead <= te.READAHEAD_MAX_PIECES,
+      f"{stream.name}, {stream.size} байт, окно {stream.readahead} кусков")
+check("11 файл со снятой галочкой включается в закачку",
+      wait_for(lambda: eng11.get(tid11).files[VIDEO_INDEX].priority > 0, 10),
+      str(eng11.get(tid11).files[VIDEO_INDEX].priority))
+
+# Начало файла: плеер всегда просит его первым
+rid = stream.open_request()
+head_bytes = b"".join(bytes(chunk)
+                      for chunk in stream.iter_range(rid, 0, 300000))
+stream.close_request(rid)
+check("11 начало файла совпадает с источником байт в байт",
+      head_bytes == VIDEO_BYTES[:300001],
+      f"{len(head_bytes)} байт, нулей {head_bytes.count(0)}")
+
+# Голова и хвост — срочные, и ОСТАЮТСЯ такими: prioritize_files
+# применяется отложенно и переписывает приоритеты кусков приоритетом
+# файла (диагностика 16.09.2026), поэтому проверяем и через секунду
+raised_ok = wait_for(lambda: bool(stream._raised), 10)
+
+
+def urgent_pending():
+    """Приоритеты ещё НЕ скачанных кусков головы и хвоста. У скачанного
+    куска приоритет уже ничего не значит — libtorrent убирает его из
+    очереди и оставляет там что угодно."""
+    handle = eng11._handle(tid11)
+    return [int(handle.piece_priority(piece)) for piece in stream._raised
+            if not handle.have_piece(piece)]
+
+
+urgent_now = urgent_pending()
+time.sleep(1.0)
+urgent_later = urgent_pending()
+check("11 голова и хвост файла — срочные (moov/cues) и не перетираются",
+      raised_ok and urgent_now
+      and all(p == te.PIECE_PRIORITY_URGENT for p in urgent_now)
+      and all(p == te.PIECE_PRIORITY_URGENT for p in urgent_later),
+      f"кусков поднято {len(stream._raised)}, ждут {len(urgent_now)}: "
+      f"{urgent_now[:4]}, через 1 с {urgent_later[:4]}")
+
+# После закрытия запроса куски окна НЕ должны падать в приоритет 1:
+# reset_piece_deadline ставит именно 1, то есть самые нужные куски
+# оказались бы в конце очереди (диагностика 16.09.2026)
+rid = stream.open_request()
+stream._request_window(rid, 0)
+window_pieces = sorted(stream._windows[rid])[:8]
+stream.close_request(rid)
+after_reset = [int(eng11._handle(tid11).piece_priority(piece))
+               for piece in window_pieces
+               if not eng11._handle(tid11).have_piece(piece)]
+check("11 после снятия дедлайна приоритет куска не падает ниже обычного",
+      all(p >= te.STREAM_PRIORITY for p in after_reset),
+      f"{after_reset} (обычный {te.STREAM_PRIORITY})")
+
+# Кусок из середины, которого на диске ещё нет — сервер обязан ЖДАТЬ
+middle = VIDEO_SIZE // 2
+done_before = eng11.file_progress(tid11)[VIDEO_INDEX]
+rid = stream.open_request()
+t_wait = time.monotonic()
+mid_bytes = b"".join(bytes(chunk)
+                     for chunk in stream.iter_range(rid, middle,
+                                                    middle + 200000))
+wait_s = time.monotonic() - t_wait
+stream.close_request(rid)
+check("11 середина недокачанного файла: дождались и совпало",
+      mid_bytes == VIDEO_BYTES[middle:middle + 200001],
+      f"{len(mid_bytes)} байт за {wait_s:.2f} с, скачано было "
+      f"{done_before} из {VIDEO_SIZE}, ожиданий {stream.waits}")
+check("11 данные брались через read_piece, а не с диска",
+      stream.piece_reads > 0, f"read_piece: {stream.piece_reads}")
+
+# Хвост файла (там moov у MP4) — и дедлайны снимаются вместе с запросом
+rid = stream.open_request()
+tail_bytes = b"".join(bytes(chunk)
+                      for chunk in stream.iter_range(rid, VIDEO_SIZE - 50000,
+                                                     VIDEO_SIZE - 1))
+stream.close_request(rid)
+check("11 хвост файла совпадает с источником",
+      tail_bytes == VIDEO_BYTES[-50000:], f"{len(tail_bytes)} байт")
+check("11 после close_request окон не осталось", not stream._windows,
+      str(stream._windows))
+
+# Закрытие потока: приоритеты кусков возвращаются к приоритету файла
+raised_pieces = list(stream._raised)
+eng11.close_stream(tid11, VIDEO_INDEX)
+check("11 close_stream: поток закрыт и убран из движка",
+      stream.closed and not eng11.streams(), str(eng11.streams()))
+check("11 приоритеты головы/хвоста вернулись к обычным",
+      all(int(eng11._handle(tid11).piece_priority(piece))
+          == te.STREAM_PRIORITY for piece in raised_pieces),
+      str([int(eng11._handle(tid11).piece_priority(p))
+           for p in raised_pieces[:4]]))
+
+# Ожидающий чтение запрос обязан выйти сразу — от этого зависит закрытие
+# окна во время просмотра (иначе оно ждало бы PIECE_WAIT_TIMEOUT)
+stream2 = eng11.open_stream(tid11, VIDEO_INDEX)
+eng11.pause(tid11)                   # куски больше не придут
+far = max(0, VIDEO_SIZE - 300000)
+holder = {}
+
+
+def read_far():
+    rid2 = stream2.open_request()
+    try:
+        holder["bytes"] = sum(len(chunk) for chunk in
+                              stream2.iter_range(rid2, far, VIDEO_SIZE - 1))
+    finally:
+        stream2.close_request(rid2)
+        holder["done"] = True
+
+
+reader = threading.Thread(target=read_far, daemon=True)
+reader.start()
+time.sleep(1.0)
+t_close = time.monotonic()
+eng11.close_stream(tid11)
+reader.join(5)
+close_s = time.monotonic() - t_close
+check("11 close_stream будит ожидающее чтение (закрытие окна)",
+      holder.get("done") and close_s < 2.0,
+      f"{close_s:.2f} с, прочитано {holder.get('bytes')} байт")
+
+# Выбор файлов важнее просмотра: сняли галочку — поток закрылся
+eng11.resume(tid11)
+stream3 = eng11.open_stream(tid11, VIDEO_INDEX)
+priorities = [0] * len(FILE_ORDER)
+priorities[(VIDEO_INDEX + 1) % len(FILE_ORDER)] = 4
+eng11.set_files(tid11, priorities)
+check("11 set_files со снятой галочкой закрывает просмотр",
+      stream3.closed and not eng11.streams(), str(eng11.streams()))
+
+# Удаление раздачи во время просмотра
+eng11.set_files(tid11, [4] * len(FILE_ORDER))
+stream4 = eng11.open_stream(tid11, VIDEO_INDEX)
+eng11.remove(tid11)
+check("11 remove закрывает просмотр (handle становится невалидным)",
+      stream4.closed, "")
+
+# shutdown при активном просмотре укладывается в бюджет
+eng12, _ = engine("s12")
+eng12.start()
+save12 = os.path.join(BASE, "просмотр-2")
+tid12 = eng12.add_torrent_file(TORRENT, save12,
+                               peers=[("127.0.0.1", seed.port)])
+wait_for(lambda: eng12.get(tid12).has_metadata, 20)
+stream5 = eng12.open_stream(tid12, VIDEO_INDEX)
+holder2 = {}
+
+
+def read_tail():
+    rid3 = stream5.open_request()
+    try:
+        holder2["bytes"] = sum(len(chunk) for chunk in
+                               stream5.iter_range(rid3, far, VIDEO_SIZE - 1))
+    finally:
+        holder2["done"] = True
+
+
+reader2 = threading.Thread(target=read_tail, daemon=True)
+reader2.start()
+time.sleep(0.5)
+result12 = eng12.shutdown(timeout=3.0)
+reader2.join(5)
+check("11 shutdown во время просмотра: в бюджете и fastresume сохранён",
+      result12["seconds"] < 3.0 and result12["unsaved"] == 0
+      and stream5.closed and holder2.get("done"),
+      f"{result12}, чтение завершилось={holder2.get('done')}")
+seed.limit(0)
+
 # ---- завершение ----
 for eng_ in ENGINES:
     try:

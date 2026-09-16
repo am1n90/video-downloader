@@ -49,7 +49,9 @@ BASE = tempfile.mkdtemp(prefix="vd-gui-torrent-")
 SRC_ROOT = os.path.join(BASE, "источник")
 CONTENT = os.path.join(SRC_ROOT, "Тестовая раздача")
 os.makedirs(CONTENT)
-SIZES = {"видео 1.bin": 2 * MB + 12345, "видео 2.bin": 1 * MB + 54321,
+# Расширения настоящие: с 2.1 страница сама выбирает, что смотреть, —
+# видеофайл определяется по расширению (.bin им не является)
+SIZES = {"видео 1.mkv": 2 * MB + 12345, "видео 2.mp4": 1 * MB + 54321,
          "описание.txt": 20000}
 for file_name, size in SIZES.items():
     with open(os.path.join(CONTENT, file_name), "wb") as f:
@@ -200,8 +202,9 @@ check("2 подпись: состояние «Раздаётся» и 100%",
 check("2 подпись: объём считается по выбранным файлам",
       gui.fmt_mb(item1.selected_size) in meta, meta)
 check("2 прогресс-бар заполнен", card1.bar.value() == 100, str(card1.bar.value()))
-check("2 у готовой раздачи есть «Открыть папку», «Файлы», «Удалить»",
-      buttons(card1) == ["Открыть папку", "Файлы", "Удалить"], str(buttons(card1)))
+check("2 у готовой раздачи: «Смотреть», «Открыть папку», «Файлы», «Удалить»",
+      buttons(card1) == ["Смотреть", "Открыть папку", "Файлы", "Удалить"],
+      str(buttons(card1)))
 
 # Пауза у ДОКАЧАННОЙ раздачи — это «Готово» (скачано, раздача выключена),
 # состояние paused бывает только у незавершённой (см. _snapshot движка)
@@ -244,7 +247,7 @@ ok = wait_until(lambda: state_of(page2, IH) == te.STATE_PAUSED, 10)
 pump(0.3)
 card2 = page2._cards.get(IH)
 check("2 пауза посреди скачивания: состояние и кнопка «Продолжить»",
-      started and ok and buttons(card2)[0] == "Продолжить",
+      started and ok and buttons(card2)[:2] == ["Смотреть", "Продолжить"],
       f"{state_of(page2, IH)} {buttons(card2)}")
 seed.h.set_upload_limit(0)
 page2.resume(IH)
@@ -364,6 +367,10 @@ settings["check_updates"] = False          # иначе QThread переживё
 settings["app_mode"] = "torrent"
 settings["torrent_folder"] = os.path.join(BASE, "Загрузки с пробелом", "win")
 window = gui.MainWindow(settings)
+# Своя папка данных: иначе раздачи теста уезжают в рабочую torrent-data# проекта и всплывают при следующем запуске программы в dev-режиме
+window.torrent_engine.data_dir = os.path.join(BASE, "данные", "win")
+window.torrent_engine.resume_dir = os.path.join(BASE, "данные", "win",
+                                                "resume")
 window.show()
 pump(0.4)
 check("6 движок создан один на окно",
@@ -400,6 +407,203 @@ check("6 порт сохраняется в настройки", settings["torre
 window.close()
 pump(0.4)
 check("6 closeEvent остановил движок", window.torrent_engine._ses is None)
+
+# ---- 7: «Смотреть» — просмотр во время закачки (2.1) ----
+# Настоящий плеер не запускаем: подменяем поиск и запуск, запоминая, с
+# чем их позвали. Всё остальное — настоящее: сервис, HTTP-сервер, движок.
+LAUNCHED = []
+FAKE_PLAYER = r"C:\Плееры\mpv.exe"
+
+
+def fake_resolve(configured=""):
+    if configured == "нет плеера":
+        raise gui_torrent.player.PlayerNotFound("на компьютере не найдены "
+                                                "mpv или VLC")
+    return configured or FAKE_PLAYER
+
+
+gui_torrent.player.resolve = fake_resolve
+gui_torrent.player.launch = lambda target, exe: LAUNCHED.append((target, exe))
+
+VIDEO_INDEX = next(i for i, p in enumerate(FILE_ORDER)
+                   if os.path.basename(p) == "видео 1.mkv")
+VIDEO_REL = FILE_ORDER[VIDEO_INDEX]
+
+# 7а. Скачанный файл открывается напрямую — сервер не нужен
+item1 = page1.engine.get(IH)
+check("7 can_watch у докачанной раздачи с видео", page1.can_watch(item1))
+check("7 «Смотреть» скачанного файла запускает плеер",
+      page1.watch(IH) and len(LAUNCHED) == 1, str(LAUNCHED))
+target, exe = LAUNCHED[-1]
+check("7 у скачанного файла открывается САМ ФАЙЛ, а не http",
+      target == os.path.join(save1, VIDEO_REL) and exe == FAKE_PLAYER, target)
+check("7 сервер для скачанного файла не поднимался",
+      page1._stream is None or not page1._stream.server.running)
+check("7 просмотр по файлу не считается активным", not page1.is_watching(IH))
+
+# 7б. Недокачанная раздача — поток через HTTP
+seed.h.set_upload_limit(96 * 1024)
+page7, eng7, save7 = make_page("s7")
+page7.show()
+pump(0.3)
+page7.magnet_edit.setText(magnet())
+page7.add_magnet()
+started = wait_until(lambda: (page7.engine.get(IH) is not None)
+                     and page7.engine.get(IH).has_metadata
+                     and 0 <= page7.engine.get(IH).progress < 1.0, 30)
+LAUNCHED.clear()
+check("7 «Смотреть» недокачанной раздачи открывает http-ссылку",
+      started and page7.watch(IH) and len(LAUNCHED) == 1
+      and LAUNCHED[-1][0].startswith("http://127.0.0.1:"),
+      str(LAUNCHED))
+watch_url = LAUNCHED[-1][0]
+check("7 просмотр активен и виден в карточке",
+      page7.is_watching(IH)
+      and page7._stream.active == (IH, VIDEO_INDEX), str(page7._stream.active))
+card7 = page7._cards.get(IH)
+check("7 в карточке «Остановить просмотр» и пометка в подписи",
+      buttons(card7)[0] == "Остановить просмотр"
+      and "идёт просмотр" in card7.meta_label.text(),
+      f"{buttons(card7)} | {card7.meta_label.text()}")
+
+# 7в. Ссылка действительно отдаёт байты файла — весь путь целиком
+import urllib.request
+
+with open(os.path.join(SRC_ROOT, VIDEO_REL), "rb") as f:
+    SRC_HEAD = f.read(65536)
+got = {}
+
+
+def fetch_head():
+    request = urllib.request.Request(watch_url,
+                                     headers={"Range": "bytes=0-65535"})
+    with urllib.request.urlopen(request, timeout=60) as resp:
+        got["status"] = resp.status
+        got["body"] = resp.read()
+
+
+fetcher = __import__("threading").Thread(target=fetch_head, daemon=True)
+fetcher.start()
+ok = wait_until(lambda: "body" in got, 60)       # ждём, пока куски придут
+check("7 по ссылке приходят те самые байты файла",
+      ok and got.get("status") == 206 and got.get("body") == SRC_HEAD,
+      f"{got.get('status')}, {len(got.get('body') or b'')} байт")
+
+# 7г. Остановка просмотра
+# Кнопок ровно столько, сколько в раскладке: прежние не должны
+# оставаться детьми виджета и рисоваться поверх новых (снимок живой
+# проверки 2.1 показал «Смотреть» поверх «Остановить просмотр»)
+from PySide6.QtWidgets import QPushButton as _QPushButton
+
+stale = [w for w in card7.actions_widget.findChildren(_QPushButton)
+         if w.parent() is card7.actions_widget]
+check("7 старые кнопки карточки не остаются поверх новых",
+      len(stale) == len(buttons(card7)),
+      f"детей {len(stale)}, в раскладке {len(buttons(card7))}")
+
+check("7 «Остановить просмотр» снимает поток",
+      page7.stop_watch() and not page7.is_watching(IH)
+      and page7._stream.active is None)
+pump(0.2)
+check("7 кнопка вернулась в «Смотреть»", "Смотреть" in buttons(card7),
+      str(buttons(card7)))
+
+# 7д. Плеера нет: поток не рвём, ссылку кладём в буфер обмена
+page7.settings["torrent_player"] = "нет плеера"
+LAUNCHED.clear()
+check("7 без плеера «Смотреть» не падает и плеер не запускается",
+      page7.watch(IH) is False and not LAUNCHED)
+check("7 без плеера просмотр продолжается, ссылка в буфере обмена",
+      page7.is_watching(IH)
+      and gui_torrent.QApplication.clipboard().text().startswith(
+          "http://127.0.0.1:"),
+      gui_torrent.QApplication.clipboard().text()[:40])
+page7.settings["torrent_player"] = ""
+page7.stop_watch()
+
+# 7е. Смотреть нечего: в раздаче нет видеофайлов
+no_video = dataclasses.replace(
+    page7.engine.get(IH),
+    files=tuple(f for f in page7.engine.get(IH).files
+                if f.path.endswith(".txt")))
+check("7 без видеофайлов кнопки «Смотреть» нет",
+      not page7.can_watch(no_video))
+metadata_only = dataclasses.replace(page7.engine.get(IH),
+                                    state=te.STATE_METADATA,
+                                    has_metadata=False, files=())
+check("7 до метаданных кнопки «Смотреть» нет",
+      not page7.can_watch(metadata_only))
+
+# 7ж. Удаление раздачи во время просмотра снимает просмотр
+page7.watch(IH)
+check("7 просмотр перед удалением активен", page7.is_watching(IH))
+page7.confirm_remove = lambda name: (True, True)
+page7.remove(IH)
+pump(0.3)
+check("7 удаление раздачи остановило просмотр", not page7.is_watching(IH))
+seed.h.set_upload_limit(0)
+
+# 7з. MainWindow: закрытие окна во время просмотра
+settings8 = dict(config.load())
+settings8["history"] = []
+settings8["check_updates"] = False
+settings8["app_mode"] = "torrent"
+settings8["torrent_folder"] = os.path.join(BASE, "Загрузки с пробелом", "win2")
+settings8["torrent_player"] = ""
+window8 = gui.MainWindow(settings8)
+window8.torrent_engine.data_dir = os.path.join(BASE, "данные", "win2")
+window8.torrent_engine.resume_dir = os.path.join(BASE, "данные", "win2",
+                                                 "resume")
+window8.show()
+pump(0.4)
+check("7 в «Настройках» появилась карточка плеера",
+      hasattr(window8.settings_page, "torrent_player_edit"))
+window8.settings_page.torrent_player_edit.setText(FAKE_PLAYER)
+pump(0.1)
+check("7 путь к плееру сохраняется в настройки",
+      settings8["torrent_player"] == FAKE_PLAYER,
+      settings8.get("torrent_player"))
+
+seed.h.set_upload_limit(96 * 1024)
+page8 = window8.torrent_page
+page8.magnet_edit.setText(magnet())
+page8.add_magnet()
+started = wait_until(lambda: (page8.engine.get(IH) is not None)
+                     and page8.engine.get(IH).has_metadata, 30)
+LAUNCHED.clear()
+check("7 просмотр в настоящем окне запущен",
+      started and page8.watch(IH) and page8.is_watching(IH), str(LAUNCHED))
+# Запрос, который ждёт недостающие куски: именно он мог бы задержать выход
+holder8 = {}
+
+
+def long_read():
+    try:
+        request = urllib.request.Request(
+            LAUNCHED[-1][0], headers={"Range": "bytes=0-2097151"})
+        with urllib.request.urlopen(request, timeout=60) as resp:
+            holder8["body"] = resp.read()
+    except Exception as exc:
+        holder8["error"] = type(exc).__name__
+
+
+reader8 = __import__("threading").Thread(target=long_read, daemon=True)
+reader8.start()
+pump(1.0)
+t_close = time.monotonic()
+window8.close()
+close_s = time.monotonic() - t_close
+pump(0.3)
+check("7 закрытие окна во время просмотра укладывается в бюджет",
+      close_s < 4.5, f"{close_s:.2f} с")
+check("7 closeEvent закрыл и сервер просмотра, и движок",
+      not window8.torrent_stream.server.running
+      and window8.torrent_engine._ses is None,
+      f"сервер={window8.torrent_stream.server.running}")
+reader8.join(3)
+check("7 висевший запрос завершился, поток не остался",
+      not reader8.is_alive(), str(holder8.keys()))
+seed.h.set_upload_limit(0)
 
 # ---- завершение: не оставить работающих потоков ----
 for page, engine in PAGES:

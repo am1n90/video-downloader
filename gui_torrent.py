@@ -1,8 +1,9 @@
-"""Режим «Torrent» — страницы (торрент-стриминг, Этап 1, сессия 1.3).
+"""Режим «Torrent» — страницы (торрент-стриминг, Этапы 1-2).
 
 Страница «Торренты» поверх torrent_engine: добавление magnet/.torrent,
-выбор файлов раздачи, карточки очереди, пауза/продолжение/удаление.
-«Библиотека» режима — заглушка до сессии 1.4.
+выбор файлов раздачи, карточки очереди, пауза/продолжение/удаление
+(1.3) и «Смотреть» — просмотр во время закачки во внешнем плеере
+(2.1: torrent_stream + player). «Библиотека» режима — заглушка.
 
 Импортируется из gui.MainWindow.__init__, а не с верхнего уровня gui.py:
 модуль сам берёт общие виджеты и отступы из gui.
@@ -15,14 +16,16 @@ import os
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QHBoxLayout, QTreeWidget, QTreeWidgetItem,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, CheckBox,
                             InfoBar, InfoBarPosition, LineEdit, MessageBoxBase,
                             PrimaryPushButton, ProgressBar, PushButton,
                             StrongBodyLabel, SubtitleLabel, TitleLabel)
 
+import player
 import torrent_engine as te
+import torrent_stream as ts
 from downloader import fmt_eta, fmt_speed
 from gui import SP_BLOCK, SP_GROUP, SP_WINDOW, TransparentScrollArea, fmt_mb
 
@@ -255,6 +258,7 @@ class TorrentCard(CardWidget):
         lay.addWidget(self.bar)
 
         self._last_state = None
+        self._last_watching = None
         self.update_state(item)
 
     @staticmethod
@@ -262,10 +266,22 @@ class TorrentCard(CardWidget):
         return item.name or item.id[:12]
 
     def _clear_actions(self):
-        while self.actions_widget.layout().count():
-            child = self.actions_widget.layout().takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+        """Убрать прежние кнопки.
+
+        setParent(None) обязателен: takeAt() вынимает виджет из
+        РАСКЛАДКИ, но он остаётся ребёнком actions_widget и продолжает
+        рисоваться на прежнем месте, пока не отработает deleteLater, —
+        а события отложенного удаления разбирает только цикл событий,
+        не processEvents(). Видно глазами на живой проверке 2.1:
+        «Смотреть» поверх «Остановить просмотр» и два комплекта
+        «Пауза/Файлы/Удалить» (снимок 16.09.2026).
+        """
+        layout = self.actions_widget.layout()
+        while layout.count():
+            widget = layout.takeAt(0).widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
 
     def _add_action(self, text, slot, accent=False):
         btn = PrimaryPushButton(text, self.actions_widget) if accent else \
@@ -288,11 +304,22 @@ class TorrentCard(CardWidget):
             self.bar.hide()
 
         # Кнопки пересоздаём только при смене состояния, не на каждом тике
-        if item.state == self._last_state:
+        # (просмотр — тоже смена набора кнопок, хотя state тот же)
+        watching = self.page.is_watching(item.id)
+        if item.state == self._last_state and watching == self._last_watching:
             return
         self._last_state = item.state
+        self._last_watching = watching
         self._clear_actions()
         tid = item.id
+        if watching:
+            self._add_action("Остановить просмотр",
+                             lambda: self.page.stop_watch())
+        elif self.page.can_watch(item):
+            # Акцент не ставим там, где он уже занят «Продолжить»/«Повторить»
+            self._add_action("Смотреть", lambda: self.page.watch(tid),
+                             accent=item.state not in (te.STATE_PAUSED,
+                                                       te.STATE_ERROR))
         if item.state in ACTIVE_STATES:
             self._add_action("Пауза", lambda: self.page.pause(tid))
         elif item.state == te.STATE_PAUSED:
@@ -311,6 +338,8 @@ class TorrentCard(CardWidget):
 
     def _meta_parts(self, item):
         parts = [STATE_TEXT.get(item.state, item.state)]
+        if self.page.is_watching(item.id):
+            parts.append("идёт просмотр")
         if item.state == te.STATE_ERROR:
             if item.error:
                 parts.append(item.error[:120])
@@ -343,10 +372,15 @@ class TorrentCard(CardWidget):
 class TorrentPage(TransparentScrollArea):
     """Очередь раздач: добавление, выбор файлов, пауза, удаление."""
 
-    def __init__(self, engine, bridge, settings, parent=None):
+    def __init__(self, engine, bridge, settings, parent=None, stream=None):
         super().__init__(parent)
         self.engine = engine
         self.settings = settings
+        # Сервис просмотра создаёт MainWindow (он же его и закрывает в
+        # closeEvent). Если его не передали — поднимем свой при первом
+        # «Смотреть»: сервер всё равно ленивый, порт заранее не занимаем.
+        self._stream = stream
+        self._player_offered = False
         self._cards = {}
 
         self.setViewportMargins(SP_WINDOW, SP_WINDOW, SP_WINDOW, SP_WINDOW)
@@ -487,6 +521,105 @@ class TorrentPage(TransparentScrollArea):
         if item is not None and os.path.isdir(item.save_path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(item.save_path))
 
+    # ------------------------------------------------------- просмотр 2.1
+
+    def stream(self):
+        if self._stream is None:
+            self._stream = ts.StreamService(self.engine)
+        return self._stream
+
+    def is_watching(self, tid):
+        return self._stream is not None and self._stream.is_watching(tid)
+
+    @staticmethod
+    def can_watch(item):
+        """Есть что смотреть: метаданные получены, раздача не в разборе
+        и среди выбранных файлов есть видео."""
+        if not item.has_metadata or item.state in (te.STATE_METADATA,
+                                                   te.STATE_CHECKING,
+                                                   te.STATE_ERROR):
+            return False
+        return ts.choose_video_file(item.files) is not None
+
+    def watch(self, tid):
+        """Открыть видео раздачи во внешнем плеере.
+
+        2.1: файл выбирается сам — самый большой из выбранных видео
+        (диалог выбора будет в 2.2). Скачанный целиком файл открываем
+        напрямую: HTTP-сервер и кэш кусков для него не нужны.
+        """
+        item = self.engine.get(tid)
+        if item is None:
+            return False
+        target = ts.choose_video_file(item.files)
+        if target is None:
+            self._notify("warning", "В раздаче нет видеофайла для просмотра")
+            return False
+        local = self.local_path(item, target)
+        if local:
+            return self._launch(local, os.path.basename(local), url="")
+        try:
+            url = self.stream().watch(tid, target.index)
+        except Exception as exc:
+            self._notify("warning", f"Не удалось начать просмотр: {exc}")
+            return False
+        started = self._launch(url, os.path.basename(target.path), url=url)
+        if not started and not self._player_offered:
+            self.stop_watch()        # плеер не запустился — поток не нужен
+        self.refresh()
+        return started
+
+    def stop_watch(self):
+        if self._stream is None or not self._stream.stop():
+            return False
+        self.refresh()
+        return True
+
+    def local_path(self, item, target):
+        """Путь к файлу, если он уже скачан ЦЕЛИКОМ, иначе ""."""
+        try:
+            done = self.engine.file_progress(item.id)
+        except Exception:
+            return ""
+        if target.index >= len(done) or done[target.index] < target.size:
+            return ""
+        # libtorrent отдаёт путь внутри раздачи с разделителем платформы —
+        # приводим оба варианта, как в дереве файлов
+        parts = target.path.replace("\\", "/").split("/")
+        path = os.path.join(item.save_path, *parts)
+        return path if os.path.isfile(path) else ""
+
+    def _launch(self, target, name, url=""):
+        """Запуск плеера. Процесс не ждём и при закрытии окна не убиваем."""
+        self._player_offered = False
+        configured = self.settings.get("torrent_player", "")
+        try:
+            exe = player.resolve(configured)
+        except player.PlayerNotFound as exc:
+            self._offer_link(str(exc), url)
+            return False
+        try:
+            player.launch(target, exe)
+        except OSError as exc:
+            self._notify("warning", f"Плеер не запустился: {exc}")
+            return False
+        self._notify("success",
+                     f"Открываем «{name}» в {player.label_for(exe)}. "
+                     f"Первый кадр появится через несколько секунд.")
+        return True
+
+    def _offer_link(self, reason, url):
+        """Плеера нет: ссылку не теряем — кладём в буфер обмена, поток
+        продолжает работать, её можно открыть чем угодно."""
+        self._player_offered = bool(url)
+        text = f"{reason}. Укажите плеер в Настройках"
+        if url:
+            clipboard = QApplication.clipboard()
+            if clipboard is not None:
+                clipboard.setText(url)
+            text += ". Ссылка на просмотр скопирована в буфер обмена"
+        self._notify("warning", text)
+
     def _engine_call(self, call):
         try:
             call()
@@ -525,6 +658,11 @@ class TorrentPage(TransparentScrollArea):
 
     def refresh(self):
         items = {item.id: item for item in self.engine.items()}
+        # Раздачу удалили во время просмотра — снимаем его сами, иначе
+        # сервер держал бы закрытый поток
+        active = self._stream.active if self._stream is not None else None
+        if active is not None and active[0] not in items:
+            self._stream.stop()
         for tid in list(self._cards):
             if tid not in items:
                 card = self._cards.pop(tid)

@@ -2277,7 +2277,47 @@ class SettingsPage(TransparentScrollArea):
         port_card.hBoxLayout.addSpacing(SP_GROUP)
         cards.append(port_card)
 
+        # Плеер для «Смотреть» (2.1). Пусто — ищем mpv/VLC сами; сам
+        # плеер мы не поставляем (решение №6, они под GPL)
+        import player
+        found = player.available()
+        hint = ("Найден: " + ", ".join(f"{label} ({path})"
+                                       for label, path in found)
+                if found else
+                "mpv или VLC не найдены — укажите путь к плееру вручную")
+        player_card = SettingCard(
+            FIF.VIDEO if hasattr(FIF, "VIDEO") else FIF.PLAY,
+            "Плеер для просмотра", hint, parent,
+        )
+        self.torrent_player_edit = LineEdit(player_card)
+        self.torrent_player_edit.setPlaceholderText("Искать автоматически")
+        self.torrent_player_edit.setText(
+            self.settings.get("torrent_player", ""))
+        self.torrent_player_edit.setMinimumWidth(260)
+        self.torrent_player_edit.setClearButtonEnabled(True)
+        self.torrent_player_edit.textChanged.connect(
+            lambda text: self.settings.__setitem__("torrent_player",
+                                                   text.strip())
+        )
+        player_card.hBoxLayout.addWidget(self.torrent_player_edit)
+        player_card.hBoxLayout.addSpacing(SP_GROUP)
+        pick = PushButton("Обзор…", player_card)
+        pick.clicked.connect(self._browse_torrent_player)
+        player_card.hBoxLayout.addWidget(pick)
+        player_card.hBoxLayout.addSpacing(SP_GROUP)
+        cards.append(player_card)
+
         return cards
+
+    def _browse_torrent_player(self):
+        from PySide6.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите плеер", self.settings.get("torrent_player", ""),
+            "Программы (*.exe)"
+        )
+        if path:
+            self.torrent_player_edit.setText(path)
+            self.settings["torrent_player"] = path
 
     def _browse_torrent_folder(self):
         from PySide6.QtWidgets import QFileDialog
@@ -2556,6 +2596,7 @@ class MainWindow(FluentWindow):
         # (а заодно не тянем libtorrent, пока окно не создаётся).
         import gui_torrent
         import torrent_engine
+        import torrent_stream
 
         # Один движок на приложение, рядом с DownloadManager. Колбэки
         # приходят из фонового потока — в GUI только через Bridge.
@@ -2571,8 +2612,12 @@ class MainWindow(FluentWindow):
                 self.settings.get("torrent_seed_after_download", True)),
             listen_interfaces=f"0.0.0.0:{port}" if port else None,
         )
+        # Просмотр во время закачки (2.1). Сервер тоже ленивый: сокет на
+        # 127.0.0.1 поднимается только при первом «Смотреть».
+        self.torrent_stream = torrent_stream.StreamService(self.torrent_engine)
         self.torrent_page = gui_torrent.TorrentPage(
-            self.torrent_engine, self.torrent_bridge, self.settings, self
+            self.torrent_engine, self.torrent_bridge, self.settings, self,
+            stream=self.torrent_stream
         )
         self.torrent_page.setObjectName("torrentInterface")
         self.torrent_library_page = gui_torrent.TorrentLibraryPage(self)
@@ -2879,6 +2924,15 @@ class MainWindow(FluentWindow):
         # дольше карточек — останавливаем их явно
         try:
             self.library_page.stop_workers()
+        except Exception:
+            pass
+        # Просмотр — ПЕРЕД движком: обработчики HTTP могут ждать кусок
+        # (до PIECE_WAIT_TIMEOUT), а пауза сессии в shutdown() его уже не
+        # принесёт. Закрытие источников будит их сразу; на сам сервер —
+        # ограничитель, окно не должно зависеть от плеера. Плеер при
+        # этом не убиваем: он отдельный процесс (решение №6).
+        try:
+            self.torrent_stream.shutdown(timeout=1.0)
         except Exception:
             pass
         # Торрент-движок: сброс кэша на диск + fastresume. Фактически

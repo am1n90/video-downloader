@@ -34,6 +34,9 @@ DEFAULTS = {
     "torrent_folder": os.path.join(os.path.expanduser("~"), "Downloads"),
     "torrent_seed_after_download": True,
     "torrent_port": 0,
+    # Плеер для «Смотреть» (2.1). Пусто — искать mpv/VLC на машине;
+    # сам плеер не поставляем (решение №6: mpv и VLC под GPL)
+    "torrent_player": "",
     # Стабильный алиас latest (не URL конкретного релиза — иначе старые
     # билды не увидят новые версии). Переопределяется в settings.json
     # только для локального теста цикла обновления.

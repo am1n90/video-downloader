@@ -23,8 +23,14 @@ API — по образцу downloader.DownloadManager. Колбэки вызы�
 
 Данные: fastresume каждой раздачи — <data_dir>/resume/<id>.fastresume
 (атомарная запись); по нему раздачи восстанавливаются при start().
+
+С сессии 2.1 движок умеет отдавать файл, пока тот качается
+(open_stream -> TorrentStream): данные ТОЛЬКО через read_piece(), голова
+и хвост файла вперёд всего, окно кусков под set_piece_deadline. HTTP —
+в torrent_stream.py, движок про него не знает.
 """
 
+import collections
 import dataclasses
 import glob
 import os
@@ -54,6 +60,25 @@ ALERT_LOG_EVERY = 100              # каждый N-й
 
 _CHECKING_STATES = {"checking_files", "checking_resume_data",
                     "queued_for_checking", "allocating"}
+
+# --- просмотр во время закачки (Этап 2, сессия 2.1) ------------------
+MB = 1024 * 1024
+STREAM_PRIORITY = 4                # приоритет файла, который смотрят
+PIECE_PRIORITY_URGENT = 7          # голова/хвост и куски под дедлайном
+HEAD_TAIL_BYTES = 8 * MB           # moov у MP4, cues у MKV — вперёд всего
+# Прототип читал вперёд 16 кусков при куске 512 КБ (8 МБ). В настоящих
+# раздачах кусок бывает 8-16 МБ, и те же «16 кусков» — это сотни мегабайт
+# в памяти GUI-процесса. Поэтому окно и кэш считаем в БАЙТАХ, а число
+# кусков только ограничиваем сверху и снизу.
+READAHEAD_BYTES = 32 * MB
+READAHEAD_MIN_PIECES = 2
+READAHEAD_MAX_PIECES = 16
+PIECE_CACHE_BYTES = 64 * MB
+DEADLINE_STEP_MS = 100             # ступенька срочности внутри окна
+PIECE_WAIT_TIMEOUT = 120           # с — сколько ждём кусок, прежде чем
+                                   # оборвать ответ плееру
+READ_PIECE_RETRY_S = 5             # с — повтор read_piece, если ответа нет
+READ_CHUNK = 256 * 1024            # размер куска ответа плееру
 
 
 def default_data_dir():
@@ -146,6 +171,329 @@ class TorrentItem:
     error_file: str = ""
 
 
+class TorrentStream:
+    """Чтение файла раздачи по диапазонам, пока он ещё качается.
+
+    Источник для torrent_stream.StreamServer; создаётся движком
+    (TorrentEngine.open_stream), напрямую не конструируется — кэш кусков
+    наполняется из общего цикла алертов движка (pop_alerts может быть
+    только у одного потребителя).
+
+    Данные берутся ТОЛЬКО через read_piece(): в libtorrent 2.x кусок
+    помечается готовым сразу после проверки хэша, а запись ещё в очереди
+    дискового потока, и sparse-файл читается в этот момент НУЛЯМИ —
+    первая версия сервера в прототипе отдавала плееру нули (находка 7
+    Этапа 0.2). Ни движок, ни плеер не читают недокачанный файл с диска.
+    """
+
+    def __init__(self, engine, tid, handle, index, ti):
+        self.tid = tid
+        self.index = index
+        self._engine = engine
+        self._handle = handle
+        self._ti = ti
+        files = ti.files()
+        self.path = files.file_path(index)
+        self.name = os.path.basename(self.path)
+        self.size = files.file_size(index)
+        self.piece_length = ti.piece_length()
+        self.readahead = max(READAHEAD_MIN_PIECES,
+                             min(READAHEAD_MAX_PIECES,
+                                 READAHEAD_BYTES // max(1, self.piece_length)))
+        self._cache_limit = max(PIECE_CACHE_BYTES,
+                                (self.readahead + 2) * self.piece_length)
+        self._cond = threading.Condition()
+        self._closed = False
+        self._cache = collections.OrderedDict()   # кусок -> bytes
+        self._cache_bytes = 0
+        self._pending = {}          # кусок -> когда просили read_piece
+        self._windows = {}          # id запроса -> куски под дедлайном
+        self._next_req = 0
+        self._raised = {}           # кусок -> приоритет до просмотра
+        self._head_tail_done = False
+        self._expected = None       # приоритеты файлов, применения которых ждём
+        self._file_prio = STREAM_PRIORITY   # к нему возвращаем куски окна
+        self.waits = 0              # счётчики для лога и тестов
+        self.piece_reads = 0
+        self.wait_seconds = 0.0
+        self._prepare()
+
+    @property
+    def closed(self):
+        return self._closed
+
+    # ------------------------------------------------------- подготовка
+
+    def _prepare(self):
+        """Файл — в закачку; голова и хвост — следом, см. _raise_head_tail."""
+        priorities = [int(p) for p in self._handle.get_file_priorities()]
+        if self.index < len(priorities) and not priorities[self.index]:
+            priorities[self.index] = STREAM_PRIORITY
+            self._handle.prioritize_files(priorities)
+            self._expected = priorities
+        self._raise_head_tail()
+
+    def rearm_head_tail(self, expected=None):
+        """Снова поднять голову и хвост: любой prioritize_files по этой
+        раздаче (пользователь открыл дерево файлов во время просмотра)
+        переписывает приоритеты кусков приоритетом файла.
+
+        expected — список приоритетов, который только что применили:
+        ждать придётся именно его, потому что «приоритет нашего файла
+        больше нуля» здесь уже выполнялось и ДО изменения.
+        """
+        with self._cond:
+            self._head_tail_done = False
+            self._raised.clear()
+            self._expected = [int(p) for p in expected] if expected else None
+        self._raise_head_tail()
+
+    def _raise_head_tail(self):
+        """Голова и хвост файла — вперёд всего: там moov у MP4 (в
+        прототипе он встречался в конце файла) и cues у MKV, без них
+        плеер не разберёт контейнер.
+
+        Поднимаем ТОЛЬКО когда движок уже применил приоритет файла.
+        prioritize_files асинхронный (находка 21), и когда он наконец
+        применяется, он переписывает приоритеты ВСЕХ кусков файла его
+        собственным приоритетом. Вызванный сразу за ним piece_priority
+        читался обратно семёркой, а через 0.2 с молча становился
+        четвёркой (диагностика 16.09.2026) — то есть срочность головы и
+        хвоста терялась незаметно. Признак применения — приоритет файла,
+        прочитанный обратно: get_file_priorities отдаёт новое значение
+        только после того, как изменение обработано (в замере — 21 мс).
+        """
+        if self._head_tail_done or not self.size:
+            return
+        try:
+            current = [int(p) for p in self._handle.get_file_priorities()]
+        except Exception:
+            return
+        expected = self._expected
+        applied = (current == expected) if expected is not None \
+            else bool(current[self.index])
+        if not applied:
+            return                      # изменение ещё не применилось
+        with self._cond:
+            if self._head_tail_done:
+                return
+            self._head_tail_done = True
+            self._expected = None
+            self._file_prio = current[self.index] or STREAM_PRIORITY
+        span = min(HEAD_TAIL_BYTES, self.size)
+        pieces = set(self._pieces(0, span))
+        pieces |= set(self._pieces(self.size - span, span))
+        for piece in sorted(pieces):
+            if self._have(piece):
+                continue
+            old = int(self._handle.piece_priority(piece))
+            if old >= PIECE_PRIORITY_URGENT:
+                continue
+            self._raised[piece] = old
+            self._handle.piece_priority(piece, PIECE_PRIORITY_URGENT)
+
+    def _pieces(self, offset, length):
+        first = self._ti.map_file(self.index, offset, 1).piece
+        last = self._ti.map_file(self.index, offset + length - 1, 1).piece
+        return range(first, last + 1)
+
+    def _have(self, piece):
+        try:
+            return self._handle.have_piece(piece)
+        except Exception:           # раздачу удалили — handle уже невалиден
+            return False
+
+    # ----------------------------------------------------------- запросы
+
+    def open_request(self):
+        with self._cond:
+            self._next_req += 1
+            self._windows[self._next_req] = set()
+            return self._next_req
+
+    def close_request(self, rid):
+        """Плеер при перемотке рвёт соединение — снимаем срочность с
+        кусков, которые были нужны только этому запросу."""
+        with self._cond:
+            mine = self._windows.pop(rid, set())
+            others = set().union(*self._windows.values()) \
+                if self._windows else set()
+        self._reset_deadlines(mine - others)
+
+    def _request_window(self, rid, piece):
+        self._raise_head_tail()     # ждали, пока применится приоритет файла
+        last = min(piece + self.readahead, self._ti.num_pieces() - 1)
+        added = []
+        for step, other in enumerate(range(piece, last + 1)):
+            if self._have(other):
+                continue
+            try:
+                self._handle.set_piece_deadline(other, step * DEADLINE_STEP_MS)
+            except Exception:
+                continue
+            added.append(other)
+        if not added:
+            return
+        with self._cond:
+            window = self._windows.get(rid)
+            if window is not None:
+                window.update(added)
+
+    def _reset_deadlines(self, pieces):
+        """Снять срочность с кусков и ВЕРНУТЬ им приоритет.
+
+        reset_piece_deadline не возвращает прежний приоритет, а ставит 1
+        (диагностика 16.09.2026: было 7 — стало 1, было 4 — стало 1;
+        заодно выяснилось, что set_piece_deadline сам поднимает кусок до
+        7). Без восстановления куски прямо перед позицией плеера после
+        каждой перемотки оказывались бы В КОНЦЕ очереди — ровно те, что
+        нужны раньше всех, — а срочность головы и хвоста пропадала бы на
+        первом же закрытии запроса.
+        """
+        for piece in pieces:
+            try:
+                if self._handle.have_piece(piece):
+                    continue
+                self._handle.reset_piece_deadline(piece)
+                self._handle.piece_priority(
+                    piece, PIECE_PRIORITY_URGENT if piece in self._raised
+                    else self._file_prio)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------ чтение
+
+    def iter_range(self, rid, start, end):
+        """Байты файла [start, end] включительно, кусками READ_CHUNK."""
+        pos = start
+        while pos <= end:
+            if self._closed:
+                return
+            mapped = self._ti.map_file(self.index, pos, 1)
+            self._request_window(rid, mapped.piece)
+            data = self._get_piece(mapped.piece)
+            if data is None:                    # поток закрыли
+                return
+            count = min(len(data) - mapped.start, end - pos + 1)
+            if count <= 0:
+                raise ValueError(f"кусок {mapped.piece}: длина {len(data)}, "
+                                 f"смещение {mapped.start}")
+            view = memoryview(data)[mapped.start:mapped.start + count]
+            for offset in range(0, count, READ_CHUNK):
+                yield view[offset:offset + READ_CHUNK]
+            pos += count
+
+    def _get_piece(self, piece):
+        """Байты куска; если куска ещё нет — ждём его скачивания."""
+        started = time.monotonic()
+        missing = not self._have(piece)
+        if missing:
+            self.waits += 1
+        data = None
+        while True:
+            with self._cond:
+                if self._closed:
+                    return None
+                data = self._cache.get(piece)
+                if data is not None:
+                    self._cache.move_to_end(piece)
+                    break
+            if time.monotonic() - started > PIECE_WAIT_TIMEOUT:
+                raise TimeoutError(f"кусок {piece} не пришёл за "
+                                   f"{PIECE_WAIT_TIMEOUT} с")
+            if self._have(piece):
+                self._ask_piece(piece)
+            with self._cond:
+                if not self._closed and piece not in self._cache:
+                    self._cond.wait(0.25)
+        if missing:
+            self.wait_seconds += time.monotonic() - started
+        return data
+
+    def _ask_piece(self, piece):
+        now = time.monotonic()
+        with self._cond:
+            asked = self._pending.get(piece)
+            if asked is not None and now - asked <= READ_PIECE_RETRY_S:
+                return
+            self._pending[piece] = now
+        try:
+            self._handle.read_piece(piece)
+        except Exception as exc:
+            log.warning("read_piece %s: %r", self.tid, exc)
+            return
+        self.piece_reads += 1
+
+    def on_read_piece(self, alert):
+        """read_piece_alert из цикла алертов движка."""
+        piece = alert.piece
+        error = getattr(alert, "error", None)
+        if error is not None and error.value():
+            log.warning("read_piece_alert %s: %s", self.tid,
+                        _alert_text(alert))
+            with self._cond:
+                self._pending.pop(piece, None)
+                self._cond.notify_all()
+            return
+        data = bytes(alert.buffer)
+        with self._cond:
+            self._pending.pop(piece, None)
+            old = self._cache.pop(piece, None)
+            if old is not None:
+                self._cache_bytes -= len(old)
+            self._cache[piece] = data
+            self._cache_bytes += len(data)
+            while self._cache_bytes > self._cache_limit and len(self._cache) > 1:
+                _, evicted = self._cache.popitem(last=False)
+                self._cache_bytes -= len(evicted)
+            self._cond.notify_all()
+
+    def wake(self):
+        """Пришёл новый кусок — разбудить ожидающих."""
+        with self._cond:
+            self._cond.notify_all()
+
+    # ---------------------------------------------------------- закрытие
+
+    def close(self):
+        """Снять дедлайны, вернуть приоритеты, разбудить ожидающих.
+
+        Повторный вызов ничего не делает. Ожидающие куска запросы выходят
+        немедленно — от этого зависит закрытие окна во время просмотра.
+        """
+        with self._cond:
+            if self._closed:
+                return
+            self._closed = True
+            pieces = set().union(*self._windows.values()) \
+                if self._windows else set()
+            self._windows.clear()
+            self._cache.clear()
+            self._cache_bytes = 0
+            self._pending.clear()
+            raised, self._raised = self._raised, {}
+            self._cond.notify_all()
+        self._reset_deadlines(pieces)
+        # Голову и хвост возвращаем к приоритету САМОГО ФАЙЛА, а не к
+        # запомненному: если файл был не выбран, _prepare включил его, и
+        # запомненный ноль вернул бы дыры в уже начатой закачке. Ноль
+        # уместен только если файл сняли галочкой прямо во время просмотра.
+        try:
+            file_priority = int(
+                self._handle.get_file_priorities()[self.index])
+        except Exception:
+            file_priority = STREAM_PRIORITY
+        for piece, old in raised.items():
+            try:
+                self._handle.piece_priority(piece,
+                                            file_priority or old)
+            except Exception:
+                pass
+        log.info("stream closed %s#%d: read_piece %d, ожиданий %d (%.1f с)",
+                 self.tid, self.index, self.piece_reads, self.waits,
+                 self.wait_seconds)
+
+
 class TorrentEngine:
     def __init__(self, data_dir=None, on_change=None, on_list_change=None,
                  seed_after_download=True, listen_interfaces=None,
@@ -156,9 +504,13 @@ class TorrentEngine:
         self.on_list_change = on_list_change
         self._seed_after_download = bool(seed_after_download)
         self._settings = {
+            # piece_progress — ради piece_finished_alert: им будится
+            # просмотр, ждущий недостающий кусок (read_piece_alert —
+            # это storage). В лог эти алерты не идут, шума нет.
             "alert_mask": int(lt.alert_category.error)
             | int(lt.alert_category.status)
-            | int(lt.alert_category.storage),
+            | int(lt.alert_category.storage)
+            | int(lt.alert_category.piece_progress),
             "stop_tracker_timeout": 1,
             "user_agent": f"VideoDownloader/{config.APP_VERSION} "
                           f"libtorrent/{lt.__version__}",
@@ -173,6 +525,7 @@ class TorrentEngine:
         self._files = {}            # id -> tuple(TorrentFile) (после метаданных)
         self._errors = {}           # id -> (текст, файл)
         self._removed = set()       # id удалённых (fastresume не писать)
+        self._streams = {}          # (id, индекс файла) -> TorrentStream
         self._pending_saves = set() # id с запрошенным fastresume (shutdown)
         self._pending_flush = set() # id с запрошенным сбросом кэша (shutdown)
         self._saves_done = threading.Condition(self._lock)
@@ -214,6 +567,10 @@ class TorrentEngine:
         сбросом — 0 из 6, сброс 5-19 мс; проверено 16.09.2026)."""
         t0 = time.monotonic()
         deadline = t0 + timeout
+        # Просмотр закрываем ПЕРВЫМ: обработчики HTTP могут ждать кусок
+        # (до PIECE_WAIT_TIMEOUT), а пауза сессии ниже этот кусок уже не
+        # принесёт — без close() окно висело бы до таймаута
+        self._close_all_streams()
         with self._lock:
             ses = self._ses
             if ses is None:
@@ -303,6 +660,15 @@ class TorrentEngine:
         handle.prioritize_files(list(priorities))
         with self._lock:
             self._files.pop(tid, None)          # пересобрать с приоритетами
+        # Сняли галочку с файла, который смотрят: выбор пользователя
+        # важнее просмотра — поток закрываем, плеер упрётся в 404
+        for stream in self._streams_of(tid):
+            if stream.index >= len(priorities) or not priorities[stream.index]:
+                self.close_stream(tid, stream.index)
+            else:
+                # Просмотр продолжается, но prioritize_files сейчас сотрёт
+                # срочность головы и хвоста — поднимем её заново
+                stream.rearm_head_tail(priorities)
         self._request_save(handle)
         self._emit(tid, handle)
 
@@ -312,6 +678,63 @@ class TorrentEngine:
         if not handle.status().has_metadata:
             return []
         return list(handle.file_progress(lt.torrent_handle.piece_granularity))
+
+    # ------------------------------------------- просмотр во время закачки
+
+    def open_stream(self, tid, index):
+        """Отдавать файл раздачи, пока он качается (см. TorrentStream).
+
+        Движок допускает несколько потоков (ключ — раздача + файл);
+        «один просмотр за раз» — правило GUI, не движка. Раздача на
+        паузе снимается с паузы: смотреть то, что не качается, нельзя.
+        """
+        handle = self._require(tid)
+        st = handle.status()
+        ti = handle.torrent_file() if st.has_metadata else None
+        if ti is None:
+            raise RuntimeError("метаданные раздачи ещё не получены")
+        if not 0 <= index < ti.num_files():
+            raise IndexError(f"в раздаче нет файла с номером {index}")
+        with self._lock:
+            stream = self._streams.get((tid, index))
+            if stream is not None and not stream.closed:
+                return stream
+        stream = TorrentStream(self, tid, handle, index, ti)
+        with self._lock:
+            self._streams[(tid, index)] = stream
+        if st.paused and not self._error_is_live(st):
+            self._resume_handle(handle)
+        log.info("stream opened %s#%d (%s, кусок %d КБ, окно %d кусков)",
+                 tid, index, stream.name, stream.piece_length // 1024,
+                 stream.readahead)
+        self._emit(tid, handle)
+        return stream
+
+    def close_stream(self, tid, index=None):
+        """Закрыть поток(и) раздачи; index=None — все её потоки."""
+        with self._lock:
+            keys = [key for key in self._streams
+                    if key[0] == tid and (index is None or key[1] == index)]
+            streams = [self._streams.pop(key) for key in keys]
+        for stream in streams:
+            stream.close()
+        return len(streams)
+
+    def streams(self):
+        with self._lock:
+            return list(self._streams.values())
+
+    def _streams_of(self, tid):
+        with self._lock:
+            return [stream for key, stream in self._streams.items()
+                    if key[0] == tid]
+
+    def _close_all_streams(self):
+        with self._lock:
+            streams = list(self._streams.values())
+            self._streams.clear()
+        for stream in streams:
+            stream.close()
 
     def pause(self, tid):
         handle = self._require(tid)
@@ -338,6 +761,7 @@ class TorrentEngine:
     def remove(self, tid, delete_files=False):
         """Убрать раздачу; delete_files — удалить и скачанные файлы
         (вместе со служебным .<infohash>.parts)."""
+        self.close_stream(tid)       # handle сейчас станет невалидным
         with self._lock:
             handle = self._handles.pop(tid, None)
             self._files.pop(tid, None)
@@ -444,6 +868,18 @@ class TorrentEngine:
         tid = None
         if handle is not None and handle.is_valid():
             tid = _id_from_hashes(handle.info_hashes())
+
+        # Просмотр: read_piece_alert приносит байты куска, piece_finished
+        # будит тех, кто ждёт недостающий. Без потоков — сразу мимо
+        # (piece_finished приходит на каждый кусок любой раздачи).
+        if name in ("read_piece_alert", "piece_finished_alert"):
+            if self._streams and tid:
+                for stream in self._streams_of(tid):
+                    if name == "read_piece_alert":
+                        stream.on_read_piece(alert)
+                    else:
+                        stream.wake()
+            return
 
         if name == "cache_flushed_alert":
             with self._lock:
