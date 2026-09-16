@@ -11,18 +11,21 @@ keep-alive, параллельные запросы, слушаем только
 чего в прототипе не было: закрытый источник -> 404 и главное для
 закрытия окна — shutdown() будит запрос, застрявший в ожидании куска.
 """
+import collections
 import http.client
 import os
 import socket
 import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import player
 import torrent_stream as ts
 
 PASS, FAIL = [], []
@@ -384,6 +387,100 @@ def main():
     check("21e. stats() без активного просмотра — None",
           service.stats() is None, "")
     service.shutdown(timeout=1.0)
+
+    # 22. Внешние субтитры — спутники активного просмотра (2.3)
+    File = collections.namedtuple("File", "index path size priority")
+
+    def files_of(*paths):
+        return [File(i, p, 1000, 4) for i, p in enumerate(paths)]
+
+    movie = os.path.join("Фильм", "Фильм.mkv")
+    subs = ts.subtitle_files(
+        files_of(movie,
+                 os.path.join("Фильм", "Фильм.rus.srt"),
+                 os.path.join("Фильм", "Фильм.eng.srt"),
+                 os.path.join("Фильм", "постер.jpg")), movie)
+    check("22. К фильму подобраны оба .srt рядом с ним",
+          [os.path.basename(f.path) for f in subs]
+          == ["Фильм.rus.srt", "Фильм.eng.srt"],
+          str([f.path for f in subs]))
+
+    one_video = os.path.join("Кино", "movie.mkv")
+    subs = ts.subtitle_files(
+        files_of(one_video, os.path.join("Кино", "rus.srt")), one_video)
+    check("22b. Видео в папке одно — берём субтитры с любым именем",
+          [os.path.basename(f.path) for f in subs] == ["rus.srt"],
+          str([f.path for f in subs]))
+
+    # Сериал: субтитры соседней серии подсовывать нельзя
+    s1 = os.path.join("Сериал", "Сезон 1", "S01E01.mkv")
+    series = files_of(s1,
+                      os.path.join("Сериал", "Сезон 1", "S01E01.srt"),
+                      os.path.join("Сериал", "Сезон 1", "S01E02.mkv"),
+                      os.path.join("Сериал", "Сезон 1", "S01E02.srt"),
+                      os.path.join("Сериал", "Сезон 2", "S02E01.srt"))
+    subs = ts.subtitle_files(series, s1)
+    check("22c. У сериала — только субтитры СВОЕЙ серии",
+          [os.path.basename(f.path) for f in subs] == ["S01E01.srt"],
+          str([f.path for f in subs]))
+
+    check("22d. Видеофайл субтитрами не считается",
+          not ts.is_subtitle("кино.mkv") and ts.is_subtitle("кино.srt")
+          and ts.is_subtitle("КИНО.ASS"), "")
+
+    class SubEngine(FakeEngine):
+        """Движок с двумя субтитрами рядом с фильмом."""
+
+        def __init__(self):
+            FakeEngine.__init__(self)
+            self.files = files_of(movie,
+                                  os.path.join("Фильм", "Фильм.rus.srt"),
+                                  os.path.join("Фильм", "постер.jpg"))
+            self.source = FakeSource(name=movie)
+            # FakeSource приписывает свою папку — здесь нужен
+            # путь ровно как в списке файлов раздачи
+            self.source.path = movie
+            self.sub_source = FakeSource(name="Фильм.rus.srt")
+
+        def get(self, tid):
+            return types.SimpleNamespace(files=self.files)
+
+        def open_stream(self, tid, index):
+            self.opened.append((tid, index))
+            return self.source if index == 0 else self.sub_source
+
+    engine = SubEngine()
+    service = ts.StreamService(engine, ts.StreamServer())
+    watch_url = service.watch("cc" * 20, 0)
+    names = [name for name, _ in service.subtitles]
+    check("22e. watch() поднял поток субтитров вместе с видео",
+          engine.opened == [("cc" * 20, 0), ("cc" * 20, 1)]
+          and names == ["Фильм.rus.srt"], f"{engine.opened} {names}")
+    check("22f. Субтитры отдаются ТЕМ ЖЕ сервером",
+          all(url.startswith(f"http://127.0.0.1:{service.server.port}/")
+              for _, url in service.subtitles), str(service.subtitles))
+    check("22g. Спутник НЕ считается отдельным просмотром",
+          service.active == ("cc" * 20, 0)
+          and not service.is_watching("cc" * 20, 1), str(service.active))
+    got = urllib.request.urlopen(service.subtitles[0][1], timeout=5).read()
+    check("22h. По ссылке субтитров приходят их байты",
+          got == engine.sub_source.data, f"{len(got)} Б")
+    service.stop()
+    check("22i. stop() закрыл и видео, и субтитры",
+          sorted(engine.closed) == [("cc" * 20, 0), ("cc" * 20, 1)]
+          and service.subtitles == [], str(engine.closed))
+    service.shutdown(timeout=1.0)
+
+    # 22j-k: ключи плеера строит player.py, у mpv и VLC они разные
+    urls = ["http://x/1.srt", "http://x/2.srt"]
+    check("22j. mpv получает все дорожки, VLC — одну",
+          player.subtitle_args(r"C:\mpv\mpv.exe", urls)
+          == ["--sub-file=http://x/1.srt", "--sub-file=http://x/2.srt"]
+          and player.subtitle_args(r"C:\VLC\vlc.exe", urls)
+          == ["--sub-file=http://x/1.srt"], "")
+    check("22k. Незнакомому плееру ключей не передаём",
+          player.subtitle_args(r"C:\other\player.exe", urls) == []
+          and player.subtitle_args(r"C:\mpv\mpv.exe", []) == [], "")
 
     print(f"\nPASS {len(PASS)} / FAIL {len(FAIL)}", flush=True)
     if FAIL:

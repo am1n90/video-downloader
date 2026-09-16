@@ -73,6 +73,29 @@ CONDITIONS = {
     "reconnect": {"min_reconnect_time": 5},
     "noincoming": {"enable_incoming_tcp": False,
                    "enable_incoming_utp": False},
+    # --- сессия 2.3, по причине простоя из diag_swarm_head.py ----------
+    # Диагностика 16.09.2026: читатель стоит не из-за медленного роя, а
+    # ждёт ПОСЛЕДНИЙ блок 16 КБ из куска — 6-7 блоков из 8 приходят
+    # сразу, один висит, и libtorrent перебирает под него пиров по
+    # 1.6-3.2 с на попытку. Отсюда три ручки и одна своя правка.
+    #
+    # strict_end_game_mode=False разрешает просить ОДИН И ТОТ ЖЕ блок у
+    # нескольких пиров, не дожидаясь конца всей раздачи — ровно наш
+    # случай «остался один блок».
+    "endgame": {"strict_end_game_mode": False},
+    # piece_timeout — сколько libtorrent терпит молчащего пира по куску
+    # со сроком. Замер показал перезапросы и без того чаще 20 с, так что
+    # ждём малого, но проверить дёшево.
+    "piecetimeout": {"piece_timeout": 4},
+    # request_queue_time задаёт глубину очереди запросов к пиру. В
+    # диагностике у пиров было 4-34 запроса впереди нашего блока при
+    # 6-10 КБ/с — это head-of-line: короче очередь, ближе срочный блок.
+    "queuetime": {"request_queue_time": 1},
+    # Наша правка (без изменения движка — приставкой, см. Rearmer):
+    # пока читатель стоит, раз в секунду напоминаем libtorrent о сроке
+    # блокирующего куска.
+    "rearm": {"_rearm": 1.0},
+    "endgame_rearm": {"strict_end_game_mode": False, "_rearm": 1.0},
 }
 
 # Сколько читаем «как плеер» перед перемотками и сколько ждём куски.
@@ -110,6 +133,67 @@ def fetch(url, start, count, timeout):
                 "status": 0, "error": type(exc).__name__}
 
 
+class Rearmer:
+    """Приставка к потоку: пока читатель стоит на куске, напоминать
+    libtorrent о его сроке.
+
+    Нарочно НЕ правка torrent_engine.py: сперва доказываем замером, что
+    эффект есть, и только потом переносим в движок. Блокирующий кусок
+    вычисляем так же, как его видит читатель — самый младший ЕЩЁ НЕ
+    скачанный кусок из тех, что под сроком (чтение строго
+    последовательное, значит именно он держит показ).
+
+    Считаем и работу: сколько раз переармировали и сколько раз при этом
+    кусок был тот же самый, — иначе по итогу не отличить «помогло» от
+    «просто не пригодилось».
+    """
+
+    def __init__(self, stream, every=1.0):
+        self.stream = stream
+        self.every = every
+        self.rearms = 0
+        self.same_piece_streak = 0
+        self._last = None
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _blocking_piece(self):
+        stream = self.stream
+        with stream._cond:
+            armed = set().union(*stream._windows.values()) \
+                if stream._windows else set()
+        for piece in sorted(armed):
+            if not stream._have(piece):
+                return piece
+        return None
+
+    def _loop(self):
+        while not self._stop.wait(self.every):
+            if self.stream._closed:
+                return
+            piece = self._blocking_piece()
+            if piece is None:
+                self._last = None
+                continue
+            if piece == self._last:
+                self.same_piece_streak += 1
+            self._last = piece
+            try:
+                self.stream._handle.set_piece_deadline(piece, 0)
+                self.rearms += 1
+            except Exception:
+                pass
+
+
 class Run:
     """Один прогон: своя папка, свой движок, свой сервер."""
 
@@ -123,12 +207,16 @@ class Run:
         self.engine = None
         self.service = None
         self.samples = []           # (секунда, скорость, пиры)
+        self.rearm_every = 0.0
+        self.rearmer = None
         self._stop = threading.Event()
 
     # ------------------------------------------------------------ жизнь
 
     def start_engine(self):
         extra = dict(CONDITIONS[self.condition])
+        # ключи на «_» — наши, не libtorrent: их движку отдавать нельзя
+        self.rearm_every = extra.pop("_rearm", 0.0)
         self.engine = te.TorrentEngine(data_dir=self.data_dir,
                                        seed_after_download=False,
                                        extra_settings=extra)
@@ -146,6 +234,8 @@ class Run:
 
     def close(self):
         self._stop.set()
+        if self.rearmer is not None:
+            self.rearmer.stop()
         try:
             if self.service is not None:
                 self.service.shutdown(timeout=2.0)
@@ -188,6 +278,9 @@ class Run:
 
         url = self.service.watch(tid, target.index)
         stream = self.engine._streams[(tid, target.index)]
+        if self.rearm_every:
+            self.rearmer = Rearmer(stream, self.rearm_every)
+            self.rearmer.start()
 
         # 1. Начало файла — то же, что делает плеер, открывая поток.
         # Время чтения головы и есть главная метрика «кусок вовремя»:
@@ -236,6 +329,9 @@ class Run:
         # 3. Прямой счётчик «кусок не пришёл вовремя»
         result["waits"] = stream.waits
         result["wait_seconds"] = round(stream.wait_seconds, 2)
+        if self.rearmer is not None:
+            result["rearms"] = self.rearmer.rearms
+            result["rearm_same_piece"] = self.rearmer.same_piece_streak
         result["piece_reads"] = stream.piece_reads
 
         item = self.engine.get(tid)

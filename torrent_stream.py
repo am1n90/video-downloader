@@ -69,6 +69,41 @@ def watchable_files(files):
     return [f for f in files if f.priority > 0 and is_video(f.path)]
 
 
+SUBTITLE_EXTS = (".srt", ".ass", ".ssa", ".vtt", ".sub")
+
+
+def is_subtitle(path):
+    return os.path.splitext(path)[1].lower() in SUBTITLE_EXTS
+
+
+def subtitle_files(files, video_path, limit=8):
+    """Внешние субтитры к выбранному видео (сессия 2.3).
+
+    Берём только те, что лежат В ТОЙ ЖЕ ПАПКЕ раздачи, что и видео:
+    у сериала в соседних папках лежат субтитры к другим сериям, и
+    подсовывать их плееру нельзя. Внутри папки правило простое —
+    либо имя начинается с имени видео без расширения («Фильм.rus.srt»
+    к «Фильм.mkv»), либо видеофайл в этой папке один и тогда подходят
+    все субтитры рядом (частый случай: «Movie.mkv» + «rus.srt»).
+
+    Галочка субтитров не важна: файл размером в десятки килобайт мы
+    включим сами, когда начнём просмотр. Ограничение limit — чтобы
+    раздача с полусотней языков не превратилась в полсотни потоков.
+    """
+    folder = os.path.dirname(video_path)
+    stem = os.path.splitext(os.path.basename(video_path))[0].lower()
+    near = [f for f in files if os.path.dirname(f.path) == folder]
+    videos_near = sum(1 for f in near if is_video(f.path))
+    out = []
+    for item in near:
+        if not is_subtitle(item.path):
+            continue
+        name = os.path.basename(item.path).lower()
+        if name.startswith(stem) or videos_near <= 1:
+            out.append(item)
+    return out[:limit]
+
+
 def choose_video_file(files):
     """Что смотреть, когда выбирать не из чего (или не у кого спросить):
     самый большой видеофайл среди выбранных.
@@ -397,6 +432,11 @@ class StreamService:
         self.server = server if server is not None else StreamServer()
         self._lock = threading.Lock()
         self._active = None                 # (tid, index)
+        # Спутники активного просмотра (2.3): внешние субтитры того же
+        # видео. Это НЕ второй просмотр — они живут и умирают вместе с
+        # ним, в _active не попадают, на кнопки карточки не влияют и
+        # своего «стоп» не имеют.
+        self._companions = []               # [(индекс, имя, URL)]
 
     @property
     def active(self):
@@ -425,24 +465,66 @@ class StreamService:
             return None
         return self.server.stats(self._key(*active))
 
+    @property
+    def subtitles(self):
+        """[(имя файла, URL)] внешних субтитров активного просмотра."""
+        with self._lock:
+            return [(name, url) for _, name, url in self._companions]
+
     def watch(self, tid, index):
-        """Открыть поток и начать его отдавать; возвращает URL."""
+        """Открыть поток и начать его отдавать; возвращает URL.
+
+        Вместе с видео поднимаем потоки внешних субтитров рядом с ним —
+        их URL забирает вызывающий через .subtitles и передаёт плееру.
+        """
         self.stop()
         stream = self.engine.open_stream(tid, index)
         url = self.server.serve(self._key(tid, index), stream)
         with self._lock:
             self._active = (tid, index)
         log.info("watch %s#%d -> %s", tid, index, stream.name)
+        try:
+            # Путь ВНУТРИ раздачи, а не имя файла: субтитры ищем в той же
+            # папке, а у сериала имя серии само по себе папку не задаёт
+            self._serve_subtitles(tid, stream.path)
+        except Exception as exc:       # кино важнее субтитров
+            log.warning("субтитры не подключились: %r", exc)
         return url
+
+    def _serve_subtitles(self, tid, video_path):
+        """Поднять потоки субтитров. Их неудача просмотр не срывает:
+        кино важнее субтитров, поэтому каждый — отдельно и молча в лог."""
+        item = self.engine.get(tid)
+        if item is None or not item.files:
+            return
+        for sub in subtitle_files(item.files, video_path):
+            try:
+                stream = self.engine.open_stream(tid, sub.index)
+                sub_url = self.server.serve(self._key(tid, sub.index), stream)
+            except Exception as exc:
+                log.warning("субтитры %s#%d не открылись: %r",
+                            tid, sub.index, exc)
+                continue
+            name = os.path.basename(sub.path)
+            with self._lock:
+                self._companions.append((sub.index, name, sub_url))
+            log.info("субтитры %s#%d -> %s", tid, sub.index, name)
 
     def stop(self):
         """Остановить просмотр. Плеер не трогаем — он отдельный процесс
         (решение №6), у него просто оборвётся соединение."""
         with self._lock:
             active, self._active = self._active, None
+            companions, self._companions = self._companions, []
         if active is None:
             return False
         tid, index = active
+        for sub_index, _, _ in companions:
+            self.server.drop(self._key(tid, sub_index))
+            try:
+                self.engine.close_stream(tid, sub_index)
+            except Exception as exc:
+                log.warning("stream: поток субтитров не закрылся: %r", exc)
         self.server.drop(self._key(tid, index))
         try:
             self.engine.close_stream(tid, index)
@@ -454,4 +536,5 @@ class StreamService:
         """Закрытие окна: сначала сервис, потом engine.shutdown()."""
         with self._lock:
             self._active = None
+            self._companions = []
         return self.server.shutdown(timeout)

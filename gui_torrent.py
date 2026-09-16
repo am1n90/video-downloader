@@ -718,7 +718,9 @@ class TorrentPage(TransparentScrollArea):
         except Exception as exc:
             self._notify("warning", f"Не удалось начать просмотр: {exc}")
             return False
-        started = self._launch(url, os.path.basename(target.path), url=url)
+        subtitles = self.stream().subtitles
+        started = self._launch(url, os.path.basename(target.path), url=url,
+                               subtitles=subtitles)
         if started:
             self._begin_prepare(url)
         elif not self._player_offered:
@@ -815,7 +817,7 @@ class TorrentPage(TransparentScrollArea):
         path = os.path.join(item.save_path, *parts)
         return path if os.path.isfile(path) else ""
 
-    def _launch(self, target, name, url=""):
+    def _launch(self, target, name, url="", subtitles=()):
         """Запуск плеера. Процесс не ждём и при закрытии окна не убиваем."""
         self._player_offered = False
         configured = self.settings.get("torrent_player", "")
@@ -824,14 +826,20 @@ class TorrentPage(TransparentScrollArea):
         except player.PlayerNotFound as exc:
             self._offer_link(str(exc), url)
             return False
+        urls = [sub_url for _, sub_url in subtitles]
         try:
-            self._player_proc = player.launch(target, exe)
+            self._player_proc = player.launch(target, exe, subtitles=urls)
         except OSError as exc:
             self._notify("warning", f"Плеер не запустился: {exc}")
             return False
-        self._notify("success",
-                     f"Открываем «{name}» в {player.label_for(exe)}. "
-                     f"Первый кадр появится через несколько секунд.")
+        text = (f"Открываем «{name}» в {player.label_for(exe)}. "
+                f"Первый кадр появится через несколько секунд.")
+        if urls:
+            shown = len(player.subtitle_args(exe, urls))
+            if shown:
+                text += (f" Подключаем субтитры: "
+                         f"{', '.join(n for n, _ in subtitles[:shown])}.")
+        self._notify("success", text)
         return True
 
     def _offer_link(self, reason, url):

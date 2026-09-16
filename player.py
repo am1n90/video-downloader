@@ -126,7 +126,26 @@ def label_for(path):
     return os.path.basename(path or "")
 
 
-def launch(target, exe):
+def subtitle_args(exe, urls):
+    """Ключи плеера для внешних субтитров (сессия 2.3).
+
+    У mpv ключ повторяемый — сколько дорожек дали, столько и подключит.
+    VLC берёт только ОДИН файл субтитров (--sub-file), поэтому отдаём
+    первый; остальные пользователь при желании добавит сам. Незнакомому
+    плееру не передаём ничего: чужие ключи скорее помешают открыть
+    видео, чем помогут.
+    """
+    if not urls:
+        return []
+    label = label_for(exe)
+    if label == "mpv":
+        return [f"--sub-file={url}" for url in urls]
+    if label == "VLC":
+        return [f"--sub-file={urls[0]}"]
+    return []
+
+
+def launch(target, exe, subtitles=()):
     """Открыть URL или файл в найденном плеере (см. resolve).
 
     Процесс не ждём и не убиваем: плеер живёт своей жизнью, при закрытии
@@ -134,7 +153,8 @@ def launch(target, exe):
     процесс), просто оборвётся соединение с нашим сервером.
     """
     flags = _CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    return subprocess.Popen([exe, target], close_fds=True,
+    args = [exe, target] + subtitle_args(exe, list(subtitles))
+    return subprocess.Popen(args, close_fds=True,
                             creationflags=flags,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,

@@ -15,6 +15,7 @@
 Сессия 2.2 добавила сценарий 9: диалог «что смотреть» для раздачи с
 несколькими видеофайлами и индикатор подготовки плеера.
 """
+import collections
 import dataclasses
 import hashlib
 import os
@@ -426,7 +427,9 @@ def fake_resolve(configured=""):
 
 
 gui_torrent.player.resolve = fake_resolve
-gui_torrent.player.launch = lambda target, exe: LAUNCHED.append((target, exe))
+gui_torrent.player.launch = (
+    lambda target, exe, subtitles=():
+    LAUNCHED.append((target, exe, tuple(subtitles))))
 
 # В раздаче два видеофайла, и с 2.2 «Смотреть» спрашивает, какой из них
 # открыть. Здесь отвечаем за пользователя тем же файлом, что выбирался
@@ -451,7 +454,7 @@ item1 = page1.engine.get(IH)
 check("7 can_watch у докачанной раздачи с видео", page1.can_watch(item1))
 check("7 «Смотреть» скачанного файла запускает плеер",
       page1.watch(IH) and len(LAUNCHED) == 1, str(LAUNCHED))
-target, exe = LAUNCHED[-1]
+target, exe, _subs = LAUNCHED[-1]
 check("7 у скачанного файла открывается САМ ФАЙЛ, а не http",
       target == os.path.join(save1, VIDEO_REL) and exe == FAKE_PLAYER, target)
 check("7 сервер для скачанного файла не поднимался",
@@ -774,6 +777,64 @@ check("9 остановка просмотра гасит индикатор",
       page9.stop_watch() and page9.watch_status(IH) == ""
       and not page9._prepare_timer.isActive())
 seed.h.set_upload_limit(0)
+
+# ---- 10. Сериал: вложенные папки в диалоге «Что смотреть» (2.3) ----
+# В 2.2 диалог проверялся на плоской раздаче из двух файлов. Сериал с
+# сезонами по папкам строит дерево другой глубины, и предвыбор «самый
+# большой файл» там означает произвольную серию — важно, что выбрать
+# можно ЛЮБУЮ, включая лежащую глубоко.
+import types as _types
+
+_SeriesFile = collections.namedtuple("File", "index path size priority")
+_series = []
+for _season in (1, 2):
+    for _ep in range(1, 6):
+        _series.append(os.path.join("Сериал", f"Сезон {_season}",
+                                    f"S0{_season}E0{_ep}.mkv"))
+        _series.append(os.path.join("Сериал", f"Сезон {_season}",
+                                    f"S0{_season}E0{_ep}.srt"))
+_series.append(os.path.join("Сериал", "обложка.jpg"))
+_files10 = []
+for _i, _path in enumerate(_series):
+    _video = _path.endswith(".mkv")
+    # Самая большая серия лежит В СЕРЕДИНЕ списка нарочно: так проверка
+    # предвыбора отличает «взяли самый большой файл» от «взяли последний»
+    _size = (300 + _i) * 1024 * 1024 if _video else 40 * 1024
+    if _path.endswith("S01E03.mkv"):
+        _size = 900 * 1024 * 1024
+    _files10.append(_SeriesFile(_i, _path, _size, 4))
+item10 = _types.SimpleNamespace(id="ee" * 20, files=tuple(_files10))
+targets10 = gui_torrent.ts.watchable_files(item10.files)
+# Родитель обязателен: MessageBoxBase qfluentwidgets берёт у него
+# размеры прямо в конструкторе
+dlg10 = gui_torrent.WatchFileDialog(item10, targets10, [], page9)
+
+root10 = dlg10.tree.invisibleRootItem()
+serial = root10.child(0)
+seasons = [serial.child(i) for i in range(serial.childCount())]
+names10 = [s.text(0) for s in seasons]
+check("10 сериал: корневая папка одна, внутри два сезона и обложка",
+      root10.childCount() == 1 and names10 == ["Сезон 1", "Сезон 2",
+                                               "обложка.jpg"],
+      f"{root10.childCount()} / {names10}")
+check("10 в сезоне видно и серии, и субтитры",
+      seasons[0].childCount() == 10,
+      str(seasons[0].childCount()))
+check("10 предвыбрана самая большая серия",
+      dlg10._current_file() is not None
+      and os.path.basename(dlg10._current_file().path) == "S01E03.mkv",
+      str(dlg10._current_file() and dlg10._current_file().path))
+_first = next(f for f in targets10
+              if os.path.basename(f.path) == "S01E01.mkv")
+check("10 выбирается серия из вложенной папки, а не только предвыбор",
+      dlg10.select(_first.index)
+      and dlg10._current_file().index == _first.index,
+      str(dlg10._current_file().path))
+_sub = next(f for f in item10.files if f.path.endswith("S01E01.srt"))
+check("10 субтитры и обложку выбрать нельзя",
+      _sub.index not in dlg10._nodes
+      and not dlg10.select(_sub.index), "")
+dlg10.deleteLater()
 
 # ---- завершение: не оставить работающих потоков ----
 for page, engine in PAGES:
