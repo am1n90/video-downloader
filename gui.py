@@ -2144,6 +2144,7 @@ class SettingsPage(TransparentScrollArea):
     themeChanged = Signal(str)
     folderChanged = Signal(str)
     maxConcurrentChanged = Signal(int)
+    seedAfterDownloadChanged = Signal(bool)
 
     def __init__(self, settings, bridge=None, parent=None):
         super().__init__(parent)
@@ -2177,7 +2178,8 @@ class SettingsPage(TransparentScrollArea):
         self.vbox.addWidget(group2)
 
         group3 = SettingCardGroup("Torrent", self)
-        group3.addSettingCard(self._torrent_placeholder_card(inner))
+        for card in self._torrent_cards(inner):
+            group3.addSettingCard(card)
         self.vbox.addWidget(group3)
 
         self.vbox.addStretch(1)
@@ -2217,12 +2219,74 @@ class SettingsPage(TransparentScrollArea):
 
         return cards
 
-    def _torrent_placeholder_card(self, parent):
-        return SettingCard(
-            FIF.CLOUD_DOWNLOAD, "Раздел в разработке",
-            "Папка загрузок, раздача после скачивания и порт появятся "
-            "вместе с режимом Torrent", parent,
+    def _torrent_cards(self, parent):
+        cards = []
+
+        folder_card = SettingCard(
+            FIF.FOLDER, "Папка раздач", "Куда скачивать торренты", parent,
         )
+        self.torrent_folder_edit = EditableComboBox(folder_card)
+        self.torrent_folder_edit.addItems([self.settings["torrent_folder"]])
+        self.torrent_folder_edit.setCurrentText(self.settings["torrent_folder"])
+        self.torrent_folder_edit.setMinimumWidth(260)
+        self.torrent_folder_edit.currentTextChanged.connect(
+            lambda text: self.settings.__setitem__("torrent_folder", text)
+        )
+        folder_card.hBoxLayout.addWidget(self.torrent_folder_edit)
+        folder_card.hBoxLayout.addSpacing(SP_GROUP)
+        browse = PushButton("Обзор…", folder_card)
+        browse.clicked.connect(self._browse_torrent_folder)
+        folder_card.hBoxLayout.addWidget(browse)
+        folder_card.hBoxLayout.addSpacing(SP_GROUP)
+        cards.append(folder_card)
+
+        # Раздача после скачивания включена по умолчанию (решение №4)
+        seed_card = SettingCard(
+            FIF.SHARE, "Раздавать после скачивания",
+            "Отдавать скачанное другим участникам раздачи", parent,
+        )
+        self.seed_check = CheckBox(seed_card)
+        self.seed_check.setChecked(
+            bool(self.settings.get("torrent_seed_after_download", True)))
+        self.seed_check.stateChanged.connect(
+            lambda state: self.settings.__setitem__(
+                "torrent_seed_after_download", bool(state)
+            )
+        )
+        self.seed_check.stateChanged.connect(
+            lambda state: self.seedAfterDownloadChanged.emit(bool(state))
+        )
+        seed_card.hBoxLayout.addWidget(self.seed_check)
+        seed_card.hBoxLayout.addSpacing(SP_GROUP)
+        cards.append(seed_card)
+
+        # Порт задаётся при создании сессии libtorrent, поэтому меняется
+        # только с перезапуском; 0 — libtorrent выберет свободный сам
+        port_card = SettingCard(
+            FIF.WIFI if hasattr(FIF, "WIFI") else FIF.SETTING,
+            "Порт", "0 — выбрать автоматически; применяется после "
+            "перезапуска приложения", parent,
+        )
+        self.torrent_port_spin = SpinBox(port_card)
+        self.torrent_port_spin.setRange(0, 65535)
+        self.torrent_port_spin.setValue(int(self.settings.get("torrent_port", 0)))
+        self.torrent_port_spin.valueChanged.connect(
+            lambda v: self.settings.__setitem__("torrent_port", int(v))
+        )
+        port_card.hBoxLayout.addWidget(self.torrent_port_spin)
+        port_card.hBoxLayout.addSpacing(SP_GROUP)
+        cards.append(port_card)
+
+        return cards
+
+    def _browse_torrent_folder(self):
+        from PySide6.QtWidgets import QFileDialog
+        path = QFileDialog.getExistingDirectory(
+            self, "Папка для раздач", self.settings["torrent_folder"]
+        )
+        if path:
+            self.torrent_folder_edit.setCurrentText(path)
+            self.settings["torrent_folder"] = path
 
     def _theme_card(self, parent):
         card = SettingCard(
@@ -2487,10 +2551,29 @@ class MainWindow(FluentWindow):
         self.settings_page = SettingsPage(self.settings, self.bridge, self)
         self.settings_page.setObjectName("settingsInterface")
 
-        # Режим «Torrent» (1.1: только каркас — страницы-заглушки).
-        # Импорт здесь, а не вверху: gui_torrent сам импортирует gui.
+        # Режим «Torrent» (1.3: страница очереди поверх движка).
+        # Импорт здесь, а не вверху: gui_torrent сам импортирует gui
+        # (а заодно не тянем libtorrent, пока окно не создаётся).
         import gui_torrent
-        self.torrent_page = gui_torrent.TorrentPage(self)
+        import torrent_engine
+
+        # Один движок на приложение, рядом с DownloadManager. Колбэки
+        # приходят из фонового потока — в GUI только через Bridge.
+        # start() здесь НЕ зовём: сессия libtorrent занимает порт и
+        # вызывает запрос брандмауэра — движок поднимает сама страница
+        # при первом показе (TorrentPage.showEvent).
+        self.torrent_bridge = Bridge()
+        port = int(self.settings.get("torrent_port") or 0)
+        self.torrent_engine = torrent_engine.TorrentEngine(
+            on_change=lambda item: self.torrent_bridge.itemChanged.emit(item),
+            on_list_change=lambda: self.torrent_bridge.queueChanged.emit(),
+            seed_after_download=bool(
+                self.settings.get("torrent_seed_after_download", True)),
+            listen_interfaces=f"0.0.0.0:{port}" if port else None,
+        )
+        self.torrent_page = gui_torrent.TorrentPage(
+            self.torrent_engine, self.torrent_bridge, self.settings, self
+        )
         self.torrent_page.setObjectName("torrentInterface")
         self.torrent_library_page = gui_torrent.TorrentLibraryPage(self)
         self.torrent_library_page.setObjectName("torrentLibraryInterface")
@@ -2523,6 +2606,10 @@ class MainWindow(FluentWindow):
         # Число одновременных загрузок применяется к живому менеджеру сразу
         self.settings_page.maxConcurrentChanged.connect(
             self.manager.set_max_concurrent
+        )
+        # Раздача после скачивания — к живому движку сразу
+        self.settings_page.seedAfterDownloadChanged.connect(
+            self.torrent_engine.set_seed_after_download
         )
 
         # Запись завершённых загрузок в историю
@@ -2792,6 +2879,12 @@ class MainWindow(FluentWindow):
         # дольше карточек — останавливаем их явно
         try:
             self.library_page.stop_workers()
+        except Exception:
+            pass
+        # Торрент-движок: сброс кэша на диск + fastresume. Фактически
+        # 0.26-0.38 с, дольше окно не держим (замер сессии 1.2).
+        try:
+            self.torrent_engine.shutdown(timeout=3.0)
         except Exception:
             pass
         self.settings["window_geometry"] = (
