@@ -28,7 +28,17 @@ if __name__ == "__main__":
         import gui as _gui
         import config as _config
 
-        window = _gui.MainWindow(_config.load())
+        # Режим приложения принудительно «video»: config.load() читает
+        # НАСТОЯЩИЕ настройки, и если владелец оставил приложение в режиме
+        # Torrent, показ окна поднял бы сессию libtorrent (TorrentPage.
+        # showEvent). Посреди автоматической сборки это лишний модальный
+        # запрос брандмауэра, а пока он открыт, Windows заводит два правила
+        # Inbound Block для python.exe, которые снимает только админ
+        # (находка Этапа 0.1). Упаковку libtorrent selftest проверяет и так:
+        # MainWindow создаёт TorrentEngine, то есть .pyd загружается.
+        _settings = _config.load()
+        _settings["app_mode"] = "video"
+        window = _gui.MainWindow(_settings)
         window.show()
 
         result = {"ok": False}
