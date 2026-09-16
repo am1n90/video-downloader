@@ -120,6 +120,17 @@ def same_as_source(save_path, rel):
     return os.path.isfile(got) and sha(got) == sha(os.path.join(SRC_ROOT, rel))
 
 
+def wait_same_as_source(save_path, rel, timeout=15):
+    """Сверка с источником через опрос: «seeding» libtorrent означает, что
+    все куски ПРОВЕРЕНЫ, а не что они уже дописаны на диск (запись идёт
+    отдельными потоками; по той же причине shutdown() сбрасывает кэш перед
+    fastresume). Мгновенная сверка ловила хвост последнего куска: на машине
+    с 32 ядрами дисковых потоков больше и окно шире — 16.09.2026 около
+    половины прогонов падали в проверках 1/3/5/6 (файлы догонялись за доли
+    секунды). Для проверки «файл НЕ скачан» нужен same_as_source без опроса."""
+    return wait_for(lambda: same_as_source(save_path, rel), timeout)
+
+
 # min_reconnect_time только в тесте: после разрыва (пауза; обе стороны стали
 # раздающими) libtorrent ждёт 60 с перед повторным подключением к ТОМУ ЖЕ
 # пиру. У теста пир один и нет трекеров/DHT — пауза и set_files упирались
@@ -193,7 +204,7 @@ item = eng.get(tid)
 check("1 скачано и раздаётся (раздача после скачивания по умолчанию)",
       ok and item.progress >= 1.0, f"{item.state} {item.progress:.3f}")
 check("1 все файлы совпадают с источником",
-      all(same_as_source(save1, rel) for rel in FILE_ORDER))
+      all(wait_same_as_source(save1, rel) for rel in FILE_ORDER))
 check("1 fastresume записан",
       wait_for(lambda: os.path.isfile(eng._resume_path(tid)), 5))
 check("1 колбэк on_change получил состояние seeding",
@@ -217,7 +228,8 @@ ok = wait_for(lambda: state(eng3, tid3) == te.STATE_SEEDING, 30)
 item3 = eng3.get(tid3)
 first_size = SIZES[os.path.basename(first)]
 check("3 выбран один файл: скачан только он",
-      ok and same_as_source(save3, first) and not same_as_source(save3, second),
+      ok and wait_same_as_source(save3, first)
+      and not same_as_source(save3, second),
       item3.state)
 check("3 selected_size = размер выбранного файла; wanted_size — по целым кускам",
       item3.selected_size == first_size
@@ -267,7 +279,7 @@ check("5 после продолжения — снова downloading",
 seed.limit(0)
 ok = wait_for(lambda: state(eng5, tid5) == te.STATE_SEEDING, 40)
 check("5 докачано, файлы совпадают",
-      ok and all(same_as_source(save5, rel) for rel in FILE_ORDER))
+      ok and all(wait_same_as_source(save5, rel) for rel in FILE_ORDER))
 
 # ---- 6: перезапуск через fastresume ----
 seed.limit(int(1.5 * MB))
@@ -310,7 +322,7 @@ eng6c.start()
 tid6c = eng6c.add_magnet(magnet(), save6)
 ok = wait_for(lambda: state(eng6c, tid6c) == te.STATE_SEEDING, 40)
 check("6 докачка тех же файлов после перезапуска — совпадают с источником",
-      ok and all(same_as_source(save6, rel) for rel in FILE_ORDER))
+      ok and all(wait_same_as_source(save6, rel) for rel in FILE_ORDER))
 
 # ---- 7: magnet без пиров ----
 eng7, _ = engine("s7")
@@ -363,7 +375,19 @@ k32.CloseHandle(lock)
 eng9.retry(tid9)
 ok = wait_for(lambda: state(eng9, tid9) == te.STATE_SEEDING, 40)
 check("9 после освобождения retry() докачивает, файлы совпадают",
-      ok and all(same_as_source(save9, rel) for rel in FILE_ORDER), state(eng9, tid9))
+      ok and all(wait_same_as_source(save9, rel) for rel in FILE_ORDER),
+      state(eng9, tid9))
+# file_error_alert приходит пачкой (16-19 на один занятый файл) и часть
+# разбирается уже ПОСЛЕ retry(): сохранённый текст сам по себе не должен
+# держать состояние error, иначе докачанная раздача навсегда остаётся
+# «сломанной» (реально ловилось на 32 ядрах, 16.09.2026). Признак ошибки —
+# upload_mode у libtorrent, а не наличие текста.
+with eng9._lock:
+    eng9._errors[tid9] = ("file_open (отголосок уже исправленной)", first)
+echo = eng9.get(tid9)
+check("9 просроченный file_error после retry() не возвращает в error",
+      echo.state == te.STATE_SEEDING and not echo.error,
+      f"{echo.state}: {echo.error[:40]}")
 
 # ---- 10: битый fastresume не ломает старт ----
 bad_dir = os.path.join(BASE, "данные", "s10", "resume")

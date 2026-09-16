@@ -12,7 +12,9 @@ API — по образцу downloader.DownloadManager. Колбэки вызы�
   - alert.message() может бросить UnicodeDecodeError — _alert_text();
   - занятый файл: file_error_alert, раздача молча уходит в upload_mode и
     сама повторит только через 10 минут — состояние «error» с файлом,
-    retry() снимает upload_mode;
+    retry() снимает upload_mode; состояние «error» держится, пока флаг
+    стоит у libtorrent (_error_is_live), а не по сохранённому тексту:
+    алерты приходят пачкой и «догоняют» уже сделанный retry();
   - частичный выбор файлов оставляет .<infohash>.parts — remove() с
     удалением файлов убирает и его;
   - закрытие сессии с трекерами до 5 с — stop_tracker_timeout,
@@ -263,7 +265,7 @@ class TorrentEngine:
             handles = list(self._handles.items())
         for tid, handle in handles:
             st = handle.status()
-            if st.is_finished and st.has_metadata and not self._errors.get(tid):
+            if st.is_finished and st.has_metadata and not self._error_is_live(st):
                 if enabled:
                     self._resume_handle(handle)
                 else:
@@ -564,13 +566,34 @@ class TorrentEngine:
             self._files[tid] = files
         return files
 
+    @staticmethod
+    def _error_is_live(st):
+        """Держит ли ошибку сам libtorrent прямо сейчас.
+
+        На дисковой ошибке errc пустой, а раздача молча припаркована в
+        upload_mode (находка 2 Этапа 0.2) — этот флаг и есть признак
+        «стоит из-за ошибки». Состояние нельзя строить на одном лишь
+        сохранённом тексте: file_error_alert приходит пачкой (16-19 штук
+        на один занятый файл), и те, что разобраны уже ПОСЛЕ retry(),
+        взводили состояние заново — навсегда, снять его было некому
+        (раздача при этом спокойно докачивалась и раздавалась)."""
+        errc = getattr(st, "errc", None)
+        if errc is not None and errc.value():
+            return True
+        return bool(int(getattr(st, "flags", 0))
+                    & int(lt.torrent_flags.upload_mode))
+
     def _snapshot(self, tid, handle, st=None):
         st = st or handle.status()
         with self._lock:
             error, error_file = self._errors.get(tid, ("", ""))
-        errc = getattr(st, "errc", None)
-        if not error and errc is not None and errc.value():
-            error = errc.message()
+        if self._error_is_live(st):
+            if not error:
+                errc = getattr(st, "errc", None)
+                error = (errc.message() if errc is not None and errc.value()
+                         else "раздача остановлена из-за ошибки файла")
+        else:
+            error = error_file = ""      # текст — отголосок исправленной
         raw = str(st.state)
         if error:
             state = STATE_ERROR
