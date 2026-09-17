@@ -639,6 +639,101 @@ check("11 shutdown во время просмотра: в бюджете и fast
       f"{result12}, чтение завершилось={holder2.get('done')}")
 seed.limit(0)
 
+# ---- 12: focus_file — качаем только то, что смотрят (2.5) ----
+# Замер 17.09.2026 на сериале из 5 серий: «Смотреть» поднимал лишь куски
+# окна просмотра, а качались ВСЕ серии сразу (серия 2 дошла до 100%
+# раньше, чем досмотрели серию 3). Правило владельца: остальным — 0,
+# кроме заказанных галочками в диалоге «Файлы».
+seed.limit(200 * 1024)
+eng12b, _ = engine("s12b")
+ENGINES.append(eng12b)
+eng12b.start()
+save12b = os.path.join(BASE, "Загрузки с пробелом", "s12b")
+tid12b = eng12b.add_torrent_file(TORRENT, save12b,
+                                 peers=[("127.0.0.1", seed.port)])
+wait_for(lambda: eng12b.get(tid12b).has_metadata, 20)
+I_BIG = FILE_ORDER.index("Тестовая раздача\видео 1.bin")
+I_SMALL = FILE_ORDER.index("Тестовая раздача\видео 2.bin")
+I_TXT = FILE_ORDER.index("Тестовая раздача\описание.txt")
+
+
+def prios12():
+    return [int(p) for p in eng12b._handles[tid12b].get_file_priorities()]
+
+
+check("12 по умолчанию качаются ВСЕ файлы раздачи",
+      prios12() == [4] * len(FILE_ORDER), str(prios12()))
+
+changed = eng12b.focus_file(tid12b, I_SMALL)
+applied = wait_for(lambda: prios12()[I_BIG] == 0, 5)   # prioritize_files асинхронный
+check("12 focus_file: приоритет остался только у выбранного файла",
+      changed and applied and prios12()[I_SMALL] == te.STREAM_PRIORITY
+      and all(p == 0 for i, p in enumerate(prios12()) if i != I_SMALL),
+      str(prios12()))
+check("12 повторный focus_file на тот же файл ничего не меняет",
+      eng12b.focus_file(tid12b, I_SMALL) is False)
+check("12 снимок для GUI показывает те же приоритеты",
+      [f.priority for f in eng12b.get(tid12b).files] == prios12(),
+      str([f.priority for f in eng12b.get(tid12b).files]))
+
+# Файл с открытым потоком (так приходят субтитры-спутники) не занижаем
+eng12b.set_files(tid12b, [4] * len(FILE_ORDER))
+wait_for(lambda: prios12() == [4] * len(FILE_ORDER), 5)
+stream12 = eng12b.open_stream(tid12b, I_BIG)
+eng12b.focus_file(tid12b, I_SMALL)
+wait_for(lambda: prios12()[I_TXT] == 0, 5)
+check("12 файл с открытым потоком (субтитры) сохраняет приоритет",
+      prios12()[I_BIG] > 0 and prios12()[I_SMALL] == te.STREAM_PRIORITY
+      and prios12()[I_TXT] == 0, str(prios12()))
+eng12b.close_stream(tid12b)
+
+# Явный заказ: снятая галочка в диалоге «Файлы» переживает просмотр
+order = [4] * len(FILE_ORDER)
+order[I_TXT] = 0
+eng12b.set_files(tid12b, order)
+wait_for(lambda: prios12()[I_TXT] == 0, 5)
+check("12 снятая галочка запомнена как явный заказ",
+      eng12b._chosen.get(tid12b) == frozenset({I_BIG, I_SMALL})
+      and os.path.isfile(eng12b._chosen_path(tid12b)),
+      str(eng12b._chosen.get(tid12b)))
+eng12b.focus_file(tid12b, I_SMALL)
+wait_for(lambda: prios12()[I_SMALL] == te.STREAM_PRIORITY, 5)
+check("12 заказанный галочкой файл focus_file не занижает",
+      prios12()[I_BIG] == 4 and prios12()[I_TXT] == 0, str(prios12()))
+
+# «Применить» без единой снятой галочки заказом не считается
+eng12b.set_files(tid12b, [4] * len(FILE_ORDER))
+check("12 «Применить» со всеми галочками заказ отменяет",
+      tid12b not in eng12b._chosen
+      and not os.path.exists(eng12b._chosen_path(tid12b)))
+wait_for(lambda: prios12() == [4] * len(FILE_ORDER), 5)
+eng12b.focus_file(tid12b, I_SMALL)
+applied = wait_for(lambda: prios12()[I_BIG] == 0, 5)
+check("12 после отмены заказа просмотр снова занижает всё остальное",
+      applied and prios12()[I_SMALL] == te.STREAM_PRIORITY, str(prios12()))
+
+# Заказ должен пережить перезапуск программы: libtorrent его не хранит
+eng12b.set_files(tid12b, order)
+wait_for(lambda: prios12()[I_TXT] == 0, 5)
+eng12b.shutdown(timeout=3.0)
+ENGINES.remove(eng12b)
+eng12c, _ = engine("s12b")
+ENGINES.append(eng12c)
+eng12c.start()
+check("12 явный заказ восстановлен из <id>.chosen после перезапуска",
+      eng12c._chosen.get(tid12b) == frozenset({I_BIG, I_SMALL}),
+      str(eng12c._chosen.get(tid12b)))
+wait_for(lambda: eng12c.get(tid12b) is not None
+         and eng12c.get(tid12b).has_metadata, 20)
+eng12c.focus_file(tid12b, I_SMALL)
+after12 = [int(p) for p in eng12c._handles[tid12b].get_file_priorities()]
+check("12 после перезапуска заказ по-прежнему бережётся",
+      after12[I_BIG] == 4 and after12[I_TXT] == 0, str(after12))
+eng12c.remove(tid12b)
+check("12 удаление раздачи убирает и файл заказа",
+      not os.path.exists(eng12c._chosen_path(tid12b)))
+seed.limit(0)
+
 # ---- завершение ----
 for eng_ in ENGINES:
     try:

@@ -696,6 +696,9 @@ class TorrentPage(TransparentScrollArea):
         фильма); два и более (сериал) — спрашиваем диалогом (2.2).
         Скачанный целиком файл открываем напрямую: HTTP-сервер и кэш
         кусков для него не нужны.
+
+        С 2.5 выбор серии здесь ещё и переключает на неё закачку
+        (engine.focus_file): раньше у сериала качались все серии сразу.
         """
         item = self.engine.get(tid)
         if item is None:
@@ -712,12 +715,16 @@ class TorrentPage(TransparentScrollArea):
                 return False
         local = self.local_path(item, target)
         if local:
+            self._focus(tid, target.index)
             return self._launch(local, os.path.basename(local), url="")
         try:
             url = self.stream().watch(tid, target.index)
         except Exception as exc:
             self._notify("warning", f"Не удалось начать просмотр: {exc}")
             return False
+        # ПОСЛЕ watch: он поднимает и потоки субтитров-спутников, а
+        # focus_file бережёт файлы именно с открытым потоком
+        self._focus(tid, target.index)
         subtitles = self.stream().subtitles
         started = self._launch(url, os.path.basename(target.path), url=url,
                                subtitles=subtitles)
@@ -727,6 +734,14 @@ class TorrentPage(TransparentScrollArea):
             self.stop_watch()        # плеер не запустился — поток не нужен
         self.refresh()
         return started
+
+    def _focus(self, tid, index):
+        """Качать только выбранную серию (2.5). Не вышло — не беда:
+        просмотр важнее, раздача просто продолжит качаться целиком."""
+        try:
+            self.engine.focus_file(tid, index)
+        except Exception as exc:
+            te.log.warning("focus_file %s#%s: %r", tid, index, exc)
 
     def stop_watch(self):
         if self._stream is None or not self._stream.stop():

@@ -836,6 +836,80 @@ check("10 субтитры и обложку выбрать нельзя",
       and not dlg10.select(_sub.index), "")
 dlg10.deleteLater()
 
+# ---- 11. «Смотреть» переключает закачку на выбранную серию (2.5) ----
+# До 2.5 у сериала качались ВСЕ серии сразу: выбор в диалоге поднимал
+# только куски окна просмотра. Теперь выбор — это ещё и «качай её».
+seed.h.set_upload_limit(96 * 1024)
+# Раздачи предыдущих страниц всё ещё качаются и делят с нами эти 96 КБ/с
+# втроём: на последнем сценарии метаданных иногда не было и за 30 с.
+# Проверки тех страниц уже сделаны — ставим их на паузу.
+for _page, _eng in list(PAGES):
+    try:
+        _eng.pause(IH)
+    except Exception:
+        pass
+page11, eng11, save11 = make_page("s11")
+page11.show()
+pump(0.3)
+page11.magnet_edit.setText(magnet())
+page11.add_magnet()
+started11 = wait_until(lambda: (page11.engine.get(IH) is not None)
+                       and page11.engine.get(IH).has_metadata
+                       and page11.engine.get(IH).progress < 1.0, 30)
+check("11 раздача добавлена и ещё качается", started11)
+
+
+def prios11():
+    return [f.priority for f in page11.engine.get(IH).files]
+
+
+check("11 до «Смотреть» качаются все файлы раздачи",
+      prios11() == [4] * len(FILE_ORDER), str(prios11()))
+
+# Выбираем НЕ предвыбранный (не самый большой) файл — как серию 3 у сериала
+OTHER_INDEX = next(i for i, p in enumerate(FILE_ORDER)
+                   if os.path.basename(p) == "видео 2.mp4")
+gui_torrent.TorrentPage.ask_watch_file = (
+    lambda self, item, targets: next(f for f in targets
+                                     if f.index == OTHER_INDEX))
+LAUNCHED.clear()
+check("11 «Смотреть» на второй серии запустил просмотр именно её",
+      page11.watch(IH) and page11._stream.active == (IH, OTHER_INDEX),
+      str(page11._stream.active))
+applied11 = wait_until(lambda: prios11()[VIDEO_INDEX] == 0, 10)
+check("11 остальные файлы раздачи сняты с закачки",
+      applied11 and prios11()[OTHER_INDEX] == te.STREAM_PRIORITY
+      and all(p == 0 for i, p in enumerate(prios11()) if i != OTHER_INDEX),
+      str(prios11()))
+
+# Главное последствие: в диалоге должны остаться ВСЕ серии, иначе
+# следующую уже не выбрать — «Смотреть» молча открывал бы ту же самую
+targets11 = ts.watchable_files(page11.engine.get(IH).files)
+check("11 в диалоге «Что смотреть» по-прежнему все серии",
+      [f.index for f in targets11] == [VIDEO_INDEX, OTHER_INDEX],
+      str([os.path.basename(f.path) for f in targets11]))
+
+# Досмотрели одну, включаем другую — закачка переезжает на неё
+gui_torrent.TorrentPage.ask_watch_file = (
+    lambda self, item, targets: next(f for f in targets
+                                     if f.index == VIDEO_INDEX))
+page11.stop_watch()
+LAUNCHED.clear()
+check("11 «Смотреть» на первой серии переключил просмотр",
+      page11.watch(IH) and page11._stream.active == (IH, VIDEO_INDEX),
+      str(page11._stream.active))
+applied11b = wait_until(lambda: prios11()[OTHER_INDEX] == 0, 10)
+check("11 теперь качается она, а прежняя снята",
+      applied11b and prios11()[VIDEO_INDEX] == te.STREAM_PRIORITY,
+      str(prios11()))
+page11.stop_watch()
+
+# Вернуть всё сразу можно диалогом «Файлы» — там галочки и стоят
+page11.ask_files = lambda item: [gui_torrent.PRIORITY_ON] * len(FILE_ORDER)
+page11.choose_files(IH)
+check("11 диалог «Файлы» возвращает закачку всей раздачи",
+      wait_until(lambda: prios11() == [4] * len(FILE_ORDER), 10), str(prios11()))
+
 # ---- завершение: не оставить работающих потоков ----
 for page, engine in PAGES:
     page.close()

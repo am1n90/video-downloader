@@ -6,7 +6,7 @@ API — по образцу downloader.DownloadManager. Колбэки вызы�
     on_list_change()   — изменился состав списка раздач
 
 Жизненный цикл: TorrentEngine(...).start() -> add_magnet / add_torrent_file
--> set_files / pause / resume / retry / remove -> shutdown().
+-> set_files / focus_file / pause / resume / retry / remove -> shutdown().
 
 Учтённые находки прототипа (AGENTS.md, «Торрент-стриминг»):
   - alert.message() может бросить UnicodeDecodeError — _alert_text();
@@ -22,7 +22,9 @@ API — по образцу downloader.DownloadManager. Колбэки вызы�
   - шум udp_error/tracker_error (сотни за прогон) — лог с ограничением.
 
 Данные: fastresume каждой раздачи — <data_dir>/resume/<id>.fastresume
-(атомарная запись); по нему раздачи восстанавливаются при start().
+(атомарная запись); по нему раздачи восстанавливаются при start(). Рядом
+<id>.chosen — какие файлы пользователь заказал галочками сам (см.
+set_files): этого libtorrent не хранит, а focus_file обязан их беречь.
 
 С сессии 2.1 движок умеет отдавать файл, пока тот качается
 (open_stream -> TorrentStream): данные ТОЛЬКО через read_piece(), голова
@@ -33,6 +35,7 @@ API — по образцу downloader.DownloadManager. Колбэки вызы�
 import collections
 import dataclasses
 import glob
+import json
 import os
 import sys
 import threading
@@ -53,6 +56,7 @@ STATE_PAUSED = "paused"            # пауза пользователя
 STATE_ERROR = "error"              # ошибка файла/раздачи — см. item.error
 
 RESUME_EXT = ".fastresume"
+CHOSEN_EXT = ".chosen"             # явный заказ файлов (см. set_files)
 SAVE_RESUME_EVERY = 30             # с — периодическое сохранение fastresume
 UPDATE_EVERY = 0.5                 # с — обновление снимков для GUI
 ALERT_LOG_FIRST = 3                # шумные алерты: первые N в лог, затем
@@ -523,6 +527,7 @@ class TorrentEngine:
         self._lock = threading.RLock()
         self._handles = {}          # id -> torrent_handle
         self._files = {}            # id -> tuple(TorrentFile) (после метаданных)
+        self._chosen = {}           # id -> frozenset индексов, заказанных явно
         self._errors = {}           # id -> (текст, файл)
         self._removed = set()       # id удалённых (fastresume не писать)
         self._streams = {}          # (id, индекс файла) -> TorrentStream
@@ -659,10 +664,56 @@ class TorrentEngine:
         return None if handle is None else self._snapshot(tid, handle)
 
     def set_files(self, tid, priorities):
-        """Выбор файлов раздачи: priorities[i] = 0 (не качать) или 1-7."""
+        """Выбор файлов раздачи: priorities[i] = 0 (не качать) или 1-7.
+
+        Снятая хотя бы одна галочка — это ЯВНЫЙ ЗАКАЗ: такие файлы
+        focus_file потом не трогает (решение владельца 17.09.2026).
+        «Применить» со всеми галочками заказом не считается — иначе одно
+        случайное нажатие навсегда вернуло бы закачку всей раздачи при
+        просмотре, а отличить его от умолчания libtorrent (у всех файлов
+        приоритет 4) по самим приоритетам невозможно.
+        """
         handle = self._require(tid)
         if not handle.status().has_metadata:
             raise RuntimeError("метаданные раздачи ещё не получены")
+        priorities = [int(p) for p in priorities]
+        self._set_chosen(tid, priorities)
+        self._apply_priorities(tid, handle, priorities)
+
+    def focus_file(self, tid, index):
+        """Качать ТОЛЬКО то, что смотрят (сессия 2.5).
+
+        До 2.5 «Смотреть» поднимал лишь куски окна просмотра, а сам файл
+        оставался с обычным приоритетом наравне с остальными — у сериала
+        качались ВСЕ серии сразу (замер 17.09.2026: за 30 с просмотра
+        серии 3 серия 2 тоже дошла до 100%). Теперь остальным ставим 0.
+        Не трогаем: заказанные галочками в диалоге «Файлы», файлы с
+        открытым потоком (субтитры-спутники) и сам просматриваемый.
+
+        Возвращает True, если приоритеты действительно поменялись.
+        """
+        handle = self._require(tid)
+        if not handle.status().has_metadata:
+            raise RuntimeError("метаданные раздачи ещё не получены")
+        current = [int(p) for p in handle.get_file_priorities()]
+        if not 0 <= index < len(current):
+            raise IndexError(f"в раздаче {tid} нет файла {index}")
+        with self._lock:
+            keep = set(self._chosen.get(tid, ()))
+        keep.update(stream.index for stream in self._streams_of(tid))
+        priorities = [
+            STREAM_PRIORITY if i == index
+            else (current[i] or STREAM_PRIORITY) if i in keep
+            else 0
+            for i in range(len(current))]
+        if priorities == current:
+            return False
+        self._apply_priorities(tid, handle, priorities)
+        log.info("focus %s#%d: %s -> %s", tid, index, current, priorities)
+        return True
+
+    def _apply_priorities(self, tid, handle, priorities):
+        """Применить приоритеты файлов и починить всё, что от них зависит."""
         handle.prioritize_files(list(priorities))
         with self._lock:
             self._files.pop(tid, None)          # пересобрать с приоритетами
@@ -677,6 +728,43 @@ class TorrentEngine:
                 stream.rearm_head_tail(priorities)
         self._request_save(handle)
         self._emit(tid, handle)
+
+    def _set_chosen(self, tid, priorities):
+        """Запомнить явный заказ файлов (см. set_files).
+
+        Рядом с fastresume, а не в памяти: правило «эти файлы качать
+        всегда» должно пережить перезапуск программы, как и сам выбор.
+        """
+        chosen = frozenset(i for i, p in enumerate(priorities) if p)
+        if len(chosen) == len(priorities):      # галочки не сняты — не заказ
+            chosen = None
+        with self._lock:
+            if chosen is None:
+                self._chosen.pop(tid, None)
+            else:
+                self._chosen[tid] = chosen
+        path = self._chosen_path(tid)
+        try:
+            if chosen is None:
+                os.remove(path)
+            else:
+                _write_atomic(path, json.dumps(sorted(chosen)).encode("ascii"))
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("явный заказ файлов не сохранён %s: %r", tid, exc)
+
+    def _load_chosen(self, tid):
+        """Явный заказ из прошлого запуска; битый файл просто игнорируем."""
+        try:
+            with open(self._chosen_path(tid), "rb") as f:
+                indexes = json.loads(f.read().decode("ascii"))
+            return frozenset(int(i) for i in indexes)
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            log.warning("явный заказ файлов не прочитан %s: %r", tid, exc)
+            return None
 
     def file_progress(self, tid):
         """Скачано байт по каждому файлу (точность до куска)."""
@@ -772,13 +860,15 @@ class TorrentEngine:
             handle = self._handles.pop(tid, None)
             self._files.pop(tid, None)
             self._errors.pop(tid, None)
+            self._chosen.pop(tid, None)
             self._removed.add(tid)
             ses = self._ses
         if handle is None or ses is None:
             return
         save_path = handle.status().save_path
         ses.remove_torrent(handle, lt.session.delete_files if delete_files else 0)
-        for path in (self._resume_path(tid), self._resume_path(tid) + ".tmp"):
+        for path in (self._resume_path(tid), self._resume_path(tid) + ".tmp",
+                     self._chosen_path(tid), self._chosen_path(tid) + ".tmp"):
             try:
                 os.remove(path)
             except OSError:
@@ -833,6 +923,9 @@ class TorrentEngine:
                             os.path.basename(path), exc, corrupt)
                 continue
             self._handles[tid] = handle
+            chosen = self._load_chosen(tid)
+            if chosen is not None:
+                self._chosen[tid] = chosen
             count += 1
         return count
 
@@ -952,6 +1045,9 @@ class TorrentEngine:
 
     def _resume_path(self, tid):
         return os.path.join(self.resume_dir, tid + RESUME_EXT)
+
+    def _chosen_path(self, tid):
+        return os.path.join(self.resume_dir, tid + CHOSEN_EXT)
 
     def _delete_parts_later(self, save_path, tid):
         """libtorrent удаляет файлы асинхронно; .parts может остаться —
