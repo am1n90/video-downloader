@@ -28,6 +28,11 @@ set_files): этого libtorrent не хранит, а focus_file обязан 
 Рядом же <id>.pending — раздача добавлена, но выбор файлов ещё не сделан
 (см. add_magnet(defer=True) и begin_download): такие раздачи не качают
 ничего и ждут ответа пользователя, в том числе после перезапуска.
+Рядом же <id>.watch — ВРЕМЕННАЯ раздача («Посмотреть» в окне
+добавления): качается в свою папку под %TEMP%, после закрытия плеера
+встаёт на паузу, не раздаётся, досмотренный файл удаляется
+(finish_file), а после перезагрузки компьютера раздача удаляется целиком
+(start -> _cleanup_temp). Нет метки — раздача постоянная.
 
 С сессии 2.1 движок умеет отдавать файл, пока тот качается
 (open_stream -> TorrentStream): данные ТОЛЬКО через read_piece(), голова
@@ -36,11 +41,17 @@ set_files): этого libtorrent не хранит, а focus_file обязан 
 """
 
 import collections
+import ctypes
 import dataclasses
+import datetime
 import glob
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -62,6 +73,7 @@ STATE_ERROR = "error"              # ошибка файла/раздачи — 
 RESUME_EXT = ".fastresume"
 CHOSEN_EXT = ".chosen"             # явный заказ файлов (см. set_files)
 PENDING_EXT = ".pending"           # выбор файлов ещё не сделан (см. _add)
+WATCH_EXT = ".watch"               # временная раздача «Посмотреть» (JSON)
 SAVE_RESUME_EVERY = 30             # с — периодическое сохранение fastresume
 UPDATE_EVERY = 0.5                 # с — обновление снимков для GUI
 ALERT_LOG_FIRST = 3                # шумные алерты: первые N в лог, затем
@@ -99,6 +111,94 @@ def default_data_dir():
         return os.path.join(base, "VideoDownloader", "torrents")
     return os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "torrent-data")
+
+
+def default_watch_root():
+    """Корень временных раздач: %TEMP%\\VideoDownloader\\torrent-watch.
+
+    У dev-запуска свой корень: _cleanup_temp удаляет папки, которых не
+    знает его движок, и общий корень dev стирал бы данные установленной
+    копии (и наоборот).
+    """
+    name = "torrent-watch" if getattr(sys, "frozen", False) \
+        else "torrent-watch-dev"
+    return os.path.join(tempfile.gettempdir(), "VideoDownloader", name)
+
+
+_BOOT_QUERY = ("*[System[Provider[@Name='Microsoft-Windows-Kernel-Boot'] "
+               "and (EventID=27)]]")
+_EVENT_RE = re.compile(r"<Event\b.*?</Event>", re.S)
+_TIME_RE = re.compile(r"SystemTime=['\"]([^'\"]+)['\"]")
+_BOOT_TYPE_RE = re.compile(r"<Data Name=['\"]BootType['\"]>(\d+)</Data>")
+
+
+def _parse_event_time(text):
+    """'2026-09-17T20:32:27.7920000Z' -> секунды эпохи (UTC)."""
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z?$", text.strip())
+    if not m:
+        return None
+    moment = datetime.datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+    frac = float(m.group(2) or 0)
+    return moment.replace(tzinfo=datetime.timezone.utc).timestamp() + frac
+
+
+def boot_time_from_events(xml_text):
+    """Время последней НАСТОЯЩЕЙ загрузки по событиям Kernel-Boot 27.
+
+    BootType: 0 — холодный старт, 1 — «быстрый запуск» (так выглядит
+    обычное «Завершение работы» + включение при включённом Fast
+    Startup), 2 — выход из гибернации. Перезагрузкой считаем 0 и 1:
+    данные временных раздач живут до выключения компьютера, а не только
+    до кнопки «Перезагрузка». События идут от новых к старым (/rd:true).
+    """
+    for event in _EVENT_RE.findall(xml_text or ""):
+        kind = _BOOT_TYPE_RE.search(event)
+        moment = _TIME_RE.search(event)
+        if kind is None or moment is None or kind.group(1) not in ("0", "1"):
+            continue
+        return _parse_event_time(moment.group(1))
+    return None
+
+
+def last_boot_time():
+    """Секунды эпохи последней загрузки компьютера (см. _cleanup_temp).
+
+    GetTickCount64 одного мало: при быстром запуске ядро выходит из
+    гибернации и счётчик не сбрасывается (на домашней машине 17.09.2026:
+    LastBootUpTime 16.09 05:32, а после него ещё две загрузки BootType=1).
+    Поэтому берём ПОЗДНЕЕ из двух — журнал ловит быстрый запуск, счётчик
+    страхует, если журнал не прочитался.
+    """
+    found = []
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+        found.append(time.time() - kernel32.GetTickCount64() / 1000.0)
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["wevtutil", "qe", "System", f"/q:{_BOOT_QUERY}", "/rd:true",
+             "/c:20", "/f:xml"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        from_log = boot_time_from_events(
+            out.stdout.decode("utf-8", "replace"))
+        if from_log:
+            found.append(from_log)
+    except Exception as exc:
+        log.warning("журнал загрузок не прочитан: %r", exc)
+    return max(found) if found else None
+
+
+def _inside(root, path):
+    """path лежит внутри root (не сам root)."""
+    try:
+        root = os.path.normcase(os.path.abspath(root))
+        path = os.path.normcase(os.path.abspath(path))
+        return path != root and os.path.commonpath([root, path]) == root
+    except ValueError:                  # разные диски
+        return False
 
 
 def _alert_text(alert):
@@ -180,6 +280,7 @@ class TorrentItem:
     error_file: str = ""
     added_time: int = 0        # с эпохи — когда раздачу добавили (из
                                # fastresume, переживает перезапуск)
+    temp: bool = False         # временная раздача «Посмотреть» (.watch)
 
 
 class TorrentStream:
@@ -508,9 +609,11 @@ class TorrentStream:
 class TorrentEngine:
     def __init__(self, data_dir=None, on_change=None, on_list_change=None,
                  seed_after_download=True, listen_interfaces=None,
-                 extra_settings=None):
+                 extra_settings=None, watch_root=None, boot_time=None):
         self.data_dir = data_dir or default_data_dir()
         self.resume_dir = os.path.join(self.data_dir, "resume")
+        self.watch_root = watch_root or default_watch_root()
+        self._boot_time = boot_time or last_boot_time
         self.on_change = on_change
         self.on_list_change = on_list_change
         self._seed_after_download = bool(seed_after_download)
@@ -536,6 +639,14 @@ class TorrentEngine:
         self._files = {}            # id -> tuple(TorrentFile) (после метаданных)
         self._chosen = {}           # id -> frozenset индексов, заказанных явно
         self._pending = set()       # id, ждущие выбора файлов (см. _add)
+        self._watch = {}            # id -> метка временной раздачи (.watch)
+        self._rechecking = set()    # id под перепроверкой после finish_file
+        self._recheck_queued = set()  # то же, но проверку начнём после
+                                      # проверки fastresume (см. _restore)
+        self._moving = {}           # id -> временная папка, из которой
+                                    # переносим в загрузки (make_permanent)
+        self._cleanups = {}         # папка -> Event отмены отложенной уборки
+        self._after_move = {}       # id -> приоритеты, ждущие конца переноса
         self._errors = {}           # id -> (текст, файл)
         self._removed = set()       # id удалённых (fastresume не писать)
         self._streams = {}          # (id, индекс файла) -> TorrentStream
@@ -565,6 +676,10 @@ class TorrentEngine:
         log.info("engine started, data=%s, restored=%d", self.data_dir, restored)
         if restored:
             self._notify_list()
+        try:
+            self._cleanup_temp()
+        except Exception as exc:        # уборка не должна ронять старт
+            log.warning("уборка временных раздач: %r", exc)
 
     def shutdown(self, timeout=3.0):
         """Сохранить fastresume всех раздач (не дольше timeout) и закрыть
@@ -640,6 +755,8 @@ class TorrentEngine:
         with self._lock:
             handles = list(self._handles.items())
         for tid, handle in handles:
+            if self.is_temp(tid):
+                continue        # временная раздача не раздаёт никогда
             st = handle.status()
             if st.is_finished and st.has_metadata and not self._error_is_live(st):
                 if enabled:
@@ -694,8 +811,14 @@ class TorrentEngine:
         with self._lock:
             return tid in self._pending
 
-    def begin_download(self, tid, priorities=None, focus=None):
+    def begin_download(self, tid, priorities=None, focus=None,
+                       temporary=False):
         """Начать качать отложенную раздачу (сессия 2.6).
+
+        temporary — «Посмотреть» в окне добавления: раздача становится
+        ВРЕМЕННОЙ (метка .watch) и переезжает в свою папку под
+        watch_root, не в папку загрузок. Режим задаётся один раз, при
+        первом ответе: у уже запущенной раздачи флаг ничего не меняет.
 
         priorities — то, что отмечено галочками («Скачать»); focus —
         индекс файла для «Посмотреть». Для просмотра приоритеты галочек
@@ -717,6 +840,20 @@ class TorrentEngine:
         with self._lock:
             was_pending = tid in self._pending
             self._pending.discard(tid)
+        if temporary and was_pending:
+            # До снятия «данных не просить»: иначе первые куски успели бы
+            # лечь в папку загрузок. Проскок magnet-ссылки (куски,
+            # пришедшие вместе с метаданными) move_storage переносит сам
+            path = self.watch_dir(tid)
+            self._claim_dir(path)
+            os.makedirs(path, exist_ok=True)
+            with self._lock:
+                self._watch[tid] = {"temp_dir": path, "positions": {},
+                                    "last_active": time.time()}
+            self._write_watch(tid)
+            if os.path.normcase(os.path.abspath(handle.status().save_path)) \
+                    != os.path.normcase(os.path.abspath(path)):
+                handle.move_storage(path)
         if priorities is not None:
             priorities = [int(p) for p in priorities]
             self._set_chosen(tid, priorities)
@@ -729,9 +866,371 @@ class TorrentEngine:
             self._resume_handle(handle)      # снимаем паузу, если была
         self._request_save(handle)
         self._emit(tid, handle)
-        log.info("begin %s (pending=%s, priorities=%s, focus=%s)",
-                 tid, was_pending, priorities, focus)
+        log.info("begin %s (pending=%s, priorities=%s, focus=%s, temp=%s)",
+                 tid, was_pending, priorities, focus, self.is_temp(tid))
         return was_pending
+
+    # ------------------------------------------- временные раздачи
+
+    def watch_dir(self, tid):
+        """Папка временной раздачи (существует ли — не проверяем)."""
+        return os.path.join(self.watch_root, tid)
+
+    def is_temp(self, tid):
+        with self._lock:
+            return tid in self._watch
+
+    def watch_position(self, tid, index):
+        """Где остановили просмотр файла, с; None — не смотрели."""
+        with self._lock:
+            info = self._watch.get(tid)
+            value = None if info is None else \
+                info.get("positions", {}).get(str(index))
+        try:
+            return None if value is None else float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def set_watch_position(self, tid, index, seconds):
+        """Запомнить позицию просмотра файла временной раздачи."""
+        with self._lock:
+            info = self._watch.get(tid)
+            if info is None:
+                return False
+            positions = info.setdefault("positions", {})
+            if seconds is None:
+                positions.pop(str(index), None)
+            else:
+                positions[str(index)] = round(float(seconds), 1)
+            info["last_active"] = time.time()
+        self._write_watch(tid)
+        return True
+
+    def stop_temp(self, tid):
+        """Плеер закрыли, не досмотрев: закачку временной раздачи — на
+        паузу, данные остаются до перезагрузки компьютера. У постоянной
+        раздачи ничего не делает (там поведение 2.5: докачивается сама)."""
+        if not self.is_temp(tid):
+            return False
+        handle = self._require(tid)
+        self.close_stream(tid)
+        self._pause_handle(handle)
+        with self._lock:
+            self._watch[tid]["last_active"] = time.time()
+        self._write_watch(tid)
+        self._request_save(handle)
+        self._emit(tid, handle)
+        log.info("temp stopped %s", tid)
+        return True
+
+    def finish_file(self, tid, index, keep_alive=None):
+        """Файл временной раздачи досмотрели: удалить его данные.
+
+        keep_alive — номера файлов, чьи данные держат раздачу живой (GUI
+        передаёт остальные видео, чтобы скачанные мимоходом субтитры не
+        держали раздачу до перезагрузки); None — любые другие файлы.
+        Своих данных у них нет (граничные куски досмотренного файла не
+        в счёт) — раздача удаляется целиком вместе с папкой: "removed".
+        Иначе удаляется только файл: "deleted" (или "busy", если файл
+        не отдали).
+
+        Порядок выведен замером (17.09.2026, libtorrent 2.1.1): файл
+        libtorrent открывает с разрешением на удаление, и os.remove
+        проходит даже без паузы — но force_recheck у раздачи БЕЗ паузы
+        тут же качает файл заново, а у раздачи НА ПАУЗЕ проверка не идёт
+        вовсе (15+ с в checking_files). Поэтому: пауза -> удалить ->
+        «данных не просить» (upload_mode) + снять паузу -> force_recheck
+        (0.9 с, ни байта не скачано) -> по torrent_checked_alert снова
+        пауза и снять upload_mode (_on_rechecked).
+        """
+        handle = self._require(tid)
+        if not self.is_temp(tid):
+            raise RuntimeError("раздача не временная")
+        st = handle.status()
+        ti = handle.torrent_file() if st.has_metadata else None
+        if ti is None:
+            raise RuntimeError("метаданные раздачи ещё не получены")
+        if not 0 <= index < ti.num_files():
+            raise IndexError(f"в раздаче {tid} нет файла {index}")
+        self.close_stream(tid)
+        self._pause_handle(handle)
+        self.set_watch_position(tid, index, None)
+        if not self._has_other_data(handle, ti, index, keep_alive):
+            log.info("temp finished %s#%d: других данных нет — удаляем "
+                     "раздачу", tid, index)
+            self.remove(tid, delete_files=True)
+            return "removed"
+        # Приоритет досмотренного файла НЕ трогаем: при нуле libtorrent 2.x
+        # переносит данные файла в .parts и перепроверка читает их оттуда —
+        # вместе с удалением это давало partfile_read «Неверный дескриптор»
+        # и раздачу в ошибке (сценарий 14, 17.09.2026). Качать его заново
+        # не даст upload_mode, а следующий «Смотреть» снимет приоритет сам
+        path = os.path.join(st.save_path, ti.files().file_path(index))
+        result = "deleted"
+        for attempt in range(20):
+            try:
+                os.remove(path)
+                break
+            except FileNotFoundError:
+                break
+            except OSError as exc:
+                if attempt == 19:
+                    log.warning("досмотренный файл не удалён %s: %r",
+                                path, exc)
+                    result = "busy"
+                time.sleep(0.1)
+        with self._lock:
+            self._watch[tid]["recheck"] = True
+            self._rechecking.add(tid)
+        self._write_watch(tid)
+        handle.set_flags(lt.torrent_flags.upload_mode)
+        self._resume_handle(handle)
+        handle.force_recheck()
+        self._emit(tid, handle)
+        log.info("temp finished %s#%d: файл %s, перепроверка", tid, index,
+                 result)
+        return result
+
+    def make_permanent(self, tid, save_path, priorities=None):
+        """Временную раздачу — в постоянные («Файлы» -> «Применить»):
+        переносим в папку загрузок, снимаем метку и паузу.
+
+        priorities (галочки окна файлов) применяются ТОЛЬКО после того,
+        как перенос закончится (storage_moved_alert). Сразу нельзя:
+        поднятый с нуля приоритет заставляет libtorrent вынимать данные
+        файла из .parts, а хранилище в этот момент ещё переезжает —
+        получаем partfile_write «Неверный дескриптор» и раздачу в ошибке
+        (сценарий 14, 17.09.2026).
+        """
+        if not self.is_temp(tid):
+            return False
+        handle = self._require(tid)
+        if self._streams_of(tid):
+            raise RuntimeError("сначала остановите просмотр")
+        with self._lock:
+            info = self._watch.pop(tid)
+            self._rechecking.discard(tid)
+            self._recheck_queued.discard(tid)
+        self._drop_watch_file(tid)
+        self._claim_dir(os.path.join(save_path, f".{tid}.parts"))
+        os.makedirs(save_path, exist_ok=True)
+        # Старую папку удалим только по storage_moved_alert: move_storage
+        # асинхронный, и rmtree сразу стёр бы ещё не перенесённые файлы
+        with self._lock:
+            self._moving[tid] = info.get("temp_dir") or self.watch_dir(tid)
+            if priorities is not None:
+                self._after_move[tid] = [int(p) for p in priorities]
+        handle.move_storage(save_path)
+        handle.unset_flags(lt.torrent_flags.upload_mode)
+        self._resume_handle(handle)
+        self._request_save(handle)
+        self._emit(tid, handle)
+        log.info("temp -> permanent %s -> %s", tid, save_path)
+        return True
+
+    @staticmethod
+    def _has_other_data(handle, ti, index, keep_alive=None):
+        """Есть ли у раздачи скачанные куски вне досмотренного файла.
+
+        Куски, которые файл делит с соседями, не считаются: они есть у
+        раздачи именно из-за него.
+        """
+        size = ti.files().file_size(index)
+        first = ti.map_file(index, 0, 1).piece if size else -1
+        last = ti.map_file(index, size - 1, 1).piece if size else -2
+        pieces = list(handle.status(lt.status_flags_t.query_pieces).pieces)
+        if keep_alive is None:
+            owned = None
+        else:
+            owned = set()
+            fs = ti.files()
+            for j in keep_alive:
+                if j == index or not 0 <= j < ti.num_files():
+                    continue
+                j_size = fs.file_size(j)
+                if not j_size:
+                    continue
+                owned.update(range(ti.map_file(j, 0, 1).piece,
+                                   ti.map_file(j, j_size - 1, 1).piece + 1))
+        for piece, have in enumerate(pieces):
+            if not have or first <= piece <= last:
+                continue
+            if owned is None or piece in owned:
+                return True
+        return False
+
+    def _on_rechecked(self, tid, handle):
+        """Перепроверка после finish_file закончилась: снова пауза."""
+        if "checking" in str(handle.status().state):
+            return                      # алерт от прежней проверки
+        with self._lock:
+            self._rechecking.discard(tid)
+            info = self._watch.get(tid)
+            if info is not None:
+                info.pop("recheck", None)
+        self._pause_handle(handle)
+        handle.unset_flags(lt.torrent_flags.upload_mode)
+        if info is not None:
+            self._write_watch(tid)
+        self._request_save(handle)
+        self._emit(tid, handle)
+        log.info("temp recheck done %s", tid)
+
+    def _cleanup_temp(self):
+        """После перезагрузки компьютера временные раздачи удаляются.
+
+        «Перезагрузка» — любая загрузка после последнего действия с
+        раздачей (last_active), включая «выключил и включил» при быстром
+        запуске (см. last_boot_time). Папки в watch_root, которых не
+        знает ни одна раздача, — остатки прошлых сбоев: удаляем сразу.
+        """
+        with self._lock:
+            temps = {tid: dict(info) for tid, info in self._watch.items()}
+        try:
+            names = os.listdir(self.watch_root)
+        except OSError:
+            names = []
+        with self._lock:
+            handles = list(self._handles.values())
+        used = [h.status().save_path for h in handles if h.is_valid()]
+        # Папку, в которой ещё лежит раздача (перенос в загрузки не успел
+        # закончиться до выхода), не трогаем, даже если метки уже нет
+        orphans = [name for name in names
+                   if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", name)
+                   and name not in temps
+                   and not any(
+                       os.path.normcase(os.path.abspath(p)) ==
+                       os.path.normcase(os.path.abspath(
+                           os.path.join(self.watch_root, name)))
+                       or _inside(os.path.join(self.watch_root, name), p)
+                       for p in used)]
+        for name in orphans:
+            log.info("временная папка без раздачи: %s", name)
+            self._delete_dir_later(os.path.join(self.watch_root, name))
+        if not temps:
+            return 0
+        boot = self._boot_time()
+        if not boot:
+            return 0
+        removed = 0
+        for tid, info in temps.items():
+            try:
+                active = float(info.get("last_active") or 0)
+            except (TypeError, ValueError):
+                active = 0
+            if active < boot:
+                log.info("временная раздача %s: была перезагрузка — удаляем",
+                         tid)
+                self.remove(tid, delete_files=True)
+                removed += 1
+        return removed
+
+    def _write_watch(self, tid):
+        with self._lock:
+            info = self._watch.get(tid)
+            data = None if info is None else json.dumps(info, ensure_ascii=True)
+        if data is None:
+            return
+        try:
+            _write_atomic(self._watch_path(tid), data.encode("ascii"))
+        except OSError as exc:
+            log.warning("метка временной раздачи не сохранена %s: %r",
+                        tid, exc)
+
+    def _load_watch(self, tid):
+        try:
+            with open(self._watch_path(tid), "rb") as f:
+                info = json.loads(f.read().decode("ascii"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            # Битую метку считаем временной раздачей без позиций: лучше
+            # удалить после перезагрузки, чем молча сделать постоянной
+            log.warning("метка временной раздачи не прочитана %s: %r",
+                        tid, exc)
+            info = {}
+        if not isinstance(info, dict):
+            info = {}
+        info.setdefault("temp_dir", self.watch_dir(tid))
+        info.setdefault("positions", {})
+        info.setdefault("last_active", 0)
+        return info
+
+    def _drop_watch_file(self, tid):
+        for path in (self._watch_path(tid), self._watch_path(tid) + ".tmp"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    def _delete_dir_later(self, path):
+        """Удалить папку временной раздачи — только ВНУТРИ watch_root.
+
+        libtorrent удаляет файлы асинхронно, поэтому повторяем (до 5 с).
+        Папка может понадобиться снова раньше, чем уборка закончит: та же
+        раздача добавлена заново («Посмотреть» на той же ссылке) и пишет в
+        ту же папку. Такую уборку отменяет _claim_dir, а каждый проход ещё
+        и сверяется с живыми раздачами (_dir_in_use) — без этого поток
+        уборки стирал только что созданный файл новой раздачи, и
+        libtorrent дальше писал в удалённый файл (поймано сценарием 14
+        17.09.2026: файл исчезал через 30 мс после begin_download).
+        """
+        if not path or not _inside(self.watch_root, path):
+            return
+        cancel = self._later(path)
+
+        def worker():
+            for _ in range(50):
+                if cancel.is_set() or self._dir_in_use(path):
+                    return
+                if not os.path.exists(path):
+                    return
+                shutil.rmtree(path, ignore_errors=True)
+                time.sleep(0.1)
+            if os.path.exists(path):
+                log.warning("временная папка не удалена: %s", path)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @staticmethod
+    def _dir_key(path):
+        return os.path.normcase(os.path.abspath(path))
+
+    def _later(self, path):
+        """Событие отмены для отложенной уборки в папке path."""
+        cancel = threading.Event()
+        with self._lock:
+            old = self._cleanups.get(self._dir_key(path))
+            if old is not None:
+                old.set()
+            self._cleanups[self._dir_key(path)] = cancel
+        return cancel
+
+    def _claim_dir(self, path):
+        """Папку снова занимает раздача — отложенную уборку в ней отменить."""
+        key = self._dir_key(path)
+        with self._lock:
+            for other, cancel in list(self._cleanups.items()):
+                if other == key or _inside(path, other) or _inside(other, path):
+                    cancel.set()
+                    self._cleanups.pop(other, None)
+
+    def _dir_in_use(self, path):
+        """Какая-нибудь живая раздача хранится в этой папке (или в ней самой
+        лежит эта папка)."""
+        key = self._dir_key(path)
+        with self._lock:
+            handles = list(self._handles.values())
+        for handle in handles:
+            try:
+                if not handle.is_valid():
+                    continue
+                used = handle.status().save_path
+            except Exception:
+                continue
+            if self._dir_key(used) == key or _inside(path, used):
+                return True
+        return False
 
     def set_save_path(self, tid, path):
         """Сменить папку раздачи (кнопка «Изменить» в окне выбора).
@@ -948,6 +1447,11 @@ class TorrentEngine:
             self._errors.pop(tid, None)
             self._chosen.pop(tid, None)
             self._pending.discard(tid)
+            watch = self._watch.pop(tid, None)
+            self._rechecking.discard(tid)
+            self._recheck_queued.discard(tid)
+            self._moving.pop(tid, None)
+            self._after_move.pop(tid, None)
             self._removed.add(tid)
             ses = self._ses
         if handle is None or ses is None:
@@ -956,13 +1460,19 @@ class TorrentEngine:
         ses.remove_torrent(handle, lt.session.delete_files if delete_files else 0)
         for path in (self._resume_path(tid), self._resume_path(tid) + ".tmp",
                      self._chosen_path(tid), self._chosen_path(tid) + ".tmp",
-                     self._pending_path(tid), self._pending_path(tid) + ".tmp"):
+                     self._pending_path(tid), self._pending_path(tid) + ".tmp",
+                     self._watch_path(tid), self._watch_path(tid) + ".tmp"):
             try:
                 os.remove(path)
             except OSError:
                 pass
         if delete_files:
             self._delete_parts_later(save_path, tid)
+            if watch is not None:
+                # Своя папка временной раздачи: в ней после libtorrent
+                # остаются пустые подпапки сериала и .parts
+                self._delete_dir_later(watch.get("temp_dir")
+                                       or self.watch_dir(tid))
         log.info("removed %s (delete_files=%s)", tid, delete_files)
         self._notify_list()
 
@@ -1006,6 +1516,10 @@ class TorrentEngine:
             tid = _id_from_hashes(hashes)
             if tid in self._handles:
                 return tid
+            # Эту раздачу могли только что удалить с файлами: отложенная
+            # уборка её .parts и временной папки не должна задеть новую
+            self._claim_dir(os.path.join(save_path, f".{tid}.parts"))
+            self._claim_dir(self.watch_dir(tid))
             os.makedirs(save_path, exist_ok=True)
             atp.save_path = save_path
             if defer:
@@ -1055,6 +1569,24 @@ class TorrentEngine:
                 # (флаг должен прийти из fastresume; подтверждаем)
                 self._pending.add(tid)
                 handle.set_flags(lt.torrent_flags.upload_mode)
+            watch = self._load_watch(tid)
+            if watch is not None:
+                self._watch[tid] = watch
+                if watch.get("recheck"):
+                    # Программу закрыли посреди перепроверки finish_file:
+                    # fastresume ещё числит удалённый файл скачанным.
+                    # Проверку повторим, когда закончится проверка
+                    # fastresume (_on_alert, torrent_checked_alert) — две
+                    # проверки сразу путают, чей алерт пришёл
+                    self._recheck_queued.add(tid)
+                    handle.set_flags(lt.torrent_flags.upload_mode)
+                    self._resume_handle(handle)
+                else:
+                    # Временная раздача после запуска программы не качает:
+                    # докачка — только через «Смотреть». Паузу ставим сами:
+                    # закрытие окна во время просмотра ставило на паузу
+                    # сессию, а в fastresume раздача записана активной
+                    self._pause_handle(handle)
             count += 1
         return count
 
@@ -1130,12 +1662,46 @@ class TorrentEngine:
                 handle.set_flags(lt.torrent_flags.upload_mode)
             self._request_save(handle)
             self._emit(tid, handle)
+        elif name == "torrent_checked_alert" and tid:
+            with self._lock:
+                queued = tid in self._recheck_queued
+                rechecking = tid in self._rechecking
+                if queued:
+                    self._recheck_queued.discard(tid)
+                    self._rechecking.add(tid)
+            if queued:
+                handle.force_recheck()
+            elif rechecking:
+                self._on_rechecked(tid, handle)
+        elif name in ("storage_moved_alert",
+                      "storage_moved_failed_alert") and tid:
+            with self._lock:
+                old = self._moving.pop(tid, None)
+                priorities = self._after_move.pop(tid, None)
+            if old and name == "storage_moved_alert":
+                self._delete_dir_later(old)
+            if name == "storage_moved_failed_alert":
+                self._log_alert(name, alert)
+            if priorities is not None:
+                try:
+                    self.set_files(tid, priorities)
+                except Exception as exc:
+                    log.warning("приоритеты после переноса %s: %r", tid, exc)
+            self._request_save(handle)
+            self._emit(tid, handle)
         elif name == "torrent_finished_alert" and tid:
             with self._lock:
                 pending = tid in self._pending
+                temp = tid in self._watch
+                rechecking = tid in self._rechecking or \
+                    tid in self._recheck_queued
             # Отложенная раздача ничего не качала — «завершилась» она
-            # только формально, паузу по «не раздавать» ставить не за что
-            if not self._seed_after_download and not pending:
+            # только формально, паузу по «не раздавать» ставить не за что.
+            # Временная не раздаёт никогда: пока её смотрят, отдаёт
+            # плееру, закроют — пауза (stop_temp); без просмотра — сразу
+            if temp and not rechecking and not self._streams_of(tid):
+                self._pause_handle(handle)
+            elif not temp and not self._seed_after_download and not pending:
                 self._pause_handle(handle)
             self._request_save(handle)
             self._emit(tid, handle)
@@ -1191,13 +1757,21 @@ class TorrentEngine:
     def _pending_path(self, tid):
         return os.path.join(self.resume_dir, tid + PENDING_EXT)
 
+    def _watch_path(self, tid):
+        return os.path.join(self.resume_dir, tid + WATCH_EXT)
+
     def _delete_parts_later(self, save_path, tid):
         """libtorrent удаляет файлы асинхронно; .parts может остаться —
         добираем его отдельным коротким потоком."""
         parts = os.path.join(save_path, f".{tid}.parts")
+        # Та же гонка, что у _delete_dir_later: раздачу добавили заново в ту
+        # же папку, пока уборка ещё ждёт, — её новый .parts трогать нельзя
+        cancel = self._later(parts)
 
         def worker():
             for _ in range(50):
+                if cancel.is_set():
+                    return
                 try:
                     os.remove(parts)
                     return
@@ -1283,7 +1857,11 @@ class TorrentEngine:
         with self._lock:
             error, error_file = self._errors.get(tid, ("", ""))
             pending = tid in self._pending
-        if self._error_is_live(st, pending):
+            temp = tid in self._watch
+            # upload_mode перепроверки finish_file — наш, не ошибка файла
+            held = pending or tid in self._rechecking \
+                or tid in self._recheck_queued
+        if self._error_is_live(st, held):
             if not error:
                 errc = getattr(st, "errc", None)
                 error = (errc.message() if errc is not None and errc.value()
@@ -1320,7 +1898,8 @@ class TorrentEngine:
             files=files,
             selected_size=sum(f.size for f in files if f.priority > 0),
             error=error, error_file=error_file,
-            added_time=int(getattr(st, "added_time", 0) or 0))
+            added_time=int(getattr(st, "added_time", 0) or 0),
+            temp=temp)
 
     def _emit(self, tid, handle, st=None):
         callback = self.on_change

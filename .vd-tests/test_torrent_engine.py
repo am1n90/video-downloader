@@ -12,6 +12,7 @@ libtorrent асинхронно — повторное добавление то
 import ctypes
 import ctypes.wintypes as wt
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -869,6 +870,317 @@ check("13 «Отмена» убирает раздачу вместе с тем,
       gone13 and eng13c.get(tid13c) is None
       and not os.path.exists(eng13c._pending_path(tid13c)),
       str(os.listdir(save13c) if os.path.isdir(save13c) else []))
+seed.limit(0)
+
+# ---- 14: временная раздача «Посмотреть» ----
+# Режим задаётся при первом ответе (begin_download(temporary=True)):
+# своя папка под watch_root, после закрытия плеера — пауза, не раздаётся,
+# досмотренный файл удаляется (finish_file), после перезагрузки
+# компьютера раздача удаляется целиком (_cleanup_temp). Время загрузки
+# подменяем: настоящая перезагрузка в тесте невозможна.
+BOOT = {"at": 1.0}          # «компьютер загрузился» давно — ничего не чистим
+
+
+def watch_root(name):
+    """Свой корень временных папок на каждый движок теста.
+
+    Общий корень на всех — ловушка именно теста: раздача одна и та же,
+    временная папка у неё одна и та же, а уборку удалённой раздачи
+    движок отменяет только у себя (_claim_dir). В программе движок один
+    на процесс, так что столкнуться там нечему; в тесте же движки
+    живут одновременно, и уборка одного стирала файлы другого.
+    """
+    return os.path.join(BASE, "временные просмотры", name)
+
+
+def temp_engine(name):
+    return engine(name, watch_root=watch_root(name),
+                  boot_time=lambda: BOOT["at"])
+
+
+def upload_mode(eng, tid):
+    return bool(int(eng._handles[tid].status().flags)
+                & int(lt.torrent_flags.upload_mode))
+
+
+eng14, _ = temp_engine("s14")
+ENGINES.append(eng14)
+eng14.start()
+downloads14 = os.path.join(BASE, "Загрузки с пробелом", "s14")
+tid14 = eng14.add_torrent_file(TORRENT, downloads14,
+                               peers=[("127.0.0.1", seed.port)], defer=True)
+seed.limit(400 * 1024)
+eng14.begin_download(tid14, focus=I_SMALL, temporary=True)
+dir14 = eng14.watch_dir(tid14)
+check("14 «Посмотреть»: раздача временная, метка рядом с fastresume",
+      eng14.is_temp(tid14) and eng14.get(tid14).temp
+      and os.path.isfile(eng14._watch_path(tid14)))
+moved14 = wait_for(lambda: os.path.normcase(eng14.get(tid14).save_path)
+                   == os.path.normcase(dir14), 10)
+check("14 путь сохранения — своя папка во временном корне",
+      moved14 and dir14.startswith(watch_root("s14")),
+      eng14.get(tid14).save_path)
+got14 = wait_for(lambda: eng14.file_progress(tid14)[I_SMALL] > 256 * 1024, 30)
+check("14 качается во временную папку, в загрузки — ни файла",
+      got14 and os.path.isdir(os.path.join(dir14, "Тестовая раздача"))
+      and not os.path.isdir(os.path.join(downloads14, "Тестовая раздача")),
+      str(os.listdir(downloads14) if os.path.isdir(downloads14) else []))
+
+# Плеер закрыли на середине: пауза, данные остаются
+eng14.set_watch_position(tid14, I_SMALL, 42.5)
+eng14.stop_temp(tid14)
+wait_for(lambda: state(eng14, tid14) == te.STATE_PAUSED, 5)
+done_at_stop = int(eng14._handles[tid14].status().all_time_download)
+time.sleep(2)
+check("14 stop_temp: пауза, за 2 с не скачано ни байта",
+      state(eng14, tid14) == te.STATE_PAUSED
+      and int(eng14._handles[tid14].status().all_time_download)
+      == done_at_stop, str(state(eng14, tid14)))
+check("14 позиция просмотра запомнена", eng14.watch_position(tid14, I_SMALL)
+      == 42.5, str(eng14.watch_position(tid14, I_SMALL)))
+
+# Перезапуск программы без перезагрузки: на паузе, позиция на месте
+eng14.shutdown(timeout=3.0)
+ENGINES.remove(eng14)
+eng14b, _ = temp_engine("s14")
+ENGINES.append(eng14b)
+eng14b.start()
+check("14 после перезапуска: временная, на паузе, позиция на месте",
+      eng14b.is_temp(tid14)
+      and wait_for(lambda: state(eng14b, tid14) == te.STATE_PAUSED, 10)
+      and eng14b.watch_position(tid14, I_SMALL) == 42.5,
+      f"{state(eng14b, tid14)}, {eng14b.watch_position(tid14, I_SMALL)}")
+
+# «Смотреть» снова: open_stream снимает паузу, докачка с того же места
+seed.limit(0)
+eng14b._handles[tid14].connect_peer(("127.0.0.1", seed.port))
+before14 = eng14b.file_progress(tid14)[I_SMALL]
+stream14 = eng14b.open_stream(tid14, I_SMALL)
+full14 = wait_for(lambda: eng14b.file_progress(tid14)[I_SMALL]
+                  >= SIZES["видео 2.bin"], 60)
+check("14 повторный просмотр — докачка, а не с нуля",
+      full14 and before14 > 0, f"было {before14} байт до повторного просмотра")
+time.sleep(1.5)
+check("14 докачано, пока смотрят: раздача не на паузе (отдаёт плееру)",
+      state(eng14b, tid14) == te.STATE_SEEDING, str(state(eng14b, tid14)))
+eng14b.set_seed_after_download(False)
+eng14b.set_seed_after_download(True)
+eng14b.stop_temp(tid14)
+wait_for(lambda: state(eng14b, tid14) == te.STATE_FINISHED, 5)
+eng14b.set_seed_after_download(True)
+time.sleep(1)
+check("14 закрыли плеер — «Скачано», не «Раздаётся», "
+      "даже при включённой раздаче",
+      state(eng14b, tid14) == te.STATE_FINISHED and stream14.closed,
+      str(state(eng14b, tid14)))
+
+# Досмотрели фильм (других видео с данными нет) — раздача целиком прочь
+res14 = eng14b.finish_file(tid14, I_SMALL, keep_alive=[I_BIG])
+gone14 = wait_for(lambda: not os.path.exists(dir14), 10)
+check("14 досмотрели единственное видео: раздача и папка удалены",
+      res14 == "removed" and eng14b.get(tid14) is None and gone14
+      and not os.path.exists(eng14b._watch_path(tid14))
+      and not os.path.exists(eng14b._resume_path(tid14)),
+      f"{res14}, папка {'есть' if os.path.exists(dir14) else 'нет'}")
+
+# Сериал: досмотрели одну серию, у другой есть свои данные — удаляется
+# только файл, раздача остаётся на паузе. Порядок finish_file выведен
+# замером (docstring): без upload_mode перепроверка качает файл заново,
+# на паузе — не идёт вовсе.
+eng14c, _ = temp_engine("s14c")
+ENGINES.append(eng14c)
+eng14c.start()
+tid14c = eng14c.add_torrent_file(TORRENT, downloads14,
+                                 peers=[("127.0.0.1", seed.port)], defer=True)
+# Сначала начали смотреть серию 1 и закрыли на середине, потом досмотрели
+# серию 2. Порядок нарочно такой, чтобы раздача не проходила через
+# «завершена»: у завершённой раздачи единственный пир теста отключается,
+# и вернуться к нему libtorrent готов только через ~58 с (замер 17.09.2026
+# — та же минута, что в находках 18 и 31; в рое есть трекер и другие пиры)
+seed.limit(300 * 1024)
+eng14c.begin_download(tid14c, focus=I_BIG, temporary=True)
+eng14c.open_stream(tid14c, I_BIG)
+big_part = wait_for(lambda: eng14c.file_progress(tid14c)[I_BIG] >= 1 * MB, 60)
+eng14c.stop_temp(tid14c)
+big_before = eng14c.file_progress(tid14c)[I_BIG]
+seed.limit(0)
+eng14c.open_stream(tid14c, I_SMALL)
+eng14c.focus_file(tid14c, I_SMALL)
+small_done = wait_for(lambda: eng14c.file_progress(tid14c)[I_SMALL]
+                      >= SIZES["видео 2.bin"], 60)
+time.sleep(1.5)
+check("14 сериал: пока смотрят, докачанная временная раздача не на паузе",
+      state(eng14c, tid14c) == te.STATE_SEEDING, str(state(eng14c, tid14c)))
+eng14c.stop_temp(tid14c)
+small_path = os.path.join(eng14c.watch_dir(tid14c), "Тестовая раздача",
+                          "видео 2.bin")
+big_path14 = os.path.join(eng14c.watch_dir(tid14c), "Тестовая раздача",
+                          "видео 1.bin")
+# Та же раздача только что удалена предыдущим шагом и её папка убиралась в
+# фоне: уборка не должна задеть файлы новой раздачи в той же папке
+check("14 сериал: серия досмотрена, у соседней серии часть данных на диске",
+      small_done and big_part and os.path.isfile(small_path)
+      and os.path.isfile(big_path14),
+      f"видео 1: {big_before} байт")
+dl_before = int(eng14c._handles[tid14c].status().all_time_download)
+res14c = eng14c.finish_file(tid14c, I_SMALL, keep_alive=[I_BIG])
+
+
+def held(eng, tid):
+    """На паузе и не в проверке. Состояние снимка тут «Скачано», а не
+    «Пауза»: досмотрели последнюю заказанную серию, заказанных файлов не
+    осталось, и libtorrent считает раздачу завершённой — важен сам флаг."""
+    st = eng._handles[tid].status()
+    return st.paused and "checking" not in str(st.state)
+
+
+settled = wait_for(lambda: tid14c not in eng14c._rechecking
+                   and held(eng14c, tid14c), 15)
+prog14c = eng14c.file_progress(tid14c)
+check("14 сериал: удалён только досмотренный файл",
+      res14c == "deleted" and not os.path.exists(small_path)
+      and eng14c.get(tid14c) is not None, res14c)
+check("14 сериал: после перепроверки — пауза, без upload_mode, не ошибка",
+      settled and not upload_mode(eng14c, tid14c)
+      and state(eng14c, tid14c) in (te.STATE_PAUSED, te.STATE_FINISHED),
+      f"{state(eng14c, tid14c)}, upload_mode={upload_mode(eng14c, tid14c)}")
+check("14 сериал: перепроверка забыла удалённый файл, соседа не тронула",
+      prog14c[I_SMALL] <= 256 * 1024
+      and prog14c[I_BIG] >= big_before - 256 * 1024,
+      f"было видео 1 {big_before}, стало {prog14c}")
+time.sleep(2)
+check("14 сериал: за перепроверку и 2 с после неё не скачано ни байта",
+      int(eng14c._handles[tid14c].status().all_time_download) == dl_before,
+      f"+{int(eng14c._handles[tid14c].status().all_time_download) - dl_before}")
+watch14c = json.loads(open(eng14c._watch_path(tid14c), "rb").read())
+check("14 сериал: метка перепроверки снята",
+      "recheck" not in watch14c, str(watch14c))
+
+# Программу закрыли посреди перепроверки: после запуска она повторяется.
+# Состояние воспроизводим прямо: удаляем файл соседа при остановленном
+# движке и взводим метку — как если бы finish_file не успел закончить
+eng14c.shutdown(timeout=3.0)
+ENGINES.remove(eng14c)
+big_path = os.path.join(eng14c.watch_dir(tid14c), "Тестовая раздача",
+                        "видео 1.bin")
+os.remove(big_path)
+watch14c["recheck"] = True
+with open(eng14c._watch_path(tid14c), "wb") as f:
+    f.write(json.dumps(watch14c).encode("ascii"))
+eng14d, _ = temp_engine("s14c")
+ENGINES.append(eng14d)
+eng14d.start()
+redone = wait_for(lambda: tid14c not in eng14d._rechecking
+                  and tid14c not in eng14d._recheck_queued
+                  and held(eng14d, tid14c), 20)
+check("14 перезапуск посреди перепроверки: проверка повторена, пауза",
+      redone and eng14d.file_progress(tid14c)[I_BIG] <= 512 * 1024
+      and not upload_mode(eng14d, tid14c),
+      f"{state(eng14d, tid14c)}, {eng14d.file_progress(tid14c)}, "
+      f"очередь {tid14c in eng14d._recheck_queued}")
+
+# Перезагрузка компьютера: временные раздачи удаляются, чужие папки —
+# нет; папки-сироты с именем раздачи — да
+orphan = os.path.join(watch_root("s14c"), "a" * 40)
+foreign = os.path.join(watch_root("s14c"), "не наша папка")
+os.makedirs(orphan, exist_ok=True)
+os.makedirs(foreign, exist_ok=True)
+dir14c = eng14d.watch_dir(tid14c)
+eng14d.shutdown(timeout=3.0)
+ENGINES.remove(eng14d)
+eng14e, _ = temp_engine("s14c")
+ENGINES.append(eng14e)
+eng14e.start()
+check("14 без перезагрузки: раздача на месте, сирота удалена, чужое цело",
+      eng14e.get(tid14c) is not None
+      and wait_for(lambda: not os.path.exists(orphan), 10)
+      and os.path.isdir(foreign) and os.path.isdir(dir14c))
+eng14e.shutdown(timeout=3.0)
+ENGINES.remove(eng14e)
+BOOT["at"] = time.time() + 1          # «загрузился» после last_active
+eng14f, _ = temp_engine("s14c")
+ENGINES.append(eng14f)
+eng14f.start()
+check("14 после перезагрузки: временная раздача и её папка удалены",
+      eng14f.get(tid14c) is None
+      and wait_for(lambda: not os.path.exists(dir14c), 10)
+      and not os.path.exists(eng14f._watch_path(tid14c))
+      and os.path.isdir(foreign))
+BOOT["at"] = 1.0
+
+# «Файлы» -> «Применить»: временная становится постоянной
+eng14g, _ = temp_engine("s14g")
+ENGINES.append(eng14g)
+eng14g.start()
+# Переводим НЕдокачанную раздачу: заодно переносятся частичные данные, и
+# раздача не проходит через «завершена» (минута переподключения, см. выше)
+seed.limit(300 * 1024)
+downloads14g = os.path.join(BASE, "Загрузки с пробелом", "s14g")
+tid14g = eng14g.add_torrent_file(TORRENT, downloads14g,
+                                 peers=[("127.0.0.1", seed.port)], defer=True)
+eng14g.begin_download(tid14g, focus=I_SMALL, temporary=True)
+wait_for(lambda: eng14g.file_progress(tid14g)[I_SMALL] >= 1 * MB, 60)
+eng14g.stop_temp(tid14g)
+seed.limit(0)
+dir14g = eng14g.watch_dir(tid14g)
+stream14g = eng14g.open_stream(tid14g, I_SMALL)
+try:
+    eng14g.make_permanent(tid14g, downloads14g)
+    refused = False
+except RuntimeError:
+    refused = True
+check("14 в постоянные во время просмотра — отказ", refused
+      and eng14g.is_temp(tid14g))
+eng14g.close_stream(tid14g)
+eng14g.make_permanent(tid14g, downloads14g, priorities=[4, 4, 4])
+check("14 в постоянные: метки нет, раздача не на паузе",
+      not eng14g.is_temp(tid14g)
+      and not os.path.exists(eng14g._watch_path(tid14g))
+      and wait_for(lambda: state(eng14g, tid14g) != te.STATE_PAUSED, 5),
+      str(state(eng14g, tid14g)))
+check("14 в постоянные: файлы перенесены в загрузки, временная папка убрана",
+      wait_same_as_source(downloads14g, "Тестовая раздача\\видео 1.bin", 60)
+      and same_as_source(downloads14g, "Тестовая раздача\\видео 2.bin")
+      and wait_for(lambda: not os.path.exists(dir14g), 10),
+      f"состояние {state(eng14g, tid14g)}, пиров "
+      f"{eng14g.get(tid14g).num_peers}, прогресс "
+      f"{eng14g.file_progress(tid14g)}, приоритеты "
+      f"{list(eng14g._handles[tid14g].get_file_priorities())}, "
+      f"видео1 {same_as_source(downloads14g, 'Тестовая раздача\видео 1.bin')}, "
+      f"видео2 {same_as_source(downloads14g, 'Тестовая раздача\видео 2.bin')}, "
+      f"загрузки {os.listdir(downloads14g)}, временная "
+      f"{[os.path.join(r, f) for r, _, fs in os.walk(dir14g) for f in fs] if os.path.exists(dir14g) else 'нет'}, "
+      f"уборки {list(eng14g._cleanups)}, перенос {eng14g._moving}, "
+      f"save_path {eng14g.get(tid14g).save_path}")
+
+# Докачалась без открытого просмотра — сама на паузу (не раздаёт), даже
+# при включённой раздаче после скачивания
+eng14h, _ = temp_engine("s14h")
+ENGINES.append(eng14h)
+eng14h.start()
+tid14h = eng14h.add_torrent_file(
+    TORRENT, os.path.join(BASE, "Загрузки с пробелом", "s14h"),
+    peers=[("127.0.0.1", seed.port)], defer=True)
+eng14h.begin_download(tid14h, focus=I_TXT, temporary=True)
+check("14 докачанная без просмотра временная раздача сама встала на паузу",
+      wait_for(lambda: state(eng14h, tid14h) == te.STATE_FINISHED, 30)
+      and eng14h.seed_after_download,
+      str(state(eng14h, tid14h)))
+eng14h.remove(tid14h, delete_files=True)
+
+# Журнал загрузок: BootType 2 (выход из гибернации) не перезагрузка
+xml14 = (
+    "<Event><System><TimeCreated SystemTime='2026-09-17T20:32:27.7920000Z'/>"
+    "</System><EventData><Data Name='BootType'>2</Data></EventData></Event>"
+    "<Event><System><TimeCreated SystemTime='2026-09-16T22:16:03.5000000Z'/>"
+    "</System><EventData><Data Name='BootType'>1</Data></EventData></Event>")
+parsed = te.boot_time_from_events(xml14)
+check("14 журнал: гибернация пропущена, быстрый запуск — загрузка",
+      parsed is not None and abs(parsed - 1789596963.5) < 0.01, str(parsed))
+real_boot = te.last_boot_time()
+check("14 время последней загрузки этой машины читается",
+      real_boot is not None and real_boot <= time.time(),
+      time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(real_boot or 0)))
 seed.limit(0)
 
 # ---- завершение ----
