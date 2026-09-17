@@ -339,6 +339,23 @@ eng7.remove(tid7)
 check("7 удаление: из списка и fastresume",
       eng7.get(tid7) is None and not os.path.exists(eng7._resume_path(tid7)))
 
+# ---- 7b: shutdown при раздаче БЕЗ метаданных рядом с обычной (2.4) ----
+# Находка 42: flush_cache() у раздачи без метаданных не отвечает никогда,
+# ожидание съедало весь timeout (закрытие окна 3 с на установленной копии),
+# и save_resume_data соседней качающейся раздачи уже не дожидались.
+seed.limit(int(1.5 * MB))
+eng7b, _ = engine("s7b")
+eng7b.start()
+tid7b_dead = eng7b.add_magnet(f"magnet:?xt=urn:btih:{dead}",
+                              os.path.join(BASE, "dead"))
+tid7b = eng7b.add_magnet(magnet(), os.path.join(BASE, "Загрузки с пробелом", "s7b"))
+ok = wait_for(lambda: eng7b.get(tid7b).progress >= 0.2, 30)
+result7b = eng7b.shutdown(timeout=3.0)
+check("7b shutdown с раздачей без метаданных: обе сохранены, без упора в timeout",
+      ok and result7b["unflushed"] == 0 and result7b["unsaved"] == 0
+      and result7b["saved"] == 2 and result7b["seconds"] < 2.5, str(result7b))
+seed.limit(0)
+
 # ---- 8: раздача после скачивания выключена ----
 eng8, _ = engine("s8", seed_after_download=False)
 ENGINES.append(eng8)

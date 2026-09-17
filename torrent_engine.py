@@ -580,6 +580,12 @@ class TorrentEngine:
             handles = [(tid, h) for tid, h in self._handles.items()
                        if h.is_valid()]
             for tid, handle in handles:
+                # Без метаданных у раздачи нет хранилища: cache_flushed_alert
+                # на flush_cache() не приходит НИКОГДА, и ожидание съедало
+                # весь timeout — закрытие окна 3 с, а на save_resume_data
+                # остальных раздач времени уже не оставалось (находка 42)
+                if not handle.status().has_metadata:
+                    continue
                 self._pending_flush.add(tid)
                 handle.flush_cache()
             while self._pending_flush and time.monotonic() < deadline:
