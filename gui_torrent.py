@@ -27,9 +27,10 @@ settings.json (torrent_history), живое состояние подмешив�
 
 import dataclasses
 import os
+import shutil
 import time
 
-from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QStyle, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
@@ -90,6 +91,13 @@ class FilesChoice:
 PREPARE_TICK_MS = 500
 PREPARE_HINT_S = 8
 PREPARE_TIMEOUT_S = 45
+
+# Временная раздача («Посмотреть» в окне добавления): качается во
+# временную папку, живёт до перезагрузки компьютера, не раздаётся
+TEMP_TEXT = "просмотр во временной папке"
+SPACE_FACTOR = 1.1            # запас места: ~110% от недокачанного
+RESUME_BACK_S = 5             # назад от сохранённой позиции при открытии
+RESUME_MIN_S = 10             # ближе к началу позицию не восстанавливаем
 
 WATCH_STARTING = "starting"   # плеер запущен, к серверу ещё не обращался
 WATCH_READY = "ready"         # первый запрос пришёл — плеер читает поток
@@ -452,6 +460,25 @@ class ConfirmRemoveTorrentDialog(MessageBoxBase):
         self.warn_label.setVisible(self.delete_files)
 
 
+class ConfirmSpaceDialog(MessageBoxBase):
+    """«Места может не хватить» перед просмотром во временную папку."""
+
+    def __init__(self, name, need, free, parent=None):
+        super().__init__(parent)
+        self.viewLayout.addWidget(
+            SubtitleLabel("На диске мало места", self))
+        self.viewLayout.addWidget(BodyLabel(name, self))
+        text = BodyLabel(
+            f"Для просмотра нужно примерно {fmt_size(need)}, а на диске "
+            f"с временной папкой свободно {fmt_size(free)}. "
+            f"Просмотр можно начать, но файл может не докачаться.", self)
+        text.setWordWrap(True)
+        self.viewLayout.addWidget(text)
+
+        self.yesButton.setText("Всё равно смотреть")
+        self.cancelButton.setText("Отмена")
+
+
 class TorrentCard(CardWidget):
     """Карточка раздачи.
 
@@ -497,6 +524,7 @@ class TorrentCard(CardWidget):
 
         self._last_state = None
         self._last_watching = None
+        self._last_temp = None
         self.update_state(item)
 
     @staticmethod
@@ -548,10 +576,12 @@ class TorrentCard(CardWidget):
         # Кнопки пересоздаём только при смене состояния, не на каждом тике
         # (просмотр — тоже смена набора кнопок, хотя state тот же)
         watching = self.page.is_watching(item.id)
-        if item.state == self._last_state and watching == self._last_watching:
+        if item.state == self._last_state and watching == self._last_watching \
+                and item.temp == self._last_temp:
             return
         self._last_state = item.state
         self._last_watching = watching
+        self._last_temp = item.temp
         self._clear_actions()
         tid = item.id
         if self.page.is_pending(tid):
@@ -569,8 +599,14 @@ class TorrentCard(CardWidget):
         elif self.page.can_watch(item):
             # Акцент не ставим там, где он уже занят «Продолжить»/«Повторить»
             self._add_action("Смотреть", lambda: self.page.watch(tid),
-                             accent=item.state not in (te.STATE_PAUSED,
-                                                       te.STATE_ERROR))
+                             accent=item.temp or item.state not in (
+                                 te.STATE_PAUSED, te.STATE_ERROR))
+        if item.temp:
+            # У временной раздачи «Пауза» и «Продолжить» не нужны: качает
+            # она только пока смотрят, а останавливает просмотр своя кнопка
+            self._add_action("Файлы", lambda: self.page.choose_files(tid))
+            self._add_action("Удалить", lambda: self.page.remove(tid))
+            return
         if item.state in ACTIVE_STATES:
             self._add_action("Пауза", lambda: self.page.pause(tid))
         elif item.state == te.STATE_PAUSED:
@@ -589,6 +625,8 @@ class TorrentCard(CardWidget):
 
     def _meta_parts(self, item):
         parts = [STATE_TEXT.get(item.state, item.state)]
+        if item.temp:
+            parts.append(TEMP_TEXT)
         watch = self.page.watch_status(item.id)
         if watch:
             parts.append(watch)
@@ -624,6 +662,9 @@ class TorrentCard(CardWidget):
 class TorrentPage(TransparentScrollArea):
     """Очередь раздач: добавление, выбор файлов, пауза, удаление."""
 
+    # PlayerWatcher зовёт нас из СВОЕГО потока — в GUI только сигналом
+    watchEnded = Signal(object)
+
     def __init__(self, engine, bridge, settings, parent=None, stream=None):
         super().__init__(parent)
         self.engine = engine
@@ -647,6 +688,10 @@ class TorrentPage(TransparentScrollArea):
         self._watch_url = ""
         self._hint_shown = False
         self._player_proc = None
+        # Наблюдатель за плеером (временные раздачи): где остановились и
+        # досмотрели ли до конца
+        self._watcher = None
+        self.watchEnded.connect(self._on_watch_ended)
         self._prepare_timer = QTimer(self)
         self._prepare_timer.setInterval(PREPARE_TICK_MS)
         self._prepare_timer.timeout.connect(self._poll_player)
@@ -799,7 +844,10 @@ class TorrentPage(TransparentScrollArea):
         или «Посмотреть». Не раньше — раздача после «Отмена» в
         Библиотеку попадать не должна."""
         item = self.engine.get(tid)
-        if item is None or not item.files:
+        if item is None or not item.files or item.temp:
+            # Временная раздача в Библиотеку не попадает: её файлы живут
+            # до перезагрузки компьютера. Запись появится, если раздачу
+            # оставят насовсем («Файлы» -> «Применить»)
             return
         done = done_indexes(self.engine, item) or ()
         config.add_torrent_history(self.settings, library_record(item, done))
@@ -811,9 +859,8 @@ class TorrentPage(TransparentScrollArea):
         Пока раздача в движке, это знает file_progress; после снятия
         раздачи — только запись. settings.json пишем лишь при изменении.
         """
-        if not item.has_metadata or item.state in (te.STATE_METADATA,
-                                                   te.STATE_PENDING,
-                                                   te.STATE_CHECKING):
+        if item.temp or not item.has_metadata or item.state in (
+                te.STATE_METADATA, te.STATE_PENDING, te.STATE_CHECKING):
             return
         record = config.find_torrent_record(self.settings, item.id)
         if record is None:
@@ -914,14 +961,17 @@ class TorrentPage(TransparentScrollArea):
             self._engine_call(
                 lambda: self.engine.set_save_path(tid, choice.save_path))
         if choice.action == ACTION_WATCH and choice.video is not None:
-            # Приоритеты галочек НЕ применяем: просмотр качает строго
-            # одну серию, и явный заказ файлов ему только мешал бы.
-            # focus внутри begin_download — чтобы раздача не успела
-            # потянуть всё подряд в момент разрешения качать
-            if not self._engine_call(lambda: self.engine.begin_download(
-                    tid, focus=choice.video.index)):
+            # «Посмотреть» — ВРЕМЕННАЯ раздача: качается во временную
+            # папку (не в загрузки), живёт до перезагрузки компьютера и в
+            # Библиотеку не пишется. Приоритеты галочек не применяем:
+            # просмотр качает строго одну серию, и явный заказ файлов ему
+            # только мешал бы. focus внутри begin_download — чтобы раздача
+            # не успела потянуть всё подряд в момент разрешения качать
+            if not self._enough_space(item, choice.video):
                 return False
-            self._remember(tid)
+            if not self._engine_call(lambda: self.engine.begin_download(
+                    tid, focus=choice.video.index, temporary=True)):
+                return False
             return self.watch(tid, index=choice.video.index)
         ok = self._engine_call(lambda: self.engine.begin_download(
             tid, list(choice.priorities)))
@@ -951,6 +1001,22 @@ class TorrentPage(TransparentScrollArea):
             return self.watch(tid, index=choice.video.index)
         if choice.action != ACTION_DOWNLOAD:
             return False
+        if item.temp:
+            # «Применить» у временной раздачи — это «оставить насовсем»:
+            # переносим в папку загрузок и записываем в Библиотеку.
+            # Приоритеты применит сам движок, когда перенос закончится
+            if self.is_watching(tid):
+                self._notify("warning", "Сначала остановите просмотр")
+                return False
+            if not self._engine_call(lambda: self.engine.make_permanent(
+                    tid, self.save_path(), list(choice.priorities))):
+                return False
+            self._remember(tid)
+            self._notify("success",
+                         "Раздача перенесена в папку загрузок и добавлена "
+                         "в Библиотеку")
+            self.refresh()
+            return True
         # prioritize_files асинхронный: сразу после set_files снимок ещё
         # показывает старый выбор (находка 21) — карточку обновит движок
         return self._engine_call(
@@ -1010,10 +1076,14 @@ class TorrentPage(TransparentScrollArea):
             target = targets[0]
         else:
             return self.choose_files(tid)
+        if item.temp and not self._enough_space(item, target):
+            return False
         local = self.local_path(item, target)
         if local:
             self._focus(tid, target.index)
-            return self._launch(local, os.path.basename(local), url="")
+            return self._launch(local, os.path.basename(local), url="",
+                                watch=(tid, target.index) if item.temp
+                                else None)
         try:
             url = self.stream().watch(tid, target.index)
         except Exception as exc:
@@ -1024,7 +1094,9 @@ class TorrentPage(TransparentScrollArea):
         self._focus(tid, target.index)
         subtitles = self.stream().subtitles
         started = self._launch(url, os.path.basename(target.path), url=url,
-                               subtitles=subtitles)
+                               subtitles=subtitles,
+                               watch=(tid, target.index) if item.temp
+                               else None)
         if started:
             self._begin_prepare(url)
         elif not self._player_offered:
@@ -1041,11 +1113,128 @@ class TorrentPage(TransparentScrollArea):
             te.log.warning("focus_file %s#%s: %r", tid, index, exc)
 
     def stop_watch(self):
+        """Кнопка «Остановить просмотр»: то же, что закрыть плеер, не
+        досмотрев, — временная раздача встаёт на паузу."""
+        active = self._stream.active if self._stream is not None else None
+        watcher, self._watcher = self._watcher, None
+        if watcher is not None:
+            watcher.cancel()
+            self._save_position(watcher)
         if self._stream is None or not self._stream.stop():
             return False
         self._end_prepare()
+        if active is not None and self.engine.is_temp(active[0]):
+            self._engine_call(lambda: self.engine.stop_temp(active[0]))
         self.refresh()
         return True
+
+    # ---------------------------- просмотр во временную папку
+
+    def _enough_space(self, item, target):
+        """Хватит ли места во временной папке; спрашиваем, если нет.
+
+        Считаем по НЕДОКАЧАННОЙ части: при повторном просмотре половина
+        файла уже лежит на диске, и предупреждать по полному размеру было
+        бы ложной тревогой.
+        """
+        need = target.size
+        try:
+            done = self.engine.file_progress(item.id)
+            if target.index < len(done):
+                need = max(0, target.size - int(done[target.index]))
+        except Exception:
+            pass
+        need = int(need * SPACE_FACTOR)
+        path = self.engine.watch_root
+        while path and not os.path.isdir(path):
+            parent = os.path.dirname(path)
+            if parent == path:
+                break
+            path = parent
+        try:
+            free = shutil.disk_usage(path).free
+        except OSError as exc:          # места не спросить — не мешаем
+            te.log.warning("свободное место не проверить (%s): %r", path, exc)
+            return True
+        if free >= need:
+            return True
+        return self.confirm_space(os.path.basename(target.path), need, free)
+
+    def _save_position(self, watcher):
+        if watcher is None or watcher.context is None \
+                or watcher.position is None:
+            return
+        tid, index = watcher.context
+        try:
+            self.engine.set_watch_position(tid, index, watcher.position)
+        except Exception as exc:
+            te.log.warning("позиция просмотра не сохранена: %r", exc)
+
+    def _watch_finished(self, watcher):
+        """Колбэк наблюдателя — приходит ИЗ ЕГО ПОТОКА."""
+        self.watchEnded.emit(watcher)
+
+    def _on_watch_ended(self, watcher):
+        """Плеер закрылся: досмотрел — удаляем файл, нет — пауза."""
+        if watcher is not self._watcher:
+            return                      # просмотр уже сняли вручную
+        self._watcher = None
+        self._save_position(watcher)
+        tid, index = watcher.context
+        if self._stream is not None and self._stream.is_watching(tid, index):
+            self._stream.stop()
+            self._end_prepare()
+        if not self.engine.is_temp(tid):
+            self.refresh()              # постоянная раздача качается дальше
+            return
+        if watcher.eof:
+            self._finish_temp(tid, index)
+        elif not watcher.reached and watcher.session.kind == player.KIND_OTHER:
+            # Плеер с режимом «один экземпляр» передаёт ссылку уже
+            # открытому окну и сразу выходит — это не конец просмотра.
+            # Закачку не трогаем, её остановит кнопка на карточке
+            self._notify("info",
+                         "Плеер сразу закрылся. Если просмотр идёт в уже "
+                         "открытом окне, остановите его кнопкой на карточке")
+        else:
+            self._engine_call(lambda: self.engine.stop_temp(tid))
+            self._notify("info", "Просмотр закрыт, закачка на паузе. "
+                                 "Данные сохранятся до перезагрузки "
+                                 "компьютера")
+        self.refresh()
+
+    def _finish_temp(self, tid, index):
+        """Досмотрел до конца: файл и его данные во временной папке —
+        прочь. Другие видео раздачи (соседние серии) держат её живой."""
+        item = self.engine.get(tid)
+        keep = [f.index for f in ts.watchable_files(item.files or ())
+                if f.index != index] if item is not None else []
+        try:
+            result = self.engine.finish_file(tid, index, keep_alive=keep)
+        except Exception as exc:
+            self._notify("warning", f"Не получилось убрать файл: {exc}")
+            return
+        if result == "removed":
+            self._notify("success",
+                         "Просмотр закончен — раздача и её временные файлы "
+                         "удалены")
+        elif result == "busy":
+            self._notify("warning",
+                         "Просмотр закончен, но файл занят другой "
+                         "программой и не удалён")
+        else:
+            self._notify("success",
+                         "Просмотр закончен — файл удалён из временной "
+                         "папки, остальные серии на месте")
+
+    def stop_watchers(self):
+        """Закрытие окна: перестать следить, сохранив позицию."""
+        watcher, self._watcher = self._watcher, None
+        if watcher is None:
+            return
+        watcher.cancel()
+        watcher.join(1.0)
+        self._save_position(watcher)
 
     # ------------------------------------------------ подготовка плеера
 
@@ -1129,8 +1318,13 @@ class TorrentPage(TransparentScrollArea):
         path = os.path.join(item.save_path, *parts)
         return path if os.path.isfile(path) else ""
 
-    def _launch(self, target, name, url="", subtitles=()):
-        """Запуск плеера. Процесс не ждём и при закрытии окна не убиваем."""
+    def _launch(self, target, name, url="", subtitles=(), watch=None):
+        """Запуск плеера. Процесс не ждём и при закрытии окна не убиваем.
+
+        watch=(раздача, файл) — временная раздача: за плеером следим
+        (PlayerWatcher) и открываем с той секунды, где остановились в
+        прошлый раз.
+        """
         self._player_offered = False
         configured = self.settings.get("torrent_player", "")
         try:
@@ -1140,7 +1334,11 @@ class TorrentPage(TransparentScrollArea):
             return False
         urls = [sub_url for _, sub_url in subtitles]
         try:
-            self._player_proc = player.launch(target, exe, subtitles=urls)
+            if watch is None:
+                self._player_proc = player.launch(target, exe, subtitles=urls)
+            else:
+                self._player_proc = self._launch_watched(target, exe, urls,
+                                                         watch)
         except OSError as exc:
             self._notify("warning", f"Плеер не запустился: {exc}")
             return False
@@ -1153,6 +1351,23 @@ class TorrentPage(TransparentScrollArea):
                          f"{', '.join(n for n, _ in subtitles[:shown])}.")
         self._notify("success", text)
         return True
+
+    def _launch_watched(self, target, exe, urls, watch):
+        """Запустить плеер под наблюдением и продолжить с прошлой позиции."""
+        tid, index = watch
+        start = None
+        position = self.engine.watch_position(tid, index)
+        if position and position >= RESUME_MIN_S:
+            # Несколько секунд назад: там, где остановились, кадр уже
+            # виден, а пары секунд «до» хватает, чтобы понять место
+            start = int(position - RESUME_BACK_S)
+        session = player.launch_watched(target, exe, subtitles=urls,
+                                        start=start)
+        self._watcher = player.PlayerWatcher(
+            session, self._watch_finished, context=watch).start()
+        if start:
+            self._notify("info", f"Продолжаем с {fmt_eta(start)}")
+        return session.proc
 
     def _offer_link(self, reason, url):
         """Плеера нет: ссылку не теряем — кладём в буфер обмена, поток
@@ -1189,6 +1404,9 @@ class TorrentPage(TransparentScrollArea):
         dialog = ConfirmRemoveTorrentDialog(name, self.window())
         ok = bool(dialog.exec())
         return ok, (dialog.delete_files if ok else False)
+
+    def confirm_space(self, name, need, free):
+        return bool(ConfirmSpaceDialog(name, need, free, self.window()).exec())
 
     def ask_choice(self, item, mode):
         """Окно выбора файлов; возвращает FilesChoice.

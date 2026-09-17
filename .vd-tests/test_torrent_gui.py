@@ -47,6 +47,7 @@ from PySide6.QtWidgets import QApplication
 
 import gui
 import gui_torrent
+import player
 import torrent_engine as te
 import torrent_stream as ts
 
@@ -159,12 +160,21 @@ def make_page(name):
         on_change=lambda item: bridge.itemChanged.emit(item),
         on_list_change=lambda: bridge.queueChanged.emit(),
         listen_interfaces="127.0.0.1:0", extra_settings=ENGINE_SETTINGS,
+        # Свой корень временных папок на страницу: раздача во всех
+        # сценариях одна, а уборку удалённой раздачи движок отменяет
+        # только у себя (в программе движок один на процесс)
+        watch_root=os.path.join(BASE, "временные просмотры", name),
+        boot_time=lambda: 1.0,          # «перезагрузки не было»
     )
     settings = {"torrent_folder": save_dir, "default_folder": save_dir}
     page = gui_torrent.TorrentPage(engine, bridge, settings)
     PAGES.append((page, engine))
     BRIDGES[page] = bridge
     return page, engine, save_dir
+
+
+def record_of(page):
+    return config.find_torrent_record(page.settings, IH)
 
 
 def buttons(card):
@@ -500,6 +510,67 @@ gui_torrent.player.resolve = fake_resolve
 gui_torrent.player.launch = (
     lambda target, exe, subtitles=():
     LAUNCHED.append((target, exe, tuple(subtitles))))
+
+# Просмотр временной раздачи идёт под наблюдением (player.PlayerWatcher).
+# Настоящий наблюдатель проверяется отдельно (test_player_watcher.py) —
+# здесь подменяем и его, и запуск плеера: тесту нужно самому решать,
+# когда «плеер закрылся» и досмотрели ли до конца.
+WATCHED = []            # (цель, exe, субтитры, позиция начала)
+WATCHERS = []
+
+
+class FakeSession:
+    def __init__(self, kind=player.KIND_MPV):
+        self.kind = kind
+        self.proc = None
+
+
+class FakeWatcher:
+    def __init__(self, session, on_end, poll_every=1.0, context=None):
+        self.session = session
+        self.on_end = on_end
+        self.context = context
+        self.position = None
+        self.duration = None
+        self.eof = False
+        self.reached = True
+        self.end_reason = ""
+        self.cancelled = False
+        WATCHERS.append(self)
+
+    def start(self):
+        return self
+
+    def cancel(self):
+        self.cancelled = True
+
+    def join(self, timeout=None):
+        pass
+
+    @property
+    def running(self):
+        return not self.cancelled
+
+    def close_player(self, position=None, eof=False, reached=True,
+                     duration=100.0):
+        """«Плеер закрылся» — как это делает настоящий наблюдатель."""
+        self.position = position
+        self.duration = duration
+        self.eof = eof
+        self.reached = reached
+        self.on_end(self)
+
+
+PLAYER_KIND = {"kind": player.KIND_MPV}
+
+
+def fake_launch_watched(target, exe, subtitles=(), start=None):
+    WATCHED.append((target, exe, tuple(subtitles), start))
+    return FakeSession(PLAYER_KIND["kind"])
+
+
+gui_torrent.player.launch_watched = fake_launch_watched
+gui_torrent.player.PlayerWatcher = FakeWatcher
 
 # В раздаче два видеофайла, и «Смотреть» при нескольких видео открывает
 # окно выбора. Здесь отвечаем за пользователя тем же файлом, что
@@ -1083,9 +1154,12 @@ check("12 папка из окна применилась к раздаче",
       page13.engine.get(IH).save_path)
 check("12 раздача больше не ждёт выбора", not page13.is_pending(IH))
 card13 = page13._cards.get(IH)
+# Пока идёт запуск, у раздачи ещё стоит upload_mode, а «ждёт выбора»
+# уже снято: без пометки «запускается» в движке снимок в этом окне
+# выглядел как ошибка файла и карточка рисовала «Повторить»
 check("12 на карточке снова обычные кнопки",
-      "Пауза" in buttons(card13) and "Файлы" in buttons(card13),
-      str(buttons(card13)))
+      "Пауза" in buttons(card13) and "Файлы" in buttons(card13)
+      and "Повторить" not in buttons(card13), str(buttons(card13)))
 
 # 12в. «Посмотреть»: качается строго выделенная серия
 try:
@@ -1105,7 +1179,23 @@ watching14 = wait_until(lambda: page14.is_watching(IH), 30)
 pump(0.3)
 check("12 «Посмотреть» из окна запускает просмотр выбранной серии",
       watching14 and page14._stream.active == (IH, OTHER_INDEX)
-      and len(LAUNCHED) == 1, str(LAUNCHED))
+      and len(WATCHED) == 1, str(WATCHED))
+check("12 «Посмотреть» делает раздачу временной: своя папка под %TEMP%",
+      eng14.is_temp(IH)
+      and wait_until(lambda: os.path.normcase(eng14.get(IH).save_path)
+                     == os.path.normcase(eng14.watch_dir(IH)), 10)
+      and eng14.watch_dir(IH).startswith(eng14.watch_root),
+      eng14.get(IH).save_path)
+check("12 временная раздача в Библиотеку не пишется",
+      record_of(page14) is None, str(record_of(page14)))
+card14 = page14._cards.get(IH)
+check("12 у временной раздачи нет «Пауза»/«Продолжить»",
+      "Пауза" not in buttons(card14) and "Продолжить" not in buttons(card14)
+      and buttons(card14) == ["Остановить просмотр", "Файлы", "Удалить"],
+      str(buttons(card14)))
+check("12 в подписи карточки видно, что папка временная",
+      gui_torrent.TEMP_TEXT in card14.meta_label.text(),
+      card14.meta_label.text())
 
 
 def prios14():
@@ -1232,7 +1322,7 @@ def data_files(engine):
 
 
 def record15(page):
-    return config.find_torrent_record(page.settings, IH)
+    return record_of(page)
 
 
 # 14а. «Отмена» — записи нет
@@ -1327,15 +1417,21 @@ check("14 без галочки: запись убрана, InfoBar «Удале
       and NOTES[-1] == ("success", "Удалено: 1 запись"), str(NOTES[-1:]))
 
 # 14г. focus_file: смотрят одну серию — раздача не выглядит «готовой»
-ANSWER[gui_torrent.MODE_ADD] = watch_file(VIDEO_INDEX)
+# Раздача ПОСТОЯННАЯ («Скачать»), а серию смотрят кнопкой на карточке:
+# у такой раздачи поведение 2.5 — она докачивается независимо от плеера
+# и попадает в Библиотеку (временные туда не пишутся, см. сценарий 16)
+ANSWER[gui_torrent.MODE_ADD] = download_all
 page16, eng16, save16 = make_page("s16")
 page16.show()
 pump(0.3)
 page16.magnet_edit.setText(magnet())
 page16.add_magnet()
-check("14 «Посмотреть» запустил просмотр",
-      wait_until(lambda: page16.is_watching(IH), 30))
-check("14 «Посмотреть» тоже создал запись", record15(page16) is not None)
+wait_ready(page16)
+check("14 «Скачать» создал запись в Библиотеке",
+      record15(page16) is not None)
+check("14 просмотр серии у постоянной раздачи",
+      page16.watch(IH, index=VIDEO_INDEX) and page16.is_watching(IH)
+      and not eng16.is_temp(IH), str(state_of(page16, IH)))
 check("14 выбранная серия скачалась",
       wait_until(lambda: eng16.file_progress(IH)[VIDEO_INDEX]
                  >= TI.files().file_size(VIDEO_INDEX), 60))
@@ -1569,6 +1665,170 @@ pump(1.5)
 check("15 тот же .torrent тоже не открывает окно и ничего не удаляет",
       not ASKED and page15.engine.get(IH) is not None
       and all(same_as_source(save15, rel) for rel in FILE_ORDER), str(ASKED))
+ANSWER[gui_torrent.MODE_ADD] = download_all
+
+# ---- 16. Временная раздача: просмотр во временную папку ----
+# «Посмотреть» в окне добавления качает во временную папку, закрытие
+# плеера останавливает закачку, досмотр до конца удаляет файл, а
+# перезагрузка компьютера — всю раздачу. Настоящий наблюдатель за
+# плеером проверяется в test_player_watcher.py — здесь он подменён,
+# чтобы решать, когда «плеер закрылся» и досмотрели ли.
+NOTES16 = []
+WATCHED.clear()
+WATCHERS.clear()
+ASKED.clear()
+ANSWER[gui_torrent.MODE_ADD] = watch_file(VIDEO_INDEX)
+seed.h.set_upload_limit(256 * 1024)
+page17, eng17, save17 = make_page("s17")
+page17._notify = lambda kind, text: NOTES16.append((kind, text))
+page17.show()
+pump(0.3)
+page17.magnet_edit.setText(magnet())
+page17.add_magnet()
+check("16 «Посмотреть» начал просмотр временной раздачи",
+      wait_until(lambda: page17.is_watching(IH), 30) and eng17.is_temp(IH)
+      and len(WATCHED) == 1 and WATCHED[0][3] is None,
+      str(WATCHED))
+check("16 в загрузки ничего не легло",
+      not os.path.isdir(os.path.join(save17, "Тестовая раздача")),
+      str(os.listdir(save17) if os.path.isdir(save17) else []))
+
+# 16а. Закрыли плеер на середине: пауза, данные целы, позиция запомнена
+wait_until(lambda: eng17.file_progress(IH)[VIDEO_INDEX] > 256 * 1024, 60)
+WATCHERS[-1].close_player(position=42.0)
+pump(0.5)
+check("16 закрыли на середине — закачка на паузе, просмотр снят",
+      wait_until(lambda: state_of(page17, IH) == te.STATE_PAUSED, 10)
+      and not page17.is_watching(IH), state_of(page17, IH))
+check("16 позиция просмотра сохранена",
+      eng17.watch_position(IH, VIDEO_INDEX) == 42.0,
+      str(eng17.watch_position(IH, VIDEO_INDEX)))
+check("16 пользователю сказано про паузу и про перезагрузку",
+      any(k == "info" and "паузе" in t and "перезагрузки" in t
+          for k, t in NOTES16), str(NOTES16[-2:]))
+done16 = eng17.file_progress(IH)[VIDEO_INDEX]
+check("16 скачанное во временной папке осталось", done16 > 256 * 1024,
+      str(done16))
+card17 = page17._cards.get(IH)
+check("16 у временной раздачи на паузе нет «Продолжить» — только «Смотреть»",
+      "Смотреть" in buttons(card17) and "Продолжить" not in buttons(card17),
+      str(buttons(card17)))
+
+# 16б. Снова «Смотреть»: докачка с прошлой позиции, а не с нуля
+WATCHED.clear()
+page17.watch(IH, index=VIDEO_INDEX)
+pump(0.5)
+check("16 повторный просмотр открывает плеер с прошлой позиции минус 5 с",
+      len(WATCHED) == 1 and WATCHED[0][3] == 37, str(WATCHED))
+check("16 докачка продолжается с места, а не с нуля",
+      eng17.file_progress(IH)[VIDEO_INDEX] >= done16,
+      f"{done16} -> {eng17.file_progress(IH)[VIDEO_INDEX]}")
+
+# 16в. Кнопка «Остановить просмотр» = закрыли плеер, не досмотрев
+watcher16 = WATCHERS[-1]
+page17.stop_watch()
+pump(0.3)
+check("16 «Остановить просмотр»: наблюдение снято, раздача на паузе",
+      watcher16.cancelled
+      and wait_until(lambda: state_of(page17, IH) == te.STATE_PAUSED, 10),
+      state_of(page17, IH))
+
+# 16г. Досмотрел до конца: файл и данные во временной папке удаляются
+temp_dir16 = eng17.watch_dir(IH)
+page17.watch(IH, index=VIDEO_INDEX)
+pump(0.3)
+WATCHERS[-1].close_player(position=99.0, eof=True)
+pump(0.5)
+check("16 досмотрел: раздачи больше нет, временная папка убрана",
+      wait_until(lambda: eng17.get(IH) is None, 15)
+      and wait_until(lambda: not os.path.exists(temp_dir16), 10)
+      and IH not in page17._cards,
+      f"{eng17.get(IH)}, папка {os.path.exists(temp_dir16)}")
+check("16 про удаление сказано пользователю",
+      any(k == "success" and "удален" in t for k, t in NOTES16),
+      str(NOTES16[-1:]))
+check("16 в Библиотеке временной раздачи нет", record_of(page17) is None)
+
+# 16д. Другой плеер (не mpv/VLC), который сразу закрылся, паузу не ставит:
+# он мог передать ссылку уже открытому окну («только один экземпляр»)
+PLAYER_KIND["kind"] = player.KIND_OTHER
+page18, eng18, save18 = make_page("s18")
+page18.show()
+pump(0.3)
+page18.magnet_edit.setText(magnet())
+page18.add_magnet()
+wait_until(lambda: page18.is_watching(IH), 30)
+state18 = state_of(page18, IH)
+WATCHERS[-1].close_player(position=None, reached=False)
+pump(0.5)
+check("16 другой плеер, закрывшийся до первого запроса: паузы нет",
+      state_of(page18, IH) != te.STATE_PAUSED
+      and eng18.is_temp(IH), f"{state18} -> {state_of(page18, IH)}")
+PLAYER_KIND["kind"] = player.KIND_MPV
+
+# 16е. «Файлы» -> «Применить» оставляет раздачу насовсем
+ANSWER[gui_torrent.MODE_MANAGE] = download_all
+page18.stop_watch()
+pump(0.3)
+seed.h.set_upload_limit(0)
+check("16 «Применить» перенесло раздачу в загрузки и в Библиотеку",
+      page18.choose_files(IH) and not eng18.is_temp(IH)
+      and wait_until(lambda: os.path.normcase(eng18.get(IH).save_path)
+                     == os.path.normcase(save18), 10)
+      and record_of(page18) is not None,
+      f"{eng18.get(IH).save_path}, запись {record_of(page18) is not None}")
+check("16 после «Применить» файлы докачиваются в папку загрузок",
+      wait_until(lambda: same_as_source(save18, VIDEO_REL), 60)
+      and wait_until(lambda: not os.path.exists(eng18.watch_dir(IH)), 10))
+card18 = page18._cards.get(IH)
+check("16 у постоянной раздачи кнопки обычные",
+      "Файлы" in buttons(card18) and gui_torrent.TEMP_TEXT
+      not in card18.meta_label.text(), str(buttons(card18)))
+ANSWER[gui_torrent.MODE_MANAGE] = answer_nothing
+
+# 16ж. Мало места: спрашиваем до начала закачки, «Отмена» её не начинает
+ANSWER[gui_torrent.MODE_ADD] = watch_file(VIDEO_INDEX)
+SPACE_ASKED = []
+page19, eng19, save19 = make_page("s19")
+page19.confirm_space = lambda name, need, free: (
+    SPACE_ASKED.append((name, need, free)) or False)
+page19.show()
+pump(0.3)
+page19.magnet_edit.setText(magnet())
+page19.add_magnet()
+wait_until(lambda: page19.is_watching(IH) or bool(SPACE_ASKED), 30)
+check("16 места хватает — вопроса нет", not SPACE_ASKED, str(SPACE_ASKED))
+page19.stop_watch()
+# Теперь заставим проверку сработать: «свободно» меньше нужного
+real_usage = gui_torrent.shutil.disk_usage
+gui_torrent.shutil.disk_usage = lambda path: type(
+    "U", (), {"free": 1, "total": 1, "used": 0})()
+try:
+    started19 = page19.watch(IH, index=VIDEO_INDEX)
+finally:
+    gui_torrent.shutil.disk_usage = real_usage
+check("16 мало места: спросили до просмотра и «Отмена» его не начала",
+      len(SPACE_ASKED) == 1 and started19 is False
+      and not page19.is_watching(IH), str(SPACE_ASKED))
+check("16 в вопросе — размер недокачанного с запасом 10%",
+      SPACE_ASKED[0][1] > 0
+      and SPACE_ASKED[0][1] <= int(SIZES["видео 1.mkv"] * 1.1),
+      f"{SPACE_ASKED[0][1]} при файле {SIZES['видео 1.mkv']}")
+
+# 16з. Перезагрузка компьютера: временная раздача уходит целиком
+temp_dir19 = eng19.watch_dir(IH)
+check("16 перед «перезагрузкой» раздача и её папка есть",
+      eng19.is_temp(IH) and os.path.isdir(temp_dir19))
+eng19.shutdown(timeout=3.0)
+eng20 = te.TorrentEngine(
+    data_dir=eng19.data_dir, listen_interfaces="127.0.0.1:0",
+    extra_settings=ENGINE_SETTINGS, watch_root=eng19.watch_root,
+    boot_time=lambda: time.time())
+eng20.start()
+check("16 после перезагрузки временной раздачи и папки нет",
+      eng20.get(IH) is None
+      and wait_until(lambda: not os.path.exists(temp_dir19), 10))
+eng20.shutdown(timeout=2.0)
 ANSWER[gui_torrent.MODE_ADD] = download_all
 
 # ---- завершение: не оставить работающих потоков ----

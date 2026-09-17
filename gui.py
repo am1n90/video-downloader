@@ -2988,8 +2988,11 @@ class MainWindow(FluentWindow):
         # этом не убиваем: он отдельный процесс (решение №6).
         try:
             # Таймер подготовки плеера — до сервиса: иначе его тик успел
-            # бы дёрнуть refresh() уже по закрывающемуся движку
+            # бы дёрнуть refresh() уже по закрывающемуся движку.
+            # Наблюдатель за плеером — тоже: его поток должен уйти до
+            # движка, а последняя позиция просмотра — сохраниться
             self.torrent_page._end_prepare()
+            self.torrent_page.stop_watchers()
             self.torrent_stream.shutdown(timeout=1.0)
         except Exception:
             pass

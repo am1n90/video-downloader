@@ -639,6 +639,7 @@ class TorrentEngine:
         self._files = {}            # id -> tuple(TorrentFile) (после метаданных)
         self._chosen = {}           # id -> frozenset индексов, заказанных явно
         self._pending = set()       # id, ждущие выбора файлов (см. _add)
+        self._starting = set()      # id в процессе begin_download
         self._watch = {}            # id -> метка временной раздачи (.watch)
         self._rechecking = set()    # id под перепроверкой после finish_file
         self._recheck_queued = set()  # то же, но проверку начнём после
@@ -840,6 +841,21 @@ class TorrentEngine:
         with self._lock:
             was_pending = tid in self._pending
             self._pending.discard(tid)
+            # Пока идёт запуск, upload_mode ещё стоит, а «ждёт выбора» уже
+            # снято — без этой пометки снимок в этом окне выглядит как
+            # ошибка файла (признак ошибки — тот же флаг, находка 2), и
+            # карточка успевала нарисовать «Повторить»
+            if was_pending:
+                self._starting.add(tid)
+        try:
+            return self._begin(tid, handle, was_pending, priorities, focus,
+                               temporary)
+        finally:
+            with self._lock:
+                self._starting.discard(tid)
+            self._emit(tid, handle)
+
+    def _begin(self, tid, handle, was_pending, priorities, focus, temporary):
         if temporary and was_pending:
             # До снятия «данных не просить»: иначе первые куски успели бы
             # лечь в папку загрузок. Проскок magnet-ссылки (куски,
@@ -1859,8 +1875,8 @@ class TorrentEngine:
             pending = tid in self._pending
             temp = tid in self._watch
             # upload_mode перепроверки finish_file — наш, не ошибка файла
-            held = pending or tid in self._rechecking \
-                or tid in self._recheck_queued
+            held = pending or tid in self._starting \
+                or tid in self._rechecking or tid in self._recheck_queued
         if self._error_is_live(st, held):
             if not error:
                 errc = getattr(st, "errc", None)
