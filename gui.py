@@ -1815,14 +1815,16 @@ class ConfirmDeleteDialog(MessageBoxBase):
     подтверждении, выбранное состояние — в атрибуте delete_files.
     """
 
-    def __init__(self, count, parent=None):
+    def __init__(self, count, parent=None,
+                 text="Записи будут убраны из Библиотеки."):
         super().__init__(parent)
         self.delete_files = False
 
         self.viewLayout.addWidget(SubtitleLabel(
             f"Удалить {ru_records(count)}?", self))
-        self.viewLayout.addWidget(BodyLabel(
-            "Записи будут убраны из Библиотеки.", self))
+        body = BodyLabel(text, self)
+        body.setWordWrap(True)
+        self.viewLayout.addWidget(body)
         self.files_check = CheckBox("Удалить также файлы с диска", self)
         self.files_check.setChecked(False)
         self.files_check.stateChanged.connect(
@@ -1843,14 +1845,22 @@ class ConfirmDeleteDialog(MessageBoxBase):
 # ================= СТРАНИЦА: БИБЛИОТЕКА =================
 
 
-class LibraryPage(TransparentScrollArea):
-    def __init__(self, bridge, manager, settings, parent=None):
+class LibraryPageBase(TransparentScrollArea):
+    """Общая основа Библиотек обоих режимов (1.0.3 -> 1.4).
+
+    Заголовок, поиск, фильтр, «Удалить» по галочкам строк, «Очистить
+    данные библиотеки», пустая подсказка и контейнер строк. Подклассы
+    дают записи и строки (refresh, _delete_selected) и то, как очищается
+    их история (_has_records, _clear_records). У строки должен быть
+    CheckBox select_check.
+    """
+
+    CLEAR_TEXT = "Список загрузок будет очищен. Файлы на диске останутся."
+    DELETE_TEXT = "Записи будут убраны из Библиотеки."
+
+    def __init__(self, settings, filter_label, empty_text, parent=None):
         super().__init__(parent)
-        self.bridge = bridge
-        self.manager = manager
         self.settings = settings
-        # Живые воркеры миниатюр (чтобы не терять при refresh и закрытии)
-        self._thumb_workers = []
 
         self.setViewportMargins(SP_WINDOW, SP_WINDOW, SP_WINDOW, SP_WINDOW)
         self.setWidgetResizable(True)
@@ -1862,7 +1872,7 @@ class LibraryPage(TransparentScrollArea):
         self.vbox.setContentsMargins(0, 0, 0, 0)
         self.vbox.addWidget(TitleLabel("Библиотека"))
 
-        # Панель: поиск + фильтр по источнику
+        # Панель: поиск + фильтр
         filters = QHBoxLayout()
         filters.setSpacing(SP_GROUP)
 
@@ -1871,11 +1881,10 @@ class LibraryPage(TransparentScrollArea):
         self.search.textChanged.connect(lambda: self.refresh())
         filters.addWidget(self.search, stretch=1)
 
-        source_label = BodyLabel("Источник:", self)
-        filters.addWidget(source_label)
-        self.source_filter = ComboBox(self)
-        self.source_filter.currentIndexChanged.connect(lambda: self.refresh())
-        filters.addWidget(self.source_filter)
+        filters.addWidget(BodyLabel(filter_label, self))
+        self.filter_combo = ComboBox(self)
+        self.filter_combo.currentIndexChanged.connect(lambda: self.refresh())
+        filters.addWidget(self.filter_combo)
 
         # 1.0.3: управление записями — удаление выбранных и очистка списка.
         # «Удалить» активна при выбранной записи, «Очистить данные
@@ -1894,7 +1903,7 @@ class LibraryPage(TransparentScrollArea):
 
         self.vbox.addLayout(filters)
 
-        self.empty_label = BodyLabel("Здесь появятся завершённые загрузки")
+        self.empty_label = BodyLabel(empty_text)
         self.empty_label.setAlignment(Qt.AlignCenter)
         self.vbox.addWidget(self.empty_label, stretch=1)
 
@@ -1911,26 +1920,56 @@ class LibraryPage(TransparentScrollArea):
         self.vbox.addStretch(1)
         self.setWidget(inner)
 
-    def _entries(self):
-        """Записи истории (только они: чужие файлы из папки загрузок
-        не показываем — 1.0.3). get_history() оставляет только
-        существующие на диске файлы, дубли путей исключены
-        (дедуп в config.load/add_history).
-        """
-        import config as cfg
-        return list(cfg.get_history(self.settings))
+    # ---------- строки и фильтр ----------
+
+    def _row_widgets(self):
+        """Строки в порядке отображения."""
+        rows = []
+        for i in range(self.rows_vbox.count()):
+            item = self.rows_vbox.itemAt(i)
+            widget = item.widget() if item else None
+            if widget is not None and hasattr(widget, "select_check"):
+                rows.append(widget)
+        return rows
+
+    def _clear_rows(self):
+        """Убрать ТОЛЬКО строки (см. комментарий в __init__)."""
+        while self.rows_vbox.count():
+            item = self.rows_vbox.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _set_filter_items(self, items):
+        """Пересобрать фильтр («Все» + items), сохранив выбор, без
+        повторного вызова refresh. Возвращает выбранный пункт."""
+        self.filter_combo.blockSignals(True)
+        current = self.filter_combo.currentText()
+        self.filter_combo.clear()
+        self.filter_combo.addItem("Все")
+        self.filter_combo.addItems(items)
+        if current in ["Все"] + list(items):
+            self.filter_combo.setCurrentText(current)
+        else:
+            self.filter_combo.setCurrentIndex(0)
+        self.filter_combo.blockSignals(False)
+        return self.filter_combo.currentText()
+
+    def _show_rows(self, widgets):
+        """Разложить строки; пустая подсказка и кнопки — по результату."""
+        self.empty_label.setVisible(not widgets)
+        for widget in widgets:
+            self.rows_vbox.addWidget(widget)
+        # 1.0.3: строки пересозданы — выбор сброшен. «Удалить» неактивна
+        # без выбранных записей; очистка — при непустой истории.
+        self.delete_btn.setEnabled(False)
+        self.clear_btn.setEnabled(self._has_records())
 
     # ---------- 1.0.3: выбор, удаление записей, очистка списка ----------
 
     def _selected_rows(self):
         """Выбранные строки (в порядке отображения)."""
-        rows = []
-        for i in range(self.rows_vbox.count()):
-            item = self.rows_vbox.itemAt(i)
-            widget = item.widget() if item else None
-            if isinstance(widget, LibraryRow) and widget.select_check.isChecked():
-                rows.append(widget)
-        return rows
+        return [row for row in self._row_widgets()
+                if row.select_check.isChecked()]
 
     def _on_selection_changed(self):
         """Чекбокс строки переключён — пересчитать «Удалить»."""
@@ -1942,9 +1981,85 @@ class LibraryPage(TransparentScrollArea):
         Возвращает (ok, delete_files): ok — подтверждено; delete_files —
         стоит ли удалять файлы с диска (галочка, по умолчанию выключена).
         """
-        dialog = ConfirmDeleteDialog(count, self.window())
+        dialog = ConfirmDeleteDialog(count, self.window(), self.DELETE_TEXT)
         ok = bool(dialog.exec())
         return ok, (dialog.delete_files if ok else False)
+
+    def _confirm_clear(self):
+        """Подтверждение очистки списка (отдельно для тестируемости)."""
+        from qfluentwidgets import MessageBox
+        box = MessageBox("Очистить данные библиотеки", self.CLEAR_TEXT,
+                         self.window())
+        return bool(box.exec())
+
+    def _clear_library_data(self):
+        """Очистить список записей (файлы на диске не трогаются)."""
+        if not self._has_records():
+            return
+        if not self._confirm_clear():
+            return
+        self._clear_records()
+        config.save(self.settings)
+        self.refresh()
+        self._notify("success", "Данные библиотеки очищены")
+
+    def _notify(self, kind, text):
+        """Итог операции в InfoBar (в offscreen-тестах подменяется)."""
+        bar = InfoBar.warning if kind == "warning" else InfoBar.success
+        bar(
+            title="Библиотека",
+            content=text,
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=-1 if kind == "warning" else 4000,
+            parent=self.window(),
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh()
+
+    # ---------- у подклассов ----------
+
+    def refresh(self):
+        raise NotImplementedError
+
+    def _delete_selected(self):
+        raise NotImplementedError
+
+    def _has_records(self):
+        raise NotImplementedError
+
+    def _clear_records(self):
+        raise NotImplementedError
+
+
+class LibraryPage(LibraryPageBase):
+    def __init__(self, bridge, manager, settings, parent=None):
+        super().__init__(settings, "Источник:",
+                         "Здесь появятся завершённые загрузки", parent)
+        self.bridge = bridge
+        self.manager = manager
+        # Фильтр этой Библиотеки — по источнику
+        self.source_filter = self.filter_combo
+        # Живые воркеры миниатюр (чтобы не терять при refresh и закрытии)
+        self._thumb_workers = []
+
+    def _entries(self):
+        """Записи истории (только они: чужие файлы из папки загрузок
+        не показываем — 1.0.3). get_history() оставляет только
+        существующие на диске файлы, дубли путей исключены
+        (дедуп в config.load/add_history).
+        """
+        import config as cfg
+        return list(cfg.get_history(self.settings))
+
+    def _has_records(self):
+        return bool(self.settings.get("history"))
+
+    def _clear_records(self):
+        config.clear_history(self.settings)
 
     def _delete_selected(self):
         """Удалить выбранные записи из Библиотеки (по подтверждению).
@@ -1985,48 +2100,8 @@ class LibraryPage(TransparentScrollArea):
             self._notify("success",
                          "Удалено: " + ru_records(len(paths_to_remove)))
 
-    def _confirm_clear(self):
-        """Подтверждение очистки списка (отдельно для тестируемости)."""
-        from qfluentwidgets import MessageBox
-        box = MessageBox(
-            "Очистить данные библиотеки",
-            "Список загрузок будет очищен. Файлы на диске останутся.",
-            self.window(),
-        )
-        return bool(box.exec())
-
-    def _clear_library_data(self):
-        """Очистить список записей (файлы на диске не трогаются)."""
-        if not self.settings.get("history"):
-            return
-        if not self._confirm_clear():
-            return
-        config.clear_history(self.settings)
-        config.save(self.settings)
-        self.refresh()
-        self._notify("success", "Данные библиотеки очищены")
-
-    def _notify(self, kind, text):
-        """Итог операции в InfoBar (в offscreen-тестах подменяется)."""
-        bar = InfoBar.warning if kind == "warning" else InfoBar.success
-        bar(
-            title="Библиотека",
-            content=text,
-            orient=Qt.Horizontal,
-            isClosable=True,
-            position=InfoBarPosition.TOP,
-            duration=-1 if kind == "warning" else 4000,
-            parent=self.window(),
-        )
-
     def refresh(self):
-        # Очистить ТОЛЬКО строки в rows_vbox (постоянные элементы страницы
-        # не трогаем — см. комментарий в __init__).
-        while self.rows_vbox.count():
-            item = self.rows_vbox.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
+        self._clear_rows()
         entries = self._entries()
 
         # Собрать уникальные источники для фильтра
@@ -2036,21 +2111,9 @@ class LibraryPage(TransparentScrollArea):
             if src not in sources:
                 sources.append(src)
         sources.sort()
-
-        # Обновить фильтр без повторного вызова refresh
-        self.source_filter.blockSignals(True)
-        current = self.source_filter.currentText()
-        self.source_filter.clear()
-        self.source_filter.addItem("Все")
-        self.source_filter.addItems(sources)
-        if current in ["Все"] + sources:
-            self.source_filter.setCurrentText(current)
-        else:
-            self.source_filter.setCurrentIndex(0)
-        self.source_filter.blockSignals(False)
+        selected_source = self._set_filter_items(sources)
 
         # Фильтрация
-        selected_source = self.source_filter.currentText()
         query = self.search.text().strip().lower()
 
         rows = []
@@ -2063,19 +2126,7 @@ class LibraryPage(TransparentScrollArea):
                 continue
             rows.append(e)
 
-        if rows:
-            self.empty_label.hide()
-        else:
-            self.empty_label.show()
-
-        for e in rows:
-            card = self._make_row(e)
-            self.rows_vbox.addWidget(card)
-
-        # 1.0.3: строки пересозданы — выбор сброшен. «Удалить» неактивна
-        # без выбранных записей; очистка — при непустой истории.
-        self.delete_btn.setEnabled(False)
-        self.clear_btn.setEnabled(bool(self.settings.get("history")))
+        self._show_rows([self._make_row(e) for e in rows])
 
     def _make_row(self, entry):
         # Дополнить запись метаданными файла
@@ -2132,10 +2183,6 @@ class LibraryPage(TransparentScrollArea):
             except Exception:
                 pass
         self._thumb_workers.clear()
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self.refresh()
 
 
 # ================= СТРАНИЦА: НАСТРОЙКИ =================
@@ -2620,7 +2667,9 @@ class MainWindow(FluentWindow):
             stream=self.torrent_stream
         )
         self.torrent_page.setObjectName("torrentInterface")
-        self.torrent_library_page = gui_torrent.TorrentLibraryPage(self)
+        self.torrent_library_page = gui_torrent.TorrentLibraryPage(
+            self.torrent_page, self.torrent_bridge, self.settings, self
+        )
         self.torrent_library_page.setObjectName("torrentLibraryInterface")
 
         self.download_page.parent_window = self

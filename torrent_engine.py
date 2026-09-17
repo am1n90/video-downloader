@@ -178,6 +178,8 @@ class TorrentItem:
     selected_size: int = 0     # байт — сумма размеров выбранных файлов (для GUI)
     error: str = ""
     error_file: str = ""
+    added_time: int = 0        # с эпохи — когда раздачу добавили (из
+                               # fastresume, переживает перезапуск)
 
 
 class TorrentStream:
@@ -1317,7 +1319,8 @@ class TorrentEngine:
             save_path=st.save_path, has_metadata=bool(st.has_metadata),
             files=files,
             selected_size=sum(f.size for f in files if f.priority > 0),
-            error=error, error_file=error_file)
+            error=error, error_file=error_file,
+            added_time=int(getattr(st, "added_time", 0) or 0))
 
     def _emit(self, tid, handle, st=None):
         callback = self.on_change

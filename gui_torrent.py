@@ -4,8 +4,11 @@
 выбор файлов раздачи, карточки очереди, пауза/продолжение/удаление
 (1.3) и «Смотреть» — просмотр во время закачки во внешнем плеере
 (2.1: torrent_stream + player). В 2.2 к просмотру добавились индикатор
-подготовки плеера и отдельное окно «Что смотреть». «Библиотека» режима
-— заглушка.
+подготовки плеера и отдельное окно «Что смотреть».
+
+«Библиотека» режима (1.4) — TorrentLibraryPage на общей основе с
+Библиотекой видео (gui.LibraryPageBase). Список — своя история в
+settings.json (torrent_history), живое состояние подмешивается из движка.
 
 С 2.6 добавление идёт через ОДНО окно выбора (TorrentFilesDialog):
 раздача добавляется отложенно и не качает ничего, пока пользователь не
@@ -35,11 +38,13 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, CheckBox,
                             PrimaryPushButton, ProgressBar, PushButton,
                             StrongBodyLabel, SubtitleLabel, TitleLabel)
 
+import config
 import player
 import torrent_engine as te
 import torrent_stream as ts
 from downloader import fmt_eta, fmt_speed
-from gui import SP_BLOCK, SP_GROUP, SP_WINDOW, TransparentScrollArea, fmt_mb
+from gui import (SP_BLOCK, SP_GROUP, SP_WINDOW, LibraryPageBase,
+                 TransparentScrollArea, fmt_mb, ru_records)
 
 STATE_TEXT = {
     te.STATE_METADATA: "Получаем список файлов…",
@@ -100,27 +105,6 @@ def fmt_size(size):
     if size < 1024 * 1024:
         return f"{size / 1024:.0f} КБ"
     return fmt_mb(size)
-
-
-class _PlaceholderPage(TransparentScrollArea):
-    """Заголовок + пояснение, что появится на странице."""
-
-    def __init__(self, title, text, parent=None):
-        super().__init__(parent)
-        self.setViewportMargins(SP_WINDOW, SP_WINDOW, SP_WINDOW, SP_WINDOW)
-        self.setWidgetResizable(True)
-
-        inner = QWidget()
-        inner.setObjectName("scrollInner")
-        vbox = QVBoxLayout(inner)
-        vbox.setSpacing(SP_BLOCK)
-        vbox.setContentsMargins(0, 0, 0, 0)
-        vbox.addWidget(TitleLabel(title))
-        self.placeholder_label = BodyLabel(text)
-        self.placeholder_label.setWordWrap(True)
-        vbox.addWidget(self.placeholder_label)
-        vbox.addStretch(1)
-        self.setWidget(inner)
 
 
 def _build_folders(tree, files):
@@ -787,11 +771,65 @@ class TorrentPage(TransparentScrollArea):
         ok, delete_files = self.confirm_remove(TorrentCard._title(item))
         if not ok:
             return False
+        # Библиотека (1.4): без файлов запись остаётся («Убрана из
+        # Торрентов») — запоминаем, что успело скачаться, пока движок это
+        # знает; с файлами показывать больше нечего
+        self._sync_record(item)
         if not self._engine_call(
                 lambda: self.engine.remove(tid, delete_files=delete_files)):
             return False
+        if delete_files:
+            self._forget(tid)
         self.refresh()
         return True
+
+    # ------------------------------------------------- Библиотека 1.4
+
+    def _remember(self, tid):
+        """Записать раздачу в Библиотеку: пользователь ответил «Скачать»
+        или «Посмотреть». Не раньше — раздача после «Отмена» в
+        Библиотеку попадать не должна."""
+        item = self.engine.get(tid)
+        if item is None or not item.files:
+            return
+        done = done_indexes(self.engine, item) or ()
+        config.add_torrent_history(self.settings, library_record(item, done))
+        config.save(self.settings)
+
+    def _sync_record(self, item):
+        """Обновить запись раздачи: какие файлы скачаны целиком.
+
+        Пока раздача в движке, это знает file_progress; после снятия
+        раздачи — только запись. settings.json пишем лишь при изменении.
+        """
+        if not item.has_metadata or item.state in (te.STATE_METADATA,
+                                                   te.STATE_PENDING,
+                                                   te.STATE_CHECKING):
+            return
+        record = config.find_torrent_record(self.settings, item.id)
+        if record is None:
+            return
+        changes = {"name": TorrentCard._title(item),
+                   "save_path": item.save_path}
+        done = done_indexes(self.engine, item)
+        if done is not None:
+            # Индексы за пределами сохранённых файлов не хранимы — см.
+            # LIBRARY_FILES_MAX
+            files_len = len(record.get("files") or ())
+            changes["done"] = [i for i in done if i < files_len]
+        if config.update_torrent_history(self.settings, item.id, **changes):
+            config.save(self.settings)
+
+    def _forget(self, tid):
+        if config.remove_torrent_history(self.settings, [tid]):
+            config.save(self.settings)
+
+    def watching_index(self, tid):
+        """Какой файл раздачи сейчас смотрят; None — никакой."""
+        active = self._stream.active if self._stream is not None else None
+        if active is None or active[0] != tid:
+            return None
+        return active[1]
 
     # ------------------------------------------------- выбор файлов 2.6
 
@@ -851,6 +889,10 @@ class TorrentPage(TransparentScrollArea):
         if choice.action == ACTION_CANCEL:
             ok = self._engine_call(
                 lambda: self.engine.remove(tid, delete_files=True))
+            if ok:
+                # Файлы удалены — старая запись той же раздачи (если её
+                # добавляли повторно) указывала бы в пустоту
+                self._forget(tid)
             self.refresh()
             return ok
         if choice.save_path and choice.save_path != item.save_path:
@@ -864,9 +906,12 @@ class TorrentPage(TransparentScrollArea):
             if not self._engine_call(lambda: self.engine.begin_download(
                     tid, focus=choice.video.index)):
                 return False
+            self._remember(tid)
             return self.watch(tid, index=choice.video.index)
         ok = self._engine_call(lambda: self.engine.begin_download(
             tid, list(choice.priorities)))
+        if ok:
+            self._remember(tid)
         self.refresh()
         return ok
 
@@ -1194,12 +1239,652 @@ class TorrentPage(TransparentScrollArea):
             card.update_state(item)
         if item.id in self._awaiting and item.has_metadata:
             self._check_pending()
+        self._sync_record(item)
 
 
-class TorrentLibraryPage(_PlaceholderPage):
-    def __init__(self, parent=None):
-        super().__init__(
-            "Библиотека",
-            "Раздел в разработке. Здесь появятся скачанные раздачи.",
-            parent,
-        )
+# ================= Библиотека торрентов (1.4) =================
+#
+# Список — своя история в settings.json (config.torrent_history), а не
+# список раздач движка: «Очистить данные библиотеки» не должен трогать
+# раздачи, а раздача, снятая с «Торрентов» без удаления файлов, остаётся
+# в Библиотеке — фильм-то скачан. Живое состояние (качается, раздаётся,
+# сколько скачано) подмешивается из движка, пока раздача в нём есть.
+#
+# Процент раздачи здесь НЕ показываем: после focus_file (2.5) libtorrent
+# считает раздачу по одной выбранной серии — посмотрели серию 3, и
+# сериал «100%, Раздаётся», хотя из пяти серий есть одна. Считаем по
+# файлам: «Скачано 1 из 5 видеофайлов».
+
+LIB_DONE = "Скачано"
+LIB_PARTIAL = "Не докачано"
+LIB_REMOVED = "Убраны из Торрентов"
+LIB_FILTERS = (LIB_DONE, LIB_PARTIAL, LIB_REMOVED)
+
+FILE_OPEN = "open"      # скачан целиком — открыть системным плеером
+FILE_WATCH = "watch"    # не докачан, раздача в движке — смотреть потоком
+FILE_STOP = "stop"      # этот файл сейчас смотрят
+
+CHECK_WIDTH = 29        # галочка без текста: уже стиль qfluentwidgets не даёт
+NBSP = " "         # «+ 1 файл» и даты не рвём переносом строки
+
+# Раздачи с сотнями файлов (например, сборник серий по одной на файл)
+# не должны раздувать settings.json: храним пути только первых
+# LIBRARY_FILES_MAX файлов, остальные — только счётчиком и суммой
+# размера (files_more / files_more_size в записи). Обычно видео стоят
+# в начале списка раздачи, поэтому урезание хвоста задевает в первую
+# очередь служебные файлы; если видео всё же окажется за пределами
+# первых 50, оно попадёт в общий счётчик «+N файлов» без кнопки
+# «Смотреть» — известное ограничение, не разбор каждого случая.
+# Готовность скрытых файлов тоже не отслеживается: они всегда
+# учитываются в общем размере (files_more_size) и счётчике «+N файлов»,
+# но не в «Скачано X из Y» и не влияют на категорию Скачано/Не докачано.
+LIBRARY_FILES_MAX = 50
+
+
+def ru_plural(n, one, few, many):
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def library_record(item, done=()):
+    """Запись Библиотеки по снимку раздачи (см. config.add_torrent_history).
+
+    files обрезаны до LIBRARY_FILES_MAX (см. комментарий у константы);
+    done — тоже, индексы за пределами сохранённых файлов не хранимы.
+    """
+    kept = item.files[:LIBRARY_FILES_MAX]
+    extra = item.files[LIBRARY_FILES_MAX:]
+    record = {
+        "id": item.id,
+        "name": TorrentCard._title(item),
+        "save_path": item.save_path,
+        "added": int(item.added_time or time.time()),
+        "files": [[f.path, f.size] for f in kept],
+        "done": sorted(i for i in done if i < len(kept)),
+    }
+    if extra:
+        record["files_more"] = len(extra)
+        record["files_more_size"] = sum(f.size for f in extra)
+    return record
+
+
+def done_indexes(engine, item):
+    """Номера файлов, скачанных целиком; None — движок не ответил.
+
+    По file_progress, а не по размеру файла на диске: libtorrent создаёт
+    файлы сразу полного размера, недокачанный от готового не отличить.
+    """
+    try:
+        progress = engine.file_progress(item.id)
+    except Exception:
+        return None
+    if len(progress) < len(item.files):
+        return None
+    return sorted(f.index for f in item.files if progress[f.index] >= f.size)
+
+
+def record_path(record, rel):
+    """Путь файла записи на диске (разделитель — как в дереве файлов)."""
+    parts = str(rel).replace("\\", "/").split("/")
+    return os.path.join(record.get("save_path") or "", *parts)
+
+
+def _inside(root, path):
+    try:
+        return os.path.commonpath([root, path]) == root and path != root
+    except ValueError:              # разные диски
+        return False
+
+
+def remove_record_files(record):
+    """Удалить с диска файлы раздачи, которой уже нет в движке.
+
+    Ровно файлы записи, служебный .<id>.parts и опустевшие папки ВНУТРИ
+    папки сохранения; саму папку сохранения и чужие файлы не трогаем.
+    Пути вне папки сохранения (ручная правка settings.json) пропускаем.
+    Возвращает имена файлов, которые удалить не удалось.
+    """
+    if not record.get("save_path"):
+        return []
+    root = os.path.abspath(record["save_path"])
+    if not os.path.isdir(root):
+        return []
+    failed = []
+    folders = set()
+    for entry in record.get("files") or []:
+        try:
+            path = os.path.abspath(record_path(record, entry[0]))
+        except (TypeError, IndexError):
+            continue
+        if not _inside(root, path):
+            continue
+        parent = os.path.dirname(path)
+        while _inside(root, parent):
+            folders.add(parent)
+            parent = os.path.dirname(parent)
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                failed.append(os.path.basename(path))
+    try:
+        os.remove(os.path.join(root, f".{record['id']}.parts"))
+    except OSError:
+        pass
+    for folder in sorted(folders, key=len, reverse=True):
+        try:
+            os.rmdir(folder)            # только пустые
+        except OSError:
+            pass
+    return failed
+
+
+@dataclasses.dataclass(frozen=True)
+class LibraryFile:
+    """Файл записи для показа."""
+    index: int
+    name: str
+    size: int
+    done: int           # байт скачано
+    complete: bool
+    queued: bool        # движок его сейчас качает (приоритет > 0)
+    path: str           # на диске
+    action: str = ""    # FILE_* или "" — кнопки нет
+
+
+@dataclasses.dataclass(frozen=True)
+class LibraryView:
+    """Что показывает строка Библиотеки (запись + живое состояние)."""
+    record: dict
+    item: object            # TorrentItem или None — раздачи нет в движке
+    units: tuple            # LibraryFile: видео раздачи (нет видео — все файлы)
+    others: int             # сколько файлов не показано (субтитры, nfo…)
+    state_text: str
+    parts: tuple            # части подписи: состояние, сколько скачано…
+    category: str           # LIB_DONE / LIB_PARTIAL
+
+    @property
+    def multi(self):
+        return len(self.units) > 1
+
+    @property
+    def details(self):
+        return "  •  ".join(self.parts)
+
+
+def file_status(f, in_engine):
+    """Подпись файла. Невыбранная серия — «Не скачано», а не ошибка."""
+    if f.complete:
+        return "Скачано"
+    pct = int(f.done * 100 / f.size) if f.size else 0
+    if in_engine and f.queued:
+        return f"{pct}%"
+    return f"Не скачано ({pct}%)" if pct >= 1 else "Не скачано"
+
+
+class TorrentLibraryRow(CardWidget):
+    """Строка Библиотеки торрентов: раздача, а у сериала — и её серии.
+
+    Как у TorrentCard, кнопки пересоздаются только при смене их набора,
+    на тиках движка обновляются подписи.
+    """
+
+    def __init__(self, view, page):
+        super().__init__(page.rows_container)
+        self.page = page
+        self.record = view.record
+        self.tid = view.record["id"]
+        self._signature = None
+        self._file_labels = {}
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(SP_GROUP * 2, SP_GROUP * 2,
+                               SP_GROUP * 2, SP_GROUP * 2)
+        lay.setSpacing(SP_GROUP)
+
+        head = QHBoxLayout()
+        head.setSpacing(SP_GROUP * 2)
+        self.select_check = CheckBox(self)
+        # Без текста у CheckBox остаётся минимальная ширина под надпись —
+        # название раздачи уезжало вправо на лишние 35 px
+        self.select_check.setFixedWidth(CHECK_WIDTH)
+        self.select_check.stateChanged.connect(
+            lambda: page._on_selection_changed())
+        head.addWidget(self.select_check)
+
+        text = QVBoxLayout()
+        text.setSpacing(4)
+        self.title_label = StrongBodyLabel("", self)
+        self.title_label.setWordWrap(True)
+        text.addWidget(self.title_label)
+        self.details_label = BodyLabel("", self)
+        self.details_label.setWordWrap(True)
+        text.addWidget(self.details_label)
+        text.addStretch()
+        head.addLayout(text, stretch=1)
+
+        self.actions_widget = QWidget(self)
+        acts = QHBoxLayout(self.actions_widget)
+        acts.setContentsMargins(0, 0, 0, 0)
+        acts.setSpacing(SP_GROUP)
+        head.addWidget(self.actions_widget)
+        lay.addLayout(head)
+
+        self.files_widget = QWidget(self)
+        files = QVBoxLayout(self.files_widget)
+        # Серии — под названием раздачи, с отступом на ширину галочки
+        files.setContentsMargins(CHECK_WIDTH + SP_GROUP * 2, 0, 0, 0)
+        files.setSpacing(4)
+        lay.addWidget(self.files_widget)
+
+        self.update_view(view)
+
+    @staticmethod
+    def _clear(layout):
+        """Убрать виджеты раскладки (setParent(None) — см. TorrentCard)."""
+        while layout.count():
+            widget = layout.takeAt(0).widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+
+    @staticmethod
+    def _button(parent, text, slot, accent=False):
+        btn = PrimaryPushButton(text, parent) if accent else \
+            PushButton(text, parent)
+        btn.clicked.connect(slot)
+        parent.layout().addWidget(btn)
+        return btn
+
+    def _file_button(self, parent, f):
+        tid, index = self.tid, f.index
+        if f.action == FILE_OPEN:
+            self._button(parent, "Открыть",
+                         lambda: self.page.open_file(tid, index))
+        elif f.action == FILE_WATCH:
+            self._button(parent, "Смотреть",
+                         lambda: self.page.watch(tid, index), accent=True)
+        elif f.action == FILE_STOP:
+            self._button(parent, "Остановить просмотр",
+                         lambda: self.page.stop_watch(tid))
+
+    def buttons(self):
+        """Надписи кнопок строки и серий (для тестов и живых проверок)."""
+        return [btn.text() for btn in self.findChildren(PushButton)]
+
+    def update_view(self, view):
+        self.record = view.record
+        self.title_label.setText(view.record.get("name") or self.tid[:12])
+        # Внутри части пробелы неразрывные: «+ 1 файл» и дата не должны
+        # рваться переносом, а разрывы — только между частями
+        self.details_label.setText("  •  ".join(
+            part.replace(" ", NBSP) for part in view.parts))
+
+        expanded = self.page.is_expanded(self.tid)
+        signature = (view.multi, expanded,
+                     tuple((f.index, f.action) for f in view.units))
+        if signature != self._signature:
+            self._signature = signature
+            self._rebuild(view, expanded)
+        for f in view.units:
+            label = self._file_labels.get(f.index)
+            if label is not None:
+                label.setText(file_status(f, view.item is not None))
+
+    def _rebuild(self, view, expanded):
+        self._clear(self.actions_widget.layout())
+        self._clear(self.files_widget.layout())
+        self._file_labels = {}
+        tid = self.tid
+        if not view.multi and view.units:
+            self._file_button(self.actions_widget, view.units[0])
+        self._button(self.actions_widget, "Открыть папку",
+                     lambda: self.page.open_folder(tid))
+        if not view.multi:
+            self.files_widget.hide()
+            return
+        self._button(self.actions_widget,
+                     "Скрыть файлы" if expanded else "Показать файлы",
+                     lambda: self.page.toggle_expanded(tid))
+        self.files_widget.setVisible(expanded)
+        if not expanded:
+            return
+        for f in view.units:
+            line = QWidget(self.files_widget)
+            line_lay = QHBoxLayout(line)
+            line_lay.setContentsMargins(0, 0, 0, 0)
+            line_lay.setSpacing(SP_GROUP)
+            name = BodyLabel(f"{f.name}  •  {fmt_size(f.size)}", line)
+            name.setWordWrap(True)
+            line_lay.addWidget(name, stretch=1)
+            status = CaptionLabel("", line)
+            line_lay.addWidget(status)
+            self._file_labels[f.index] = status
+            # Кнопка в слоте постоянного размера: иначе строки с кнопкой
+            # выше и шире, и подписи «Скачано»/«Не скачано» не встают
+            # столбцом
+            slot = QWidget(line)
+            slot_lay = QHBoxLayout(slot)
+            slot_lay.setContentsMargins(0, 0, 0, 0)
+            slot_lay.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            slot.setFixedSize(self.page.file_slot_size())
+            self._file_button(slot, f)
+            line_lay.addWidget(slot)
+            self.files_widget.layout().addWidget(line)
+
+
+class TorrentLibraryPage(LibraryPageBase):
+    """Библиотека режима Torrent: что скачивали и смотрели через торренты.
+
+    Удаление записи ВСЕГДА снимает раздачу и с «Торрентов» (решение
+    владельца 17.09.2026): галочка решает только судьбу файлов. Раздача в
+    движке снимается engine.remove — он же убирает .fastresume, .chosen,
+    .pending и .parts, сирот в папке данных не остаётся.
+    """
+
+    CLEAR_TEXT = ("Список раздач будет очищен. Раздачи на странице "
+                  "«Торренты» и файлы на диске останутся.")
+    DELETE_TEXT = ("Раздачи будут убраны из Библиотеки и со страницы "
+                   "«Торренты».")
+
+    def __init__(self, torrent_page, bridge, settings, parent=None):
+        super().__init__(settings, "Показать:",
+                         "Здесь появятся раздачи, которые вы скачивали "
+                         "или смотрели", parent)
+        self.torrent_page = torrent_page
+        self.engine = torrent_page.engine
+        self._rows = {}
+        self._expanded = set()
+        self._slot_size = None
+        bridge.itemChanged.connect(self._on_item_changed)
+        bridge.queueChanged.connect(self._on_queue_changed)
+
+    def showEvent(self, event):
+        # Движок нужен и здесь: удалять раздачу из не запущенного движка
+        # нельзя — remove() без сессии не тронул бы fastresume, и раздача
+        # вернулась бы при следующем запуске
+        self.torrent_page.start_engine()
+        super().showEvent(event)
+
+    # ---------- данные ----------
+
+    def _has_records(self):
+        return bool(config.get_torrent_history(self.settings))
+
+    def _clear_records(self):
+        config.clear_history(self.settings, "torrent_history")
+
+    def view(self, record, item=None):
+        """Собрать то, что показывает строка (без виджетов — для тестов)."""
+        progress = None
+        if item is not None and item.has_metadata:
+            try:
+                progress = self.engine.file_progress(item.id)
+            except Exception:
+                progress = None
+        files = []
+        for index, entry in enumerate(record.get("files") or []):
+            try:
+                files.append((index, str(entry[0]), int(entry[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        done_set = set(record.get("done") or ())
+        live = progress is not None and len(progress) >= len(files)
+        priorities = {f.index: f.priority for f in item.files} \
+            if item is not None else {}
+        watching = self.torrent_page.watching_index(record["id"]) \
+            if item is not None else None
+        can_watch = item is not None and self.torrent_page.can_watch(item)
+
+        videos = [f for f in files if ts.is_video(f[1])]
+        shown_ids = {f[0] for f in (videos or files)}
+        units = []
+        done_bytes = 0
+        for index, rel, size in files:
+            if live:
+                done = min(int(progress[index]), size)
+                complete = progress[index] >= size
+            else:
+                complete = index in done_set
+                done = size if complete else 0
+            done_bytes += done
+            if index not in shown_ids:
+                continue
+            path = record_path(record, rel)
+            if watching == index:
+                action = FILE_STOP
+            elif complete and os.path.isfile(path):
+                action = FILE_OPEN
+            elif can_watch and ts.is_video(rel):
+                action = FILE_WATCH
+            else:
+                action = ""
+            units.append(LibraryFile(
+                index=index, name=rel.replace("\\", "/").split("/")[-1],
+                size=size, done=done, complete=complete,
+                queued=priorities.get(index, 0) > 0, path=path,
+                action=action))
+
+        all_done = bool(units) and all(u.complete for u in units)
+        if item is None:
+            state = "Убрана из Торрентов"
+        elif item.state == te.STATE_FINISHED:
+            state = "Скачано" if all_done else "Выбранное скачано"
+        else:
+            state = STATE_TEXT.get(item.state, item.state)
+
+        parts = [state]
+        watch = self.torrent_page.watch_status(record["id"]) \
+            if item is not None else ""
+        if watch:
+            parts.append(watch)
+        # files_more_size — сумма размеров файлов за пределами
+        # LIBRARY_FILES_MAX (их путей мы не храним)
+        total = sum(f[2] for f in files) + record.get("files_more_size", 0)
+        if len(units) > 1:
+            count = len(units)
+            one, many = ("видеофайла", "видеофайлов") if videos \
+                else ("файла", "файлов")
+            parts.append(f"Скачано {sum(u.complete for u in units)} из "
+                         f"{count} {ru_plural(count, one, many, many)}")
+        elif units and not all_done and item is not None:
+            unit = units[0]
+            parts.append(
+                f"{int(unit.done * 100 / unit.size) if unit.size else 0}%")
+        if done_bytes >= total:
+            parts.append(fmt_size(total))
+        else:
+            parts.append(f"{fmt_size(done_bytes)} из {fmt_size(total)}")
+        if record.get("added"):
+            try:
+                parts.append("Добавлено " + time.strftime(
+                    "%d.%m.%Y", time.localtime(int(record["added"]))))
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+        others = len(files) - len(units) + record.get("files_more", 0)
+        if others:
+            parts.append(f"+ {others} "
+                         + ru_plural(others, "файл", "файла", "файлов"))
+        return LibraryView(
+            record=record, item=item, units=tuple(units), others=others,
+            state_text=state, parts=tuple(parts),
+            category=LIB_DONE if all_done else LIB_PARTIAL)
+
+    @staticmethod
+    def _on_disk(record):
+        for entry in record.get("files") or []:
+            try:
+                if os.path.isfile(record_path(record, entry[0])):
+                    return True
+            except (TypeError, IndexError):
+                continue
+        return False
+
+    def _items(self):
+        try:
+            return {item.id: item for item in self.engine.items()}
+        except Exception:
+            return {}
+
+    # ---------- список ----------
+
+    def refresh(self):
+        self._clear_rows()
+        self._rows = {}
+        items = self._items()
+        selected = self._set_filter_items(list(LIB_FILTERS))
+        query = self.search.text().strip().lower()
+
+        widgets = []
+        for record in config.get_torrent_history(self.settings):
+            item = items.get(record["id"])
+            # Раздачи нет в движке и файлов на диске тоже — показывать
+            # нечего (как get_history у видео)
+            if item is None and not self._on_disk(record):
+                continue
+            if query and query not in str(record.get("name") or "").lower():
+                continue
+            if selected == LIB_REMOVED and item is not None:
+                continue
+            view = self.view(record, item)
+            if selected in (LIB_DONE, LIB_PARTIAL) \
+                    and view.category != selected:
+                continue
+            row = TorrentLibraryRow(view, self)
+            self._rows[record["id"]] = row
+            widgets.append(row)
+        self._show_rows(widgets)
+
+    def rows(self):
+        """Строки по id раздачи (для тестов и живых проверок)."""
+        return dict(self._rows)
+
+    def update_row(self, tid):
+        row = self._rows.get(tid)
+        record = config.find_torrent_record(self.settings, tid)
+        if row is None or record is None:
+            return
+        row.update_view(self.view(record, self.engine.get(tid)))
+
+    def _on_item_changed(self, item):
+        if self.isVisible() and item.id in self._rows:
+            self.update_row(item.id)
+
+    def _on_queue_changed(self):
+        if self.isVisible():
+            self.refresh()
+
+    def file_slot_size(self):
+        """Место под кнопку серии — по самой длинной надписи."""
+        if self._slot_size is None:
+            probe = PushButton("Остановить просмотр")
+            self._slot_size = probe.sizeHint()
+            probe.deleteLater()
+        return self._slot_size
+
+    def is_expanded(self, tid):
+        return tid in self._expanded
+
+    def toggle_expanded(self, tid):
+        self._expanded ^= {tid}
+        self.update_row(tid)
+
+    # ---------- действия строки ----------
+
+    def file_path(self, tid, index):
+        """Путь скачанного файла записи или "" (нет записи/файла)."""
+        record = config.find_torrent_record(self.settings, tid)
+        if record is None or not 0 <= index < len(record["files"]):
+            return ""
+        path = record_path(record, record["files"][index][0])
+        return path if os.path.isfile(path) else ""
+
+    def open_file(self, tid, index):
+        path = self.file_path(tid, index)
+        return bool(path) and QDesktopServices.openUrl(
+            QUrl.fromLocalFile(path))
+
+    def folder_of(self, tid):
+        """Папка раздачи: у многофайловой — её корневая папка."""
+        record = config.find_torrent_record(self.settings, tid)
+        if record is None:
+            return ""
+        folder = record.get("save_path") or ""
+        files = record.get("files") or []
+        if files:
+            parts = str(files[0][0]).replace("\\", "/").split("/")
+            root = os.path.join(folder, parts[0]) if len(parts) > 1 else ""
+            if root and os.path.isdir(root):
+                folder = root
+        return folder if os.path.isdir(folder) else ""
+
+    def open_folder(self, tid):
+        folder = self.folder_of(tid)
+        return bool(folder) and QDesktopServices.openUrl(
+            QUrl.fromLocalFile(folder))
+
+    def watch(self, tid, index):
+        """Смотреть недокачанный файл — тот же путь, что у карточки
+        (поток + focus_file: качаться начнёт именно эта серия)."""
+        started = self.torrent_page.watch(tid, index=index)
+        self.update_row(tid)
+        return started
+
+    def stop_watch(self, tid):
+        stopped = self.torrent_page.stop_watch()
+        self.update_row(tid)
+        return stopped
+
+    # ---------- удаление ----------
+
+    def _delete_selected(self):
+        """Удалить выбранные записи; раздачи снимаются и с «Торрентов».
+
+        Раздача в движке — engine.remove(delete_files=галочка). Раздачи в
+        движке нет — с галочкой удаляем файлы записи сами
+        (remove_record_files). Не удалось — запись остаётся, имя в InfoBar.
+        """
+        rows = self._selected_rows()
+        if not rows:
+            return
+        # Без сессии remove() не убрал бы fastresume — лучше не удалять
+        if not self.torrent_page.start_engine():
+            return
+        ok, delete_files = self._confirm_delete(len(rows))
+        if not ok:
+            return
+        # Записи — до первого remove: он сам вызовет refresh (queueChanged),
+        # и строки пересоздадутся
+        records = [row.record for row in rows]
+
+        failed = []
+        removed = []
+        for record in records:
+            tid = record["id"]
+            if self.engine.get(tid) is not None:
+                try:
+                    self.engine.remove(tid, delete_files=delete_files)
+                except Exception as exc:
+                    te.log.warning("library remove %s: %r", tid, exc)
+                    failed.append(record.get("name") or tid[:12])
+                    continue
+            elif delete_files:
+                bad = remove_record_files(record)
+                if bad:
+                    failed.extend(bad)
+                    continue
+            removed.append(tid)
+
+        config.remove_torrent_history(self.settings, removed)
+        config.save(self.settings)
+        self.torrent_page.refresh()
+        self.refresh()
+
+        if failed:
+            self._notify("warning", "Не удалены: " + ", ".join(failed))
+        elif removed:
+            self._notify("success", "Удалено: " + ru_records(len(removed)))

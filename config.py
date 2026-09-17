@@ -27,6 +27,9 @@ DEFAULTS = {
     "notifications": True,
     "window_geometry": None,                # "WxH" или null
     "history": [],                           # завершённые загрузки
+    # Библиотека торрентов (1.4): одна запись на раздачу (ключ — id),
+    # появляется, когда пользователь ответил «Скачать»/«Посмотреть»
+    "torrent_history": [],
     "check_updates": True,                   # автопроверка при старте
     "app_mode": "video",                     # режим приложения: video / torrent
     # Режим Torrent. torrent_port 0 — libtorrent выберет свободный сам;
@@ -241,6 +244,8 @@ def load():
         # (add_history всегда вставляет в начало). Некорректные записи
         # (не dict / без path) не трогаем — их фильтрует get_history().
         settings["history"] = _dedup_history(settings.get("history"))
+        settings["torrent_history"] = _dedup_history(
+            settings.get("torrent_history"), TORRENT_FIELD)
         _load_warning = None
         return settings
 
@@ -260,21 +265,36 @@ def consume_load_warning():
     return warning
 
 
-def _dedup_history(history):
-    """Одна запись истории на путь (остаётся самая новая — первая).
+HISTORY_MAX = 200         # записей в каждой истории
+HISTORY_FIELD = "path"    # история видео: один файл — одна запись
+TORRENT_FIELD = "id"      # история торрентов: одна раздача — одна запись
+
+
+def _record_key(entry, field):
+    """Ключ записи истории или None (запись без ключа не сравнивается).
+
+    Сравнение — через os.path.normcase, как во всём коде: Windows не
+    различает регистр путей. id раздачи — строчный hex, ему это не мешает.
+    """
+    if not isinstance(entry, dict) or not entry.get(field):
+        return None
+    return os.path.normcase(str(entry[field]))
+
+
+def _dedup_history(history, field=HISTORY_FIELD):
+    """Одна запись истории на ключ (остаётся самая новая — первая).
 
     Новая запись всегда в начале списка (add_history -> insert(0)), поэтому
-    при обходе с начала первая встречная запись пути и есть самая новая.
-    Сравнение путей — как во всём коде: os.path.normcase (Windows не
-    различает регистр). Записи без path не дедуплицируются.
+    при обходе с начала первая встречная запись ключа и есть самая новая.
+    Записи без ключа не дедуплицируются.
     """
     if not isinstance(history, list):
         return history
     seen = set()
     result = []
     for entry in history:
-        if isinstance(entry, dict) and entry.get("path"):
-            key = os.path.normcase(entry["path"])
+        key = _record_key(entry, field)
+        if key is not None:
             if key in seen:
                 continue
             seen.add(key)
@@ -338,6 +358,33 @@ def save(settings):
             pass
 
 
+def _add_record(settings, name, field, entry):
+    """Вставить запись в начало истории name; запись с тем же ключом
+    заменяется (новая встаёт в начало, дубля нет)."""
+    with _lock:
+        history = list(settings.get(name) or [])
+        key = _record_key(entry, field)
+        if key is not None:
+            history = [e for e in history if _record_key(e, field) != key]
+        history.insert(0, entry)
+        settings[name] = history[:HISTORY_MAX]
+
+
+def _remove_records(settings, name, field, values):
+    """Убрать записи с указанными ключами; вернуть число удалённых."""
+    keys = {_record_key({field: v}, field) for v in values if v}
+    removed = 0
+    with _lock:
+        kept = []
+        for e in settings.get(name) or []:
+            if _record_key(e, field) in keys:
+                removed += 1
+            else:
+                kept.append(e)
+        settings[name] = kept
+    return removed
+
+
 def add_history(settings, entry):
     """Добавить завершённую загрузку в историю (в начало).
 
@@ -346,16 +393,7 @@ def add_history(settings, entry):
     удаляется — новая встаёт в начало (замена, не дубль). До 1.0.3 путь не
     проверялся и повторная загрузка того же файла дублировала запись.
     """
-    with _lock:
-        history = list(settings.get("history", []))
-        path = entry.get("path") if isinstance(entry, dict) else None
-        if path:
-            key = os.path.normcase(path)
-            history = [e for e in history
-                        if not (isinstance(e, dict) and e.get("path")
-                                and os.path.normcase(e["path"]) == key)]
-        history.insert(0, entry)
-        settings["history"] = history[:200]  # максимум 200 записей
+    _add_record(settings, "history", HISTORY_FIELD, entry)
 
 
 def remove_history(settings, paths):
@@ -366,24 +404,15 @@ def remove_history(settings, paths):
     удалённых записей. Файлы на диске не затрагиваются — их удаляет
     вызывающий код (gui) по отдельному подтверждению пользователя.
     """
-    keys = {os.path.normcase(p) for p in paths if p}
-    removed = 0
-    with _lock:
-        kept = []
-        for e in settings.get("history", []):
-            if (isinstance(e, dict) and e.get("path")
-                    and os.path.normcase(e["path"]) in keys):
-                removed += 1
-            else:
-                kept.append(e)
-        settings["history"] = kept
-    return removed
+    return _remove_records(settings, "history", HISTORY_FIELD, paths)
 
 
-def clear_history(settings):
-    """Очистить историю целиком (только записи; файлы не трогаются)."""
+def clear_history(settings, name="history"):
+    """Очистить историю целиком (только записи; файлы не трогаются).
+
+    name — "history" (видео) или "torrent_history" (раздачи)."""
     with _lock:
-        settings["history"] = []
+        settings[name] = []
 
 
 def get_history(settings):
@@ -394,3 +423,54 @@ def get_history(settings):
         e for e in history
         if isinstance(e, dict) and e.get("path") and os.path.isfile(e["path"])
     ]
+
+
+# ---------- Библиотека торрентов (1.4) ----------
+# Запись: {id, name, save_path, added, files: [[путь в раздаче, размер]],
+# done: [номера файлов, скачанных целиком]}. Отдельный ключ, тот же
+# механизм (блокировка, атомарный save): второго хранилища не делаем.
+
+
+def add_torrent_history(settings, entry):
+    """Добавить раздачу в Библиотеку (в начало; тот же id — замена)."""
+    _add_record(settings, "torrent_history", TORRENT_FIELD, entry)
+
+
+def update_torrent_history(settings, tid, **changes):
+    """Обновить поля записи на месте, не двигая её в списке.
+
+    Возвращает True, если что-то действительно изменилось, — по нему
+    вызывающий решает, сохранять ли settings.json (снимки движка идут
+    дважды в секунду, писать файл на каждом незачем).
+    """
+    with _lock:
+        for entry in settings.get("torrent_history") or []:
+            if isinstance(entry, dict) and entry.get(TORRENT_FIELD) == tid:
+                changed = {k: v for k, v in changes.items()
+                           if entry.get(k) != v}
+                entry.update(changed)
+                return bool(changed)
+    return False
+
+
+def remove_torrent_history(settings, ids):
+    """Убрать раздачи из Библиотеки; вернуть число удалённых записей.
+    Раздачи в движке и файлы на диске не затрагиваются."""
+    return _remove_records(settings, "torrent_history", TORRENT_FIELD, ids)
+
+
+def get_torrent_history(settings):
+    """Записи Библиотеки торрентов (некорректные отброшены)."""
+    with _lock:
+        history = list(settings.get("torrent_history") or [])
+    return [e for e in history
+            if isinstance(e, dict) and e.get(TORRENT_FIELD)
+            and isinstance(e.get("files"), list)]
+
+
+def find_torrent_record(settings, tid):
+    """Запись раздачи или None."""
+    for entry in get_torrent_history(settings):
+        if entry[TORRENT_FIELD] == tid:
+            return entry
+    return None

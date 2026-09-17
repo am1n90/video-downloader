@@ -16,6 +16,9 @@
 видеофайлами и индикатор подготовки плеера. Сессия 2.6 — сценарии 12
 (новый поток добавления: ожидание списка файлов, «Отмена» / «Скачать» /
 «Посмотреть») и 13 (само окно: галочки и выделение — разные ответы).
+Долг 1.4 — сценарий 14: Библиотека торрентов (запись после «Скачать» /
+«Посмотреть», удаление с галочкой и без, «Очистить», раздача после
+focus_file).
 
 Окно выбора модальное, поэтому в тесте подменяется ЕДИНСТВЕННАЯ точка
 его показа — TorrentPage.ask_choice (см. ANSWER ниже).
@@ -142,6 +145,7 @@ def same_as_source(save_path, rel):
 
 
 PAGES = []
+BRIDGES = {}
 
 
 def make_page(name):
@@ -157,6 +161,7 @@ def make_page(name):
     settings = {"torrent_folder": save_dir, "default_folder": save_dir}
     page = gui_torrent.TorrentPage(engine, bridge, settings)
     PAGES.append((page, engine))
+    BRIDGES[page] = bridge
     return page, engine, save_dir
 
 
@@ -1190,6 +1195,349 @@ check("13 у фильма «Посмотреть» активна сразу, б
       dlg13b.watch_btn.isEnabled()
       and dlg13b.watch_target().index == VIDEO_INDEX)
 dlg13b.deleteLater()
+
+# ---- 14. Библиотека торрентов (долг 1.4) ----
+# Своя история в settings (torrent_history), живое состояние — из движка.
+# Запись появляется только после «Скачать»/«Посмотреть»; удаление записи
+# снимает раздачу и с «Торрентов» (галочка — только судьба файлов);
+# «Очистить» раздачи и файлы не трогает; раздача после focus_file не
+# выглядит «готовой».
+import json
+
+seed.h.set_upload_limit(0)
+for _page, _eng in PAGES:
+    try:
+        _eng.pause(IH)                  # чужие проверки сделаны, канал общий
+    except Exception:
+        pass
+LAUNCHED.clear()
+
+
+def library_for(page):
+    lib = gui_torrent.TorrentLibraryPage(page, BRIDGES[page],
+                                         page.settings)
+    lib._notify = lambda kind, text: NOTES.append((kind, text))
+    return lib
+
+
+NOTES = []
+SIDE_FILES = (te.RESUME_EXT, te.CHOSEN_EXT, te.PENDING_EXT)
+
+
+def data_files(engine):
+    return sorted(name for name in os.listdir(engine.resume_dir)
+                  if name.startswith(IH))
+
+
+def record15(page):
+    return config.find_torrent_record(page.settings, IH)
+
+
+# 14а. «Отмена» — записи нет
+ANSWER[gui_torrent.MODE_ADD] = cancel_answer
+ASKED.clear()
+page15, eng15, save15 = make_page("s15")
+page15.show()
+pump(0.3)
+page15.magnet_edit.setText(magnet())
+page15.add_magnet()
+wait_until(lambda: eng15.get(IH) is None and ASKED, 30)
+pump(0.3)
+check("14 после «Отмена» раздача в Библиотеку не попала",
+      eng15.get(IH) is None and record15(page15) is None,
+      str(page15.settings.get("torrent_history")))
+
+# 14б. «Скачать» — запись с файлами, датой и тем, что скачано
+ANSWER[gui_torrent.MODE_ADD] = download_all
+saves_before = len(SAVES)
+page15.magnet_edit.setText(magnet())
+page15.add_magnet()
+check("14 «Скачать»: окно ответило", wait_ready(page15))
+rec = record15(page15)
+check("14 «Скачать» создал запись: id, название, папка, файлы, дата",
+      rec is not None and rec["save_path"] == save15
+      and [f[0] for f in rec["files"]] == FILE_ORDER
+      and [f[1] for f in rec["files"]] == [TI.files().file_size(i)
+                                           for i in range(TI.num_files())]
+      and abs(rec["added"] - time.time()) < 120,
+      str(rec))
+check("14 запись сохранена в settings.json (config.save)",
+      len(SAVES) > saves_before
+      and any(e.get("id") == IH for e in SAVES[-1].get("torrent_history", [])))
+ok = wait_until(lambda: state_of(page15, IH) == te.STATE_SEEDING, 60)
+check("14 докачано: в записи все файлы помечены скачанными",
+      ok and wait_until(lambda: record15(page15)["done"]
+                        == list(range(len(FILE_ORDER))), 10),
+      str(record15(page15)))
+
+lib15 = library_for(page15)
+lib15.show()
+pump(0.3)
+row15 = lib15.rows().get(IH)
+check("14 Библиотека показала раздачу одной строкой",
+      row15 is not None and len(lib15.rows()) == 1
+      and not lib15.empty_label.isVisible())
+view15 = lib15.view(record15(page15), eng15.get(IH))
+check("14 сериал: «Скачано 2 из 2 видеофайлов», «+ 1 файл», «Раздаётся»",
+      "Скачано 2 из 2 видеофайлов" in view15.details
+      and "+ 1 файл" in view15.details
+      and view15.state_text == "Раздаётся"
+      and view15.category == gui_torrent.LIB_DONE, view15.details)
+check("14 свёрнутая строка: «Открыть папку», «Показать файлы»",
+      row15.buttons() == ["Открыть папку", "Показать файлы"],
+      str(row15.buttons()))
+lib15.toggle_expanded(IH)
+pump(0.2)
+check("14 развёрнуто: у каждой скачанной серии «Открыть»",
+      row15.buttons().count("Открыть") == 2
+      and "Скрыть файлы" in row15.buttons(), str(row15.buttons()))
+check("14 путь скачанного файла и папка раздачи",
+      lib15.file_path(IH, VIDEO_INDEX) == os.path.join(save15, VIDEO_REL)
+      and lib15.folder_of(IH) == os.path.join(save15, "Тестовая раздача"),
+      f"{lib15.file_path(IH, VIDEO_INDEX)} | {lib15.folder_of(IH)}")
+for _ in range(5):
+    lib15.refresh()
+pump(0.2)
+check("14 повторный refresh без дублей и крашей",
+      len(lib15.rows()) == 1 and len(lib15._row_widgets()) == 1)
+lib15.search.setText("нет такой раздачи")
+pump(0.1)
+hidden = len(lib15.rows()) == 0
+lib15.search.setText("")
+pump(0.1)
+check("14 поиск по названию", hidden and len(lib15.rows()) == 1)
+
+# 14в. Удаление записи без галочки: раздача снята, файлы на месте, сирот нет
+lib15._confirm_delete = lambda count: (True, False)
+lib15.rows()[IH].select_check.setChecked(True)
+check("14 «Удалить» активна при выбранной записи",
+      lib15.delete_btn.isEnabled())
+lib15._delete_selected()
+pump(0.5)
+check("14 без галочки: раздача снята с «Торрентов»",
+      eng15.get(IH) is None and IH not in page15._cards)
+check("14 без галочки: нет .fastresume/.chosen/.pending",
+      wait_until(lambda: not data_files(eng15), 5), str(data_files(eng15)))
+check("14 без галочки: файлы на диске целы",
+      all(same_as_source(save15, rel) for rel in FILE_ORDER))
+check("14 без галочки: запись убрана, InfoBar «Удалено: 1 запись»",
+      record15(page15) is None and not lib15.rows()
+      and NOTES[-1] == ("success", "Удалено: 1 запись"), str(NOTES[-1:]))
+
+# 14г. focus_file: смотрят одну серию — раздача не выглядит «готовой»
+ANSWER[gui_torrent.MODE_ADD] = watch_file(VIDEO_INDEX)
+page16, eng16, save16 = make_page("s16")
+page16.show()
+pump(0.3)
+page16.magnet_edit.setText(magnet())
+page16.add_magnet()
+check("14 «Посмотреть» запустил просмотр",
+      wait_until(lambda: page16.is_watching(IH), 30))
+check("14 «Посмотреть» тоже создал запись", record15(page16) is not None)
+check("14 выбранная серия скачалась",
+      wait_until(lambda: eng16.file_progress(IH)[VIDEO_INDEX]
+                 >= TI.files().file_size(VIDEO_INDEX), 60))
+page16.stop_watch()
+check("14 раздача перешла в «Раздаётся»",
+      wait_until(lambda: state_of(page16, IH) == te.STATE_SEEDING, 30),
+      state_of(page16, IH))
+check("14 в записи скачанной помечена только эта серия",
+      wait_until(lambda: VIDEO_INDEX in record15(page16)["done"]
+                 and OTHER_INDEX not in record15(page16)["done"], 10),
+      str(record15(page16)))
+lib16 = library_for(page16)
+lib16.show()
+pump(0.3)
+item16 = eng16.get(IH)
+view16 = lib16.view(record15(page16), item16)
+check("14 частичный приоритет: «Скачано 1 из 2», категория «Не докачано»",
+      "Скачано 1 из 2 видеофайлов" in view16.details
+      and view16.category == gui_torrent.LIB_PARTIAL
+      and " из " in view16.details.split("  •  ")[2], view16.details)
+units16 = {u.index: u for u in view16.units}
+check("14 частичный приоритет: серия «Скачано», соседняя «Не скачано»",
+      gui_torrent.file_status(units16[VIDEO_INDEX], True) == "Скачано"
+      and gui_torrent.file_status(units16[OTHER_INDEX], True)
+      .startswith("Не скачано"),
+      f"{gui_torrent.file_status(units16[VIDEO_INDEX], True)} | "
+      f"{gui_torrent.file_status(units16[OTHER_INDEX], True)}")
+check("14 частичный приоритет: соседнюю серию можно смотреть",
+      units16[VIDEO_INDEX].action == gui_torrent.FILE_OPEN
+      and units16[OTHER_INDEX].action == gui_torrent.FILE_WATCH,
+      f"{units16[VIDEO_INDEX].action} {units16[OTHER_INDEX].action}")
+finished16 = lib16.view(record15(page16),
+                        dataclasses.replace(item16, state=te.STATE_FINISHED))
+check("14 раздача без раздачи: «Выбранное скачано», а не «Готово»",
+      finished16.state_text == "Выбранное скачано", finished16.state_text)
+lib16.filter_combo.setCurrentText(gui_torrent.LIB_DONE)
+pump(0.1)
+in_done = IH in lib16.rows()
+lib16.filter_combo.setCurrentText(gui_torrent.LIB_PARTIAL)
+pump(0.1)
+check("14 фильтр: частичная раздача в «Не докачано», не в «Скачано»",
+      not in_done and IH in lib16.rows())
+lib16.filter_combo.setCurrentIndex(0)
+pump(0.1)
+
+# 14д. Снять раздачу с карточки без файлов — запись остаётся
+page16.confirm_remove = lambda name: (True, False)
+page16.remove(IH)
+pump(0.5)
+rec16 = record15(page16)
+check("14 карточка без файлов: запись осталась, скачанное помнит",
+      eng16.get(IH) is None and rec16 is not None
+      and VIDEO_INDEX in rec16["done"]
+      and OTHER_INDEX not in rec16["done"], str(rec16))
+view16b = lib16.view(rec16, None)
+check("14 снятая раздача: «Убрана из Торрентов», серия открывается",
+      view16b.state_text == "Убрана из Торрентов"
+      and {u.index: u.action for u in view16b.units}
+      == {VIDEO_INDEX: gui_torrent.FILE_OPEN, OTHER_INDEX: ""},
+      view16b.details)
+lib16.filter_combo.setCurrentText(gui_torrent.LIB_REMOVED)
+pump(0.1)
+check("14 фильтр «Убраны из Торрентов»", IH in lib16.rows())
+lib16.filter_combo.setCurrentIndex(0)
+pump(0.1)
+
+# 14е. Запись переживает сохранение: JSON туда-обратно + дедуп при load
+restored = json.loads(json.dumps(page16.settings, ensure_ascii=False))
+restored["torrent_history"] = config._dedup_history(
+    restored["torrent_history"] + restored["torrent_history"],
+    config.TORRENT_FIELD)
+check("14 после перезапуска запись та же (дубли схлопнуты)",
+      [e for e in restored["torrent_history"] if e["id"] == IH] == [rec16],
+      str(restored["torrent_history"]))
+
+# 14ж. Удаление с галочкой записи, которой нет в движке: занятый файл
+locked = open(os.path.join(save16, VIDEO_REL), "rb")
+lib16._confirm_delete = lambda count: (True, True)
+lib16.rows()[IH].select_check.setChecked(True)
+lib16._delete_selected()
+pump(0.2)
+check("14 занятый файл: запись осталась, имя в InfoBar",
+      record15(page16) is not None
+      and NOTES[-1] == ("warning", "Не удалены: видео 1.mkv"),
+      str(NOTES[-1:]))
+locked.close()
+lib16.rows()[IH].select_check.setChecked(True)
+lib16._delete_selected()
+pump(0.2)
+root16 = os.path.join(save16, "Тестовая раздача")
+check("14 с галочкой без движка: файлы и папка раздачи удалены",
+      not os.path.exists(root16) and os.path.isdir(save16),
+      str(os.listdir(save16)))
+check("14 с галочкой без движка: запись убрана",
+      record15(page16) is None and not lib16.rows())
+
+# 14з. Удаление с галочкой раздачи в движке
+ANSWER[gui_torrent.MODE_ADD] = download_all
+page15.magnet_edit.setText(magnet())
+page15.add_magnet()
+check("14 снова «Скачать»", wait_ready(page15)
+      and wait_until(lambda: state_of(page15, IH) == te.STATE_SEEDING, 60))
+lib15.refresh()
+lib15._confirm_delete = lambda count: (True, True)
+lib15.rows()[IH].select_check.setChecked(True)
+lib15._delete_selected()
+check("14 с галочкой: раздача снята, файлы удалены движком",
+      eng15.get(IH) is None
+      and wait_until(lambda: not os.path.exists(
+          os.path.join(save15, VIDEO_REL)), 10),
+      str(os.listdir(save15)))
+check("14 с галочкой: сирот в папке данных нет, записи нет",
+      wait_until(lambda: not data_files(eng15), 5)
+      and record15(page15) is None, str(data_files(eng15)))
+
+# 14и. Карточка с файлами — запись уходит вместе с ними
+page15.magnet_edit.setText(magnet())
+page15.add_magnet()
+wait_ready(page15)
+check("14 запись есть перед удалением с карточки",
+      record15(page15) is not None)
+page15.confirm_remove = lambda name: (True, True)
+page15.remove(IH)
+pump(0.3)
+check("14 карточка с файлами: запись убрана", record15(page15) is None)
+
+# 14к. «Очистить данные библиотеки»: раздачи и файлы не трогаются
+page15.magnet_edit.setText(magnet())
+page15.add_magnet()
+check("14 перед очисткой: раздача качается и есть в Библиотеке",
+      wait_ready(page15)
+      and wait_until(lambda: state_of(page15, IH) == te.STATE_SEEDING, 60)
+      and record15(page15) is not None)
+lib15.refresh()
+check("14 «Очистить» активна при непустой истории",
+      lib15.clear_btn.isEnabled())
+lib15._confirm_clear = lambda: True
+lib15._clear_library_data()
+pump(1.5)                             # снимки движка идут дальше
+check("14 очистка: список пуст, записи не вернулись со снимками движка",
+      not lib15.rows() and record15(page15) is None
+      and page15.settings.get("torrent_history") == [])
+check("14 очистка: раздача в движке и файлы на месте",
+      eng15.get(IH) is not None and IH in page15._cards
+      and all(same_as_source(save15, rel) for rel in FILE_ORDER))
+check("14 очистка: InfoBar, кнопка неактивна",
+      NOTES[-1] == ("success", "Данные библиотеки очищены")
+      and not lib15.clear_btn.isEnabled())
+
+# 14л. Файлы записи вне папки сохранения не удаляются
+outside = os.path.join(BASE, "чужой.txt")
+with open(outside, "wb") as f:
+    f.write(b"x")
+bad_record = {"id": "0" * 40, "save_path": save16,
+              "files": [["../чужой.txt", 1], [None, 1], "мусор"]}
+check("14 путь за пределами папки сохранения не удаляется",
+      gui_torrent.remove_record_files(bad_record) == []
+      and os.path.isfile(outside))
+check("14 ru_plural: 1 файл, 2 файла, 5 файлов, 11 файлов, 21 файл",
+      [gui_torrent.ru_plural(n, "файл", "файла", "файлов")
+       for n in (1, 2, 5, 11, 21)]
+      == ["файл", "файла", "файлов", "файлов", "файл"])
+
+# 14м. Лимит файлов записи: раздача с сотнями файлов не раздувает
+# settings.json — хранятся пути только первых LIBRARY_FILES_MAX, дальше
+# только счётчик и сумма размера (done тоже обрезан)
+FAKE_TOTAL = gui_torrent.LIBRARY_FILES_MAX + 7
+fake_files = tuple(
+    te.TorrentFile(i, f"файл{i:03d}.bin", 1000 + i, 4)
+    for i in range(FAKE_TOTAL))
+fake_item = te.TorrentItem(
+    id="f" * 40, name="Раздача с кучей файлов", state=te.STATE_SEEDING,
+    progress=1.0, download_rate=0, upload_rate=0, num_peers=0, num_seeds=1,
+    wanted_size=0, wanted_done=0, total_size=sum(f.size for f in fake_files),
+    save_path=save15, has_metadata=True, files=fake_files,
+    selected_size=sum(f.size for f in fake_files),
+    added_time=int(time.time()))
+fake_record = gui_torrent.library_record(fake_item, set(range(FAKE_TOTAL)))
+check("14 лимит файлов: хранится не больше LIBRARY_FILES_MAX",
+      len(fake_record["files"]) == gui_torrent.LIBRARY_FILES_MAX,
+      str(len(fake_record["files"])))
+extra_count = FAKE_TOTAL - gui_torrent.LIBRARY_FILES_MAX
+extra_size = sum(f.size for f in fake_files[gui_torrent.LIBRARY_FILES_MAX:])
+check("14 лимит файлов: files_more и files_more_size верны",
+      fake_record["files_more"] == extra_count
+      and fake_record["files_more_size"] == extra_size,
+      str((fake_record.get("files_more"), fake_record.get("files_more_size"))))
+check("14 лимит файлов: done обрезан до сохранённых файлов",
+      fake_record["done"] == list(range(gui_torrent.LIBRARY_FILES_MAX)),
+      f"хвост: {fake_record['done'][-3:]}")
+
+fake_view = lib15.view(fake_record, None)
+# view.details — «сырые» части без NBSP; неразрывные пробелы подставляет
+# только строка (TorrentLibraryRow.update_view) для отображения
+tail_marker = f"+ {extra_count} файлов"
+shown_total = gui_torrent.fmt_size(
+    fake_record["files_more_size"] + sum(e[1] for e in fake_record["files"]))
+check("14 лимит файлов: «+N файлов» и общий размер учитывают скрытый хвост",
+      tail_marker in fake_view.details and shown_total in fake_view.details,
+      fake_view.details)
+
+for lib in (lib15, lib16):
+    lib.close()
+ANSWER[gui_torrent.MODE_ADD] = download_all
 
 # ---- завершение: не оставить работающих потоков ----
 for page, engine in PAGES:
