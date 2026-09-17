@@ -750,6 +750,15 @@ class TorrentPage(TransparentScrollArea):
         except Exception as exc:
             self._notify("warning", f"Не удалось добавить раздачу: {exc}")
             return False
+        if tid and not self.is_pending(tid):
+            # Раздача уже была в списке и качается/раздаётся: движок просто
+            # вернул её id. Окно «Что скачать» ей не показываем — его
+            # «Отмена» удаляет раздачу ВМЕСТЕ С ФАЙЛАМИ, и повторно
+            # вставленный magnet стирал бы уже скачанное (найдено на
+            # установленной копии перед релизом 1.1.0)
+            self._notify("info", "Эта раздача уже в списке")
+            self.refresh()
+            return True
         if tid and tid not in self._awaiting:
             self._awaiting.append(tid)
         self.refresh()          # refresh откроет окно, если файлы уже есть
@@ -852,6 +861,12 @@ class TorrentPage(TransparentScrollArea):
             tid = self._awaiting[0]
             item = self.engine.get(tid)
             if item is None:                    # раздачу уже убрали
+                self._awaiting.pop(0)
+                continue
+            if not self.is_pending(tid):
+                # Уже не ждёт выбора (ответили через «Выбрать файлы» на
+                # карточке): окно добавления с «Отменой», удаляющей файлы,
+                # такой раздаче показывать нельзя
                 self._awaiting.pop(0)
                 continue
             if not item.has_metadata:

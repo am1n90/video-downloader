@@ -19,6 +19,8 @@
 Долг 1.4 — сценарий 14: Библиотека торрентов (запись после «Скачать» /
 «Посмотреть», удаление с галочкой и без, «Очистить», раздача после
 focus_file).
+Перед релизом 1.1.0 — сценарий 15: повторное добавление раздачи, которая
+уже в списке, не открывает окно выбора (его «Отмена» удаляла файлы).
 
 Окно выбора модальное, поэтому в тесте подменяется ЕДИНСТВЕННАЯ точка
 его показа — TorrentPage.ask_choice (см. ANSWER ниже).
@@ -1537,6 +1539,36 @@ check("14 лимит файлов: «+N файлов» и общий разме�
 
 for lib in (lib15, lib16):
     lib.close()
+ANSWER[gui_torrent.MODE_ADD] = download_all
+
+# ---- 15. Повторное добавление раздачи, которая уже в списке ----
+# Найдено на установленной копии перед релизом 1.1.0: движок для уже
+# добавленной раздачи просто возвращает её id, а страница открывала окно
+# «Что скачать» — и его «Отмена» (remove с удалением файлов) стирала уже
+# скачанное. Теперь окно не открывается, пользователю — сообщение.
+NOTES15 = []
+page15._notify = lambda kind, text: NOTES15.append((kind, text))
+ANSWER[gui_torrent.MODE_ADD] = cancel_answer     # если окно откроется — беда
+ASKED.clear()
+check("15 перед проверкой раздача в списке и раздаётся",
+      state_of(page15, IH) == te.STATE_SEEDING, state_of(page15, IH))
+page15.magnet_edit.setText(magnet())
+readded = page15.add_magnet()
+pump(1.5)
+check("15 повторный magnet не открывает окно выбора", not ASKED, str(ASKED))
+check("15 пользователю сказано, что раздача уже в списке",
+      readded and ("info", "Эта раздача уже в списке") in NOTES15,
+      str(NOTES15))
+check("15 раздача осталась в движке и на карточке",
+      page15.engine.get(IH) is not None and IH in page15._cards)
+check("15 скачанные файлы на месте",
+      all(same_as_source(save15, rel) for rel in FILE_ORDER))
+check("15 поле magnet очищено", page15.magnet_edit.text() == "")
+page15.add_torrent_file(TORRENT)
+pump(1.5)
+check("15 тот же .torrent тоже не открывает окно и ничего не удаляет",
+      not ASKED and page15.engine.get(IH) is not None
+      and all(same_as_source(save15, rel) for rel in FILE_ORDER), str(ASKED))
 ANSWER[gui_torrent.MODE_ADD] = download_all
 
 # ---- завершение: не оставить работающих потоков ----

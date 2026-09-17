@@ -234,6 +234,21 @@ check("ru_records(1/2/5/11/21)",
       == ["1 запись", "2 записи", "5 записей", "11 записей", "21 запись"],
       str([gui.ru_records(n) for n in (1, 2, 5, 11, 21)]))
 
+# --- 10. подтверждение очистки: кнопки по-русски (1.1.0) ---
+# Переводчик qfluentwidgets не подключён — без явных подписей кнопки
+# были «OK»/«Cancel». exec подменён: окно модальное, подписи — настоящие.
+from qfluentwidgets import MessageBox
+seen_buttons = []
+_old_exec = MessageBox.exec
+MessageBox.exec = lambda self: (seen_buttons.append(
+    (self.yesButton.text(), self.cancelButton.text())), 0)[1]
+try:
+    gui.LibraryPageBase._confirm_clear(lib)
+finally:
+    MessageBox.exec = _old_exec
+check("подтверждение очистки: «Очистить» / «Отмена», не OK/Cancel",
+      seen_buttons == [("Очистить", "Отмена")], str(seen_buttons))
+
 # --- итог ---
 window.close()
 shutil.rmtree(TMP, ignore_errors=True)

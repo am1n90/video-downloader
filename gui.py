@@ -1990,6 +1990,10 @@ class LibraryPageBase(TransparentScrollArea):
         from qfluentwidgets import MessageBox
         box = MessageBox("Очистить данные библиотеки", self.CLEAR_TEXT,
                          self.window())
+        # Переводчик qfluentwidgets не подключён: без этого кнопки
+        # остаются «OK»/«Cancel» посреди русского интерфейса
+        box.yesButton.setText("Очистить")
+        box.cancelButton.setText("Отмена")
         return bool(box.exec())
 
     def _clear_library_data(self):
@@ -2561,6 +2565,8 @@ class SettingsPage(TransparentScrollArea):
             "Программа закроется, обновится и перезапустится. Продолжить?",
             self.window(),
         )
+        box.yesButton.setText("Обновить")      # иначе «OK»/«Cancel»
+        box.cancelButton.setText("Отмена")
         if not box.exec():
             return
         import tempfile
