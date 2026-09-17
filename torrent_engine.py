@@ -25,6 +25,9 @@ API — по образцу downloader.DownloadManager. Колбэки вызы�
 (атомарная запись); по нему раздачи восстанавливаются при start(). Рядом
 <id>.chosen — какие файлы пользователь заказал галочками сам (см.
 set_files): этого libtorrent не хранит, а focus_file обязан их беречь.
+Рядом же <id>.pending — раздача добавлена, но выбор файлов ещё не сделан
+(см. add_magnet(defer=True) и begin_download): такие раздачи не качают
+ничего и ждут ответа пользователя, в том числе после перезапуска.
 
 С сессии 2.1 движок умеет отдавать файл, пока тот качается
 (open_stream -> TorrentStream): данные ТОЛЬКО через read_piece(), голова
@@ -48,6 +51,7 @@ import config
 log = config.get_logger("torrent", "torrent.log")
 
 STATE_METADATA = "metadata"        # ждём метаданные по magnet-ссылке
+STATE_PENDING = "pending"          # метаданные есть, ждём выбора файлов
 STATE_CHECKING = "checking"        # проверка файлов / fastresume
 STATE_DOWNLOADING = "downloading"
 STATE_SEEDING = "seeding"          # скачано, раздаётся
@@ -57,6 +61,7 @@ STATE_ERROR = "error"              # ошибка файла/раздачи — 
 
 RESUME_EXT = ".fastresume"
 CHOSEN_EXT = ".chosen"             # явный заказ файлов (см. set_files)
+PENDING_EXT = ".pending"           # выбор файлов ещё не сделан (см. _add)
 SAVE_RESUME_EVERY = 30             # с — периодическое сохранение fastresume
 UPDATE_EVERY = 0.5                 # с — обновление снимков для GUI
 ALERT_LOG_FIRST = 3                # шумные алерты: первые N в лог, затем
@@ -528,6 +533,7 @@ class TorrentEngine:
         self._handles = {}          # id -> torrent_handle
         self._files = {}            # id -> tuple(TorrentFile) (после метаданных)
         self._chosen = {}           # id -> frozenset индексов, заказанных явно
+        self._pending = set()       # id, ждущие выбора файлов (см. _add)
         self._errors = {}           # id -> (текст, файл)
         self._removed = set()       # id удалённых (fastresume не писать)
         self._streams = {}          # (id, индекс файла) -> TorrentStream
@@ -642,17 +648,18 @@ class TorrentEngine:
 
     # --------------------------------------------------------- раздачи
 
-    def add_magnet(self, uri, save_path, peers=None):
+    def add_magnet(self, uri, save_path, peers=None, defer=False):
+        """Добавить magnet-ссылку. defer — не качать до begin_download()."""
         atp = lt.parse_magnet_uri(uri)
-        return self._add(atp, save_path, peers)
+        return self._add(atp, save_path, peers, defer)
 
     def add_torrent_file(self, path, save_path, file_priorities=None,
-                         peers=None):
+                         peers=None, defer=False):
         atp = lt.add_torrent_params()
         atp.ti = lt.torrent_info(path)
         if file_priorities is not None:
             atp.file_priorities = list(file_priorities)
-        return self._add(atp, save_path, peers)
+        return self._add(atp, save_path, peers, defer)
 
     def items(self):
         with self._lock:
@@ -679,6 +686,64 @@ class TorrentEngine:
         priorities = [int(p) for p in priorities]
         self._set_chosen(tid, priorities)
         self._apply_priorities(tid, handle, priorities)
+
+    def is_pending(self, tid):
+        """Раздача добавлена, но выбор файлов ещё не сделан."""
+        with self._lock:
+            return tid in self._pending
+
+    def begin_download(self, tid, priorities=None, focus=None):
+        """Начать качать отложенную раздачу (сессия 2.6).
+
+        priorities — то, что отмечено галочками («Скачать»); focus —
+        индекс файла для «Посмотреть». Для просмотра приоритеты галочек
+        НЕ применяем: по решению владельца просмотр качает строго одну
+        серию, даже если галочки стоят у всех, и попади они в явный
+        заказ (.chosen) — focus_file сберёг бы их и качалась бы вся
+        раздача.
+
+        Порядок важен: сначала приоритеты, и только потом снимаем
+        «данных не просить». Иначе между снятием флага и применением
+        приоритетов раздача успела бы потянуть всё подряд.
+
+        Идемпотентна: повторный вызов на уже запущенной раздаче просто
+        применит приоритеты.
+        """
+        handle = self._require(tid)
+        if not handle.status().has_metadata:
+            raise RuntimeError("метаданные раздачи ещё не получены")
+        with self._lock:
+            was_pending = tid in self._pending
+            self._pending.discard(tid)
+        if priorities is not None:
+            priorities = [int(p) for p in priorities]
+            self._set_chosen(tid, priorities)
+            self._apply_priorities(tid, handle, priorities)
+        if focus is not None:
+            self.focus_file(tid, focus)
+        if was_pending:
+            self._drop_pending_file(tid)
+            handle.unset_flags(lt.torrent_flags.upload_mode)
+            self._resume_handle(handle)      # снимаем паузу, если была
+        self._request_save(handle)
+        self._emit(tid, handle)
+        log.info("begin %s (pending=%s, priorities=%s, focus=%s)",
+                 tid, was_pending, priorities, focus)
+        return was_pending
+
+    def set_save_path(self, tid, path):
+        """Сменить папку раздачи (кнопка «Изменить» в окне выбора).
+
+        Рассчитано на отложенную раздачу: файлов на диске ещё нет, и
+        move_storage сводится к смене пути. Для уже качающейся libtorrent
+        перенесёт данные сам — но такой кнопки в GUI нет.
+        """
+        handle = self._require(tid)
+        os.makedirs(path, exist_ok=True)
+        handle.move_storage(path)
+        self._request_save(handle)
+        self._emit(tid, handle)
+        log.info("save path %s -> %s", tid, path)
 
     def focus_file(self, tid, index):
         """Качать ТОЛЬКО то, что смотрят (сессия 2.5).
@@ -765,6 +830,25 @@ class TorrentEngine:
         except (OSError, ValueError) as exc:
             log.warning("явный заказ файлов не прочитан %s: %r", tid, exc)
             return None
+
+    def _write_pending(self, tid):
+        """Пометить раздачу «ждёт выбора файлов» — рядом с fastresume.
+
+        Не в памяти: после перезапуска программы такая раздача выглядела
+        бы просто паузой со снятыми галочками, и было бы непонятно, чего
+        она ждёт. Пустой файл, содержимое не нужно.
+        """
+        try:
+            _write_atomic(self._pending_path(tid), b"")
+        except OSError as exc:
+            log.warning("метка ожидания не сохранена %s: %r", tid, exc)
+
+    def _drop_pending_file(self, tid):
+        for path in (self._pending_path(tid), self._pending_path(tid) + ".tmp"):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def file_progress(self, tid):
         """Скачано байт по каждому файлу (точность до куска)."""
@@ -861,6 +945,7 @@ class TorrentEngine:
             self._files.pop(tid, None)
             self._errors.pop(tid, None)
             self._chosen.pop(tid, None)
+            self._pending.discard(tid)
             self._removed.add(tid)
             ses = self._ses
         if handle is None or ses is None:
@@ -868,7 +953,8 @@ class TorrentEngine:
         save_path = handle.status().save_path
         ses.remove_torrent(handle, lt.session.delete_files if delete_files else 0)
         for path in (self._resume_path(tid), self._resume_path(tid) + ".tmp",
-                     self._chosen_path(tid), self._chosen_path(tid) + ".tmp"):
+                     self._chosen_path(tid), self._chosen_path(tid) + ".tmp",
+                     self._pending_path(tid), self._pending_path(tid) + ".tmp"):
             try:
                 os.remove(path)
             except OSError:
@@ -880,7 +966,36 @@ class TorrentEngine:
 
     # ------------------------------------------------------ внутреннее
 
-    def _add(self, atp, save_path, peers):
+    def _add(self, atp, save_path, peers, defer=False):
+        """Добавить раздачу; defer — ничего не качать до begin_download().
+
+        Отложенная раздача (сессия 2.6): пользователь сначала видит
+        список файлов и решает, что делать, и только потом что-то
+        скачивается. Держим её флагом upload_mode — «данных не просить»:
+        метаданные magnet-ссылки он не мешает получить, приоритеты
+        файлов остаются настоящими, а рой при этом собирается.
+
+        Ни нулевыми приоритетами, ни паузой этого делать нельзя, хотя
+        сначала было сделано так. Замер трёх способов на локальном сиде
+        (17.09.2026; ожидание 5 с, потом разрешаем качать):
+
+            нули приоритетов  скачано 0, пиров 0, первые байты — НЕТ за 20 с
+            нули + пауза      скачано 0, пиров 0, первые байты — НЕТ за 20 с
+            upload_mode       скачано 0, пиры держатся, первые байты 0.66 с
+
+        С нулями libtorrent считает раздачу завершённой (is_finished) и
+        расходится с другими сидами — рой приходится собирать заново, а
+        к тем же пирам он вернётся только через min_reconnect_time
+        (60 с по умолчанию, находка 18). Пауза добавляет к этому разрыв
+        всех соединений. Для стриминга это прямой вред: после
+        «Посмотреть» искать пиров уже некогда.
+
+        У magnet-ссылки небольшой проскок данных всё же возможен: в
+        момент, когда метаданные получены, libtorrent успевает забрать
+        несколько кусков, прежде чем upload_mode снова вступает в силу
+        (в замере 0.4-1.3 МБ). Эти куски убирает «Отмена» — remove с
+        удалением файлов.
+        """
         with self._lock:
             ses = self._ses
             if ses is None:
@@ -891,13 +1006,19 @@ class TorrentEngine:
                 return tid
             os.makedirs(save_path, exist_ok=True)
             atp.save_path = save_path
+            if defer:
+                atp.flags = atp.flags | lt.torrent_flags.upload_mode
             if peers:
                 atp.peers = [tuple(p) for p in peers]
             handle = ses.add_torrent(atp)
             self._handles[tid] = handle
             self._removed.discard(tid)
+            if defer:
+                self._pending.add(tid)
+        if defer:
+            self._write_pending(tid)
         self._request_save(handle)       # магнит сохраняется и без метаданных
-        log.info("added %s -> %s", tid, save_path)
+        log.info("added %s -> %s (defer=%s)", tid, save_path, defer)
         self._notify_list()
         self._emit(tid, handle)
         return tid
@@ -926,6 +1047,12 @@ class TorrentEngine:
             chosen = self._load_chosen(tid)
             if chosen is not None:
                 self._chosen[tid] = chosen
+            if os.path.exists(self._pending_path(tid)):
+                # Выбор файлов не сделали до прошлого выхода — раздача
+                # по-прежнему ждёт окна выбора и ничего не качает
+                # (флаг должен прийти из fastresume; подтверждаем)
+                self._pending.add(tid)
+                handle.set_flags(lt.torrent_flags.upload_mode)
             count += 1
         return count
 
@@ -993,10 +1120,20 @@ class TorrentEngine:
         elif name == "metadata_received_alert" and tid:
             with self._lock:
                 self._files.pop(tid, None)
+                pending = tid in self._pending
+            if pending:
+                # Отложенная раздача (2.6): получение метаданных
+                # переинициализирует раздачу — на всякий случай
+                # подтверждаем «данных не просить» (флаг идемпотентный)
+                handle.set_flags(lt.torrent_flags.upload_mode)
             self._request_save(handle)
             self._emit(tid, handle)
         elif name == "torrent_finished_alert" and tid:
-            if not self._seed_after_download:
+            with self._lock:
+                pending = tid in self._pending
+            # Отложенная раздача ничего не качала — «завершилась» она
+            # только формально, паузу по «не раздавать» ставить не за что
+            if not self._seed_after_download and not pending:
                 self._pause_handle(handle)
             self._request_save(handle)
             self._emit(tid, handle)
@@ -1048,6 +1185,9 @@ class TorrentEngine:
 
     def _chosen_path(self, tid):
         return os.path.join(self.resume_dir, tid + CHOSEN_EXT)
+
+    def _pending_path(self, tid):
+        return os.path.join(self.resume_dir, tid + PENDING_EXT)
 
     def _delete_parts_later(self, save_path, tid):
         """libtorrent удаляет файлы асинхронно; .parts может остаться —
@@ -1115,8 +1255,11 @@ class TorrentEngine:
         return files
 
     @staticmethod
-    def _error_is_live(st):
+    def _error_is_live(st, pending=False):
         """Держит ли ошибку сам libtorrent прямо сейчас.
+
+        pending — раздача ждёт выбора файлов (2.6): upload_mode у неё
+        стоит нарочно, «данных не просить», и ошибкой не является.
 
         На дисковой ошибке errc пустой, а раздача молча припаркована в
         upload_mode (находка 2 Этапа 0.2) — этот флаг и есть признак
@@ -1128,6 +1271,8 @@ class TorrentEngine:
         errc = getattr(st, "errc", None)
         if errc is not None and errc.value():
             return True
+        if pending:
+            return False
         return bool(int(getattr(st, "flags", 0))
                     & int(lt.torrent_flags.upload_mode))
 
@@ -1135,7 +1280,8 @@ class TorrentEngine:
         st = st or handle.status()
         with self._lock:
             error, error_file = self._errors.get(tid, ("", ""))
-        if self._error_is_live(st):
+            pending = tid in self._pending
+        if self._error_is_live(st, pending):
             if not error:
                 errc = getattr(st, "errc", None)
                 error = (errc.message() if errc is not None and errc.value()
@@ -1147,6 +1293,11 @@ class TorrentEngine:
             state = STATE_ERROR
         elif raw == "downloading_metadata":
             state = STATE_METADATA
+        elif pending and st.has_metadata:
+            # Ждёт выбора файлов (2.6). Своё состояние, а не «скачивается»:
+            # раздача добавлена, но ни байта не просит, и показывать ей
+            # проценты не о чем
+            state = STATE_PENDING
         elif raw in _CHECKING_STATES:
             state = STATE_CHECKING
         elif st.is_finished and st.has_metadata:

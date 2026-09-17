@@ -3,9 +3,17 @@
 Страница «Торренты» поверх torrent_engine: добавление magnet/.torrent,
 выбор файлов раздачи, карточки очереди, пауза/продолжение/удаление
 (1.3) и «Смотреть» — просмотр во время закачки во внешнем плеере
-(2.1: torrent_stream + player). В 2.2 к просмотру добавились диалог
-«что смотреть» для раздач с несколькими видеофайлами и индикатор
-подготовки плеера. «Библиотека» режима — заглушка.
+(2.1: torrent_stream + player). В 2.2 к просмотру добавились индикатор
+подготовки плеера и отдельное окно «Что смотреть». «Библиотека» режима
+— заглушка.
+
+С 2.6 добавление идёт через ОДНО окно выбора (TorrentFilesDialog):
+раздача добавляется отложенно и не качает ничего, пока пользователь не
+ответил — «Отмена» (убрать с диска), «Скачать» (всё отмеченное сразу)
+или «Посмотреть» (строго одна выделенная серия через focus_file). То же
+окно открывает кнопка «Файлы» на карточке — им же продолжают сериал.
+Отдельного окна «Что смотреть» больше нет: галочки («что скачать») и
+выделение строки («что смотреть») живут в одном дереве.
 
 Импортируется из gui.MainWindow.__init__, а не с верхнего уровня gui.py:
 модуль сам берёт общие виджеты и отступы из gui.
@@ -14,12 +22,13 @@
 через сигналы Bridge (тот же приём, что в режиме Video Downloader).
 """
 
+import dataclasses
 import os
 import time
 
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QApplication, QHBoxLayout, QTreeWidget,
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QStyle, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, CheckBox,
                             InfoBar, InfoBarPosition, LineEdit, MessageBoxBase,
@@ -33,7 +42,8 @@ from downloader import fmt_eta, fmt_speed
 from gui import SP_BLOCK, SP_GROUP, SP_WINDOW, TransparentScrollArea, fmt_mb
 
 STATE_TEXT = {
-    te.STATE_METADATA: "Получение сведений о раздаче…",
+    te.STATE_METADATA: "Получаем список файлов…",
+    te.STATE_PENDING: "Ожидает выбора файлов",
     te.STATE_CHECKING: "Проверка файлов…",
     te.STATE_DOWNLOADING: "Скачивается",
     te.STATE_SEEDING: "Раздаётся",
@@ -47,6 +57,24 @@ ACTIVE_STATES = (te.STATE_METADATA, te.STATE_CHECKING, te.STATE_DOWNLOADING)
 DONE_STATES = (te.STATE_SEEDING, te.STATE_FINISHED)
 
 PRIORITY_ON = 4      # обычный приоритет; 0 — файл не качать
+
+# Окно выбора (2.6): контексты и ответ пользователя
+MODE_ADD = "add"        # раздачу только что добавили, она ещё не качает
+MODE_MANAGE = "manage"  # раздача в списке, кнопка «Файлы» на карточке
+
+ACTION_CLOSE = "close"        # закрыли окно (Esc/крестик) — ничего не делать
+ACTION_CANCEL = "cancel"      # «Отмена» — убрать раздачу вместе с кусками
+ACTION_DOWNLOAD = "download"  # «Скачать» — всё отмеченное галочками
+ACTION_WATCH = "watch"        # «Посмотреть» — только выделенная строка
+
+
+@dataclasses.dataclass(frozen=True)
+class FilesChoice:
+    """Ответ окна выбора файлов (см. TorrentFilesDialog)."""
+    action: str
+    priorities: tuple = ()
+    video: object = None        # TorrentFile — что смотреть
+    save_path: str = ""
 
 # Подготовка плеера (2.2). Между запуском плеера и первым его
 # обращением к нашему серверу бывает ~20 с: Защитник проверяет файлы
@@ -98,11 +126,8 @@ class _PlaceholderPage(TransparentScrollArea):
 def _build_folders(tree, files):
     """Построить папки раздачи в дереве.
 
-    Общая часть двух деревьев — «что качать» (TorrentFilesDialog) и «что
-    смотреть» (WatchFileDialog): разбор пути по разделителям и узлы
-    папок. Листья каждый диалог делает свои: у первого галочки и сумма
-    выбранного, у второго одиночный выбор и «сколько скачано», — общего
-    там нет, а иерархия одна и та же.
+    Разбор пути по разделителям и узлы папок — отдельно от листьев: их
+    окно выбора собирает само (галочка, размер, сколько скачано).
 
     Возвращает ([(родитель, имя файла)] по порядку files, [узлы папок]).
     """
@@ -122,39 +147,147 @@ def _build_folders(tree, files):
     return parents, list(folders.values())
 
 
-class TorrentFilesDialog(MessageBoxBase):
-    """Дерево файлов раздачи с галочками.
+class _FilesTree(QTreeWidget):
+    """Дерево окна выбора: клик по галочке не трогает выделение строки.
 
-    Отдаёт приоритеты списком по индексам файлов (0 — не качать, 4 —
-    качать): движок ждёт в set_files именно такой список. Показывает сумму
-    ВЫБРАННЫХ файлов, а не wanted_size: последний libtorrent считает по
-    целым кускам, и для пользователя он выглядит странно (находка 1.2).
+    В окне 2.6 это два независимых ответа — галочка «скачать этот файл»
+    и выделение «смотреть эту серию». QTreeWidget по умолчанию выделяет
+    строку при любом клике по ней, в том числе по квадратику галочки, и
+    тогда «Посмотреть» оживала бы от простой расстановки галочек.
+    Событие делегату отдаём как есть (иначе галочка не переключится), а
+    выделение возвращаем на место после него.
     """
 
-    def __init__(self, item, parent=None):
+    def _hits_check(self, index, pos):
+        if index.column() != 0:
+            return False
+        rect = self.visualRect(index)
+        style = self.style()
+        width = (style.pixelMetric(QStyle.PM_IndicatorWidth, None, self)
+                 + 2 * style.pixelMetric(QStyle.PM_FocusFrameHMargin,
+                                         None, self))
+        return rect.left() <= pos.x() <= rect.left() + width
+
+    def mousePressEvent(self, event):
+        pos = event.position().toPoint()
+        index = self.indexAt(pos)
+        restore = bool(index.isValid()) and self._hits_check(index, pos)
+        keep = self.currentItem() if restore else None
+        super().mousePressEvent(event)
+        if restore:
+            self.setCurrentItem(keep)
+            if keep is None:
+                self.clearSelection()
+
+
+class TorrentFilesDialog(MessageBoxBase):
+    """Одно окно выбора для раздачи: что скачать и что смотреть (2.6).
+
+    Галочки — состав закачки; движок ждёт в set_files список приоритетов
+    по индексам файлов (0 — не качать, 4 — качать). Показываем сумму
+    ВЫБРАННЫХ файлов, а не wanted_size: последний libtorrent считает по
+    целым кускам, и для пользователя он выглядит странно (находка 1.2).
+
+    Выделение строки — отдельный ответ «что смотреть»: «Посмотреть»
+    качает СТРОГО одну серию (focus_file), галочки при этом не в счёт.
+    Единственное видео раздачи (фильм) выделять не нужно — берём его.
+
+    Контексты (mode):
+      MODE_ADD    — раздачу только что добавили, она не качает ничего:
+                    сверху папка сохранения с «Изменить», галочки стоят
+                    у всех файлов, «Отмена» убирает раздачу;
+      MODE_MANAGE — кнопка «Файлы» уже добавленной раздачи: галочки по
+                    текущим приоритетам, «Отмена» просто закрывает.
+
+    Ответ — FilesChoice (см. choice()); Esc и крестик дают ACTION_CLOSE,
+    то есть «ничего не делать»: случайное закрытие окна не должно
+    удалять раздачу.
+    """
+
+    def __init__(self, item, mode=MODE_MANAGE, progress=(), parent=None):
         super().__init__(parent)
+        self._item = item
+        self._mode = mode
         self._files = list(item.files)
+        self._videos = {f.index: f for f in ts.watchable_files(item.files)}
         self._leaves = {}          # индекс файла -> лист дерева
         self._guard = False        # защита от рекурсии в itemChanged
+        self._action = ACTION_CLOSE
+        self._choice = FilesChoice(ACTION_CLOSE)
+        self._save_path = item.save_path
 
-        self.viewLayout.addWidget(SubtitleLabel("Файлы раздачи", self))
-        self.tree = QTreeWidget(self)
-        self.tree.setHeaderLabels(["Файл", "Размер"])
-        self.tree.setColumnWidth(0, 380)
+        self.viewLayout.addWidget(SubtitleLabel(
+            "Что скачать" if mode == MODE_ADD else "Файлы раздачи", self))
+        if mode == MODE_ADD:
+            self.name_label = BodyLabel(item.name or item.id[:12], self)
+            self.name_label.setWordWrap(True)
+            self.viewLayout.addWidget(self.name_label)
+            self.viewLayout.addLayout(self._folder_row())
+
+        self.tree = _FilesTree(self)
+        self.tree.setHeaderLabels(["Файл", "Размер", "Скачано"])
+        self.tree.setColumnWidth(0, 340)
+        self.tree.setColumnWidth(1, 100)
         self.tree.setMinimumSize(560, 320)
-        self._build_tree()
+        # «Скачано» показываем, когда есть что показывать: у только что
+        # добавленной раздачи столбец нулей — пустой шум
+        self._show_done = bool(progress) and (mode != MODE_ADD
+                                              or any(progress))
+        self._build_tree(progress)
         self.tree.expandAll()
+        self.tree.setColumnHidden(2, not self._show_done)
         self.tree.itemChanged.connect(self._on_item_changed)
+        self.tree.itemSelectionChanged.connect(self._update_watch)
+        self.tree.itemDoubleClicked.connect(self._on_double_click)
         self.viewLayout.addWidget(self.tree)
 
         self.size_label = BodyLabel("", self)
         self.viewLayout.addWidget(self.size_label)
+        self.hint_label = CaptionLabel(
+            "Галочки — что скачать. Чтобы смотреть, выделите строку с "
+            "видео: качаться будет только она, ждать конца закачки не "
+            "нужно", self)
+        self.hint_label.setWordWrap(True)
+        self.viewLayout.addWidget(self.hint_label)
 
-        self.yesButton.setText("Применить")
+        self.watch_btn = PushButton("Посмотреть", self.buttonGroup)
+        self.watch_btn.setAttribute(Qt.WA_LayoutUsesWidgetRect)
+        self.watch_btn.clicked.connect(self._on_watch)
+        self.buttonLayout.insertWidget(0, self.watch_btn, 1, Qt.AlignVCenter)
+
+        self.yesButton.setText("Скачать" if mode == MODE_ADD else "Применить")
+        self.yesButton.clicked.connect(
+            lambda: self._set_action(ACTION_DOWNLOAD))
         self.cancelButton.setText("Отмена")
+        self.cancelButton.clicked.connect(
+            lambda: self._set_action(ACTION_CANCEL))
         self._update_size()
+        self._update_watch()
 
-    def _build_tree(self):
+    def _folder_row(self):
+        row = QHBoxLayout()
+        row.setSpacing(SP_GROUP)
+        self.folder_label = BodyLabel("", self)
+        self.folder_label.setWordWrap(True)
+        row.addWidget(self.folder_label, stretch=1)
+        self.folder_btn = PushButton("Изменить", self)
+        self.folder_btn.clicked.connect(self._choose_folder)
+        row.addWidget(self.folder_btn)
+        self._show_folder()
+        return row
+
+    def _show_folder(self):
+        self.folder_label.setText(f"Папка: {self._save_path}")
+
+    def _choose_folder(self):
+        from PySide6.QtWidgets import QFileDialog
+        path = QFileDialog.getExistingDirectory(
+            self, "Папка для раздачи", self._save_path)
+        if path:
+            self._save_path = path
+            self._show_folder()
+
+    def _build_tree(self, progress):
         self._guard = True
         try:
             parents, folders = _build_folders(self.tree, self._files)
@@ -162,11 +295,22 @@ class TorrentFilesDialog(MessageBoxBase):
                 node.setFlags(node.flags() | Qt.ItemIsUserCheckable)
                 node.setCheckState(0, Qt.Unchecked)
             for file, (parent, name) in zip(self._files, parents):
-                leaf = QTreeWidgetItem(parent, [name, fmt_size(file.size)])
+                done = (progress[file.index]
+                        if file.index < len(progress) else 0)
+                share = ""
+                # Доля — только у видео: по ней выбирают, какая серия
+                # пойдёт быстрее (приём 2.2)
+                if self._show_done and file.index in self._videos \
+                        and file.size:
+                    share = ("скачан" if done >= file.size
+                             else f"{done * 100 // file.size}%")
+                leaf = QTreeWidgetItem(
+                    parent, [name, fmt_size(file.size), share])
                 leaf.setFlags(leaf.flags() | Qt.ItemIsUserCheckable)
                 leaf.setData(0, Qt.UserRole, file.index)
+                checked = (self._mode == MODE_ADD or file.priority > 0)
                 leaf.setCheckState(
-                    0, Qt.Checked if file.priority > 0 else Qt.Unchecked)
+                    0, Qt.Checked if checked else Qt.Unchecked)
                 self._leaves[file.index] = leaf
             for leaf in self._leaves.values():
                 self._refresh_parents(leaf.parent())
@@ -216,108 +360,81 @@ class TorrentFilesDialog(MessageBoxBase):
         self.size_label.setText(
             f"Выбрано: {fmt_size(selected)} из {fmt_size(total)}")
         # Снять все галочки — значит не качать ничего: раздача просто
-        # встанет, поэтому «Применить» в этом случае недоступна
+        # встанет, поэтому «Скачать» в этом случае недоступна
         self.yesButton.setEnabled(selected > 0)
 
+    # ------------------------------------------------- «что смотреть»
 
-class WatchFileDialog(MessageBoxBase):
-    """Какой файл раздачи смотреть (2.2, многофайловые раздачи).
-
-    То же дерево, что у выбора «что качать» (общий _build_folders), но
-    выбор ОДИНОЧНЫЙ: смотрят один файл за раз, и галочки с частично
-    отмеченными папками здесь только мешали бы. Невидеофайлы и папки
-    показываем — так видно устройство раздачи, — но выбрать нельзя.
-
-    Предвыбран самый большой видеофайл: это правило 2.1, и для раздачи
-    «фильм + трейлер» Enter сразу даёт то, что нужно.
-    """
-
-    def __init__(self, item, targets, progress=(), parent=None):
-        super().__init__(parent)
-        self._files = list(item.files)
-        self._targets = {f.index: f for f in targets}
-        self._nodes = {}            # индекс файла -> лист дерева
-        self._chosen = None
-
-        self.viewLayout.addWidget(SubtitleLabel("Что смотреть", self))
-        self.tree = QTreeWidget(self)
-        self.tree.setHeaderLabels(["Файл", "Размер", "Скачано"])
-        self.tree.setColumnWidth(0, 340)
-        self.tree.setColumnWidth(1, 100)
-        self.tree.setMinimumSize(560, 320)
-        self.tree.setRootIsDecorated(True)
-        self._build_tree(progress)
-        self.tree.expandAll()
-        self.tree.itemSelectionChanged.connect(self._on_selection)
-        self.tree.itemDoubleClicked.connect(self._on_double_click)
-        self.viewLayout.addWidget(self.tree)
-
-        self.hint_label = CaptionLabel(
-            "Файл можно смотреть, не дожидаясь конца закачки — "
-            "нужные куски программа запросит первыми", self)
-        self.hint_label.setWordWrap(True)
-        self.viewLayout.addWidget(self.hint_label)
-
-        self.yesButton.setText("Смотреть")
-        self.cancelButton.setText("Отмена")
-        self._preselect(targets)
-
-    def _build_tree(self, progress):
-        parents, _folders = _build_folders(self.tree, self._files)
-        for file, (parent, name) in zip(self._files, parents):
-            done = progress[file.index] if file.index < len(progress) else 0
-            share = ""
-            if file.index in self._targets and file.size:
-                share = ("скачан" if done >= file.size
-                         else f"{done * 100 // file.size}%")
-            node = QTreeWidgetItem(parent, [name, fmt_size(file.size), share])
-            if file.index in self._targets:
-                node.setData(0, Qt.UserRole, file.index)
-                self._nodes[file.index] = node
-            else:
-                # Не видео или снята галочка «качать» — показываем, но
-                # выбрать нельзя: смотреть там нечего
-                node.setDisabled(True)
-
-    def _preselect(self, targets):
-        biggest = max(targets, key=lambda f: f.size) if targets else None
-        if biggest is not None:
-            node = self._nodes.get(biggest.index)
-            if node is not None:
-                self.tree.setCurrentItem(node)
-        self._on_selection()
-
-    def _current_file(self):
+    def watch_target(self):
+        """Что пойдёт в просмотр: выделенное видео, а если видео в
+        раздаче одно — оно само (фильм выделять не нужно). Иначе None."""
         node = self.tree.currentItem()
-        if node is None or node.isDisabled():
-            return None
-        index = node.data(0, Qt.UserRole)
-        return self._targets.get(index)
+        if node is not None and node.isSelected():
+            video = self._videos.get(node.data(0, Qt.UserRole))
+            if video is not None:
+                return video
+        if len(self._videos) == 1:
+            return next(iter(self._videos.values()))
+        return None
+
+    def _update_watch(self):
+        self.watch_btn.setEnabled(self.watch_target() is not None)
 
     def select(self, index):
-        """Выбрать файл по индексу — для offscreen-тестов и живых
-        проверок: мышью в них никто не кликает."""
-        node = self._nodes.get(index)
+        """Выделить строку файла — для offscreen-тестов и живых проверок:
+        мышью в них никто не кликает."""
+        node = self._leaves.get(index)
         if node is None:
             return False
         self.tree.setCurrentItem(node)
-        self._on_selection()
+        self._update_watch()
         return True
 
-    def _on_selection(self):
-        self.yesButton.setEnabled(self._current_file() is not None)
+    def set_checked(self, index, checked):
+        """Поставить/снять галочку — тоже для проверок без мыши."""
+        node = self._leaves.get(index)
+        if node is None:
+            return False
+        node.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+        return True
+
+    def _on_watch(self):
+        if self.watch_target() is None:
+            return
+        self._set_action(ACTION_WATCH)
+        self.accept()
 
     def _on_double_click(self, node, column):
-        if node is not None and not node.isDisabled():
-            self.accept()
+        """Двойной клик по видео — сразу «Посмотреть» (приём 2.2)."""
+        if node is not None and self._videos.get(node.data(0, Qt.UserRole)):
+            self._on_watch()
 
-    def chosen(self):
-        """Выбранный файл или None (диалог закрыли/отменили)."""
-        return self._chosen
+    # ------------------------------------------------------- ответ окна
+
+    def _set_action(self, action):
+        self._action = action
+
+    def make_choice(self, action):
+        """Ответ окна для этого действия. Отдельно от exec() — живые
+        проверки показывают окно и отвечают за пользователя сами."""
+        return FilesChoice(
+            action=action,
+            priorities=tuple(self.priorities()),
+            video=self.watch_target() if action == ACTION_WATCH else None,
+            save_path=self._save_path)
+
+    def choice(self):
+        """Ответ пользователя (FilesChoice). Вызывать после exec()."""
+        return self._choice
 
     def exec(self):
         ok = super().exec()
-        self._chosen = self._current_file() if ok else None
+        action = self._action
+        if ok and action not in (ACTION_DOWNLOAD, ACTION_WATCH):
+            action = ACTION_DOWNLOAD        # Enter на «Скачать»
+        elif not ok and action != ACTION_CANCEL:
+            action = ACTION_CLOSE           # Esc/крестик — ничего не делаем
+        self._choice = self.make_choice(action)
         return ok
 
 
@@ -431,7 +548,11 @@ class TorrentCard(CardWidget):
         self.title_label.setText(self._title(item))
         self.meta_label.setText("  •  ".join(self._meta_parts(item)))
 
-        if item.state in DONE_STATES:
+        if item.state == te.STATE_PENDING:
+            # Раздача ещё ничего не качала — показывать ей проценты не о
+            # чем (а у magnet бывает проскок в момент метаданных)
+            self.bar.hide()
+        elif item.state in DONE_STATES:
             self.bar.show()
             self.bar.setValue(100)
         elif item.has_metadata and item.state != te.STATE_ERROR:
@@ -449,6 +570,15 @@ class TorrentCard(CardWidget):
         self._last_watching = watching
         self._clear_actions()
         tid = item.id
+        if self.page.is_pending(tid):
+            # Раздача ещё ничего не качает и ждёт ответа в окне выбора
+            # (2.6): пауза и просмотр тут бессмысленны
+            if item.has_metadata:
+                self._add_action("Выбрать файлы",
+                                 lambda: self.page.choose_pending(tid),
+                                 accent=True)
+            self._add_action("Удалить", lambda: self.page.remove(tid))
+            return
         if watching:
             self._add_action("Остановить просмотр",
                              lambda: self.page.stop_watch())
@@ -484,7 +614,7 @@ class TorrentCard(CardWidget):
             if item.error_file:
                 parts.append(os.path.basename(item.error_file))
             return parts
-        if not item.has_metadata:
+        if not item.has_metadata or item.state == te.STATE_PENDING:
             return parts
 
         parts.append(f"{item.progress * 100:.0f}%")
@@ -520,6 +650,12 @@ class TorrentPage(TransparentScrollArea):
         self._stream = stream
         self._player_offered = False
         self._cards = {}
+        # Раздачи, добавленные в этом сеансе и ждущие метаданных: как
+        # только список файлов придёт, окно выбора откроется само (2.6).
+        # _dialog_busy — окно уже на экране: колбэки движка идут потоком,
+        # и без него второе окно легло бы поверх первого
+        self._awaiting = []
+        self._dialog_busy = False
         # Подготовка плеера: состояние, момент запуска и сам процесс —
         # если он закроется, не открыв поток, ждать 45 с незачем
         self._watch_state = ""
@@ -603,7 +739,8 @@ class TorrentPage(TransparentScrollArea):
         if not uri:
             self._notify("warning", "Вставьте magnet-ссылку")
             return False
-        if self._add(lambda: self.engine.add_magnet(uri, self.save_path())):
+        if self._add(lambda: self.engine.add_magnet(
+                uri, self.save_path(), defer=True)):
             self.magnet_edit.clear()
             return True
         return False
@@ -616,18 +753,22 @@ class TorrentPage(TransparentScrollArea):
                 "Торренты (*.torrent)")
         if not path:
             return False
-        return self._add(
-            lambda: self.engine.add_torrent_file(path, self.save_path()))
+        return self._add(lambda: self.engine.add_torrent_file(
+            path, self.save_path(), defer=True))
 
     def _add(self, call):
+        """Добавить раздачу отложенно: качать ничего не начинаем, ждём
+        список файлов и показываем окно выбора (2.6)."""
         if not self.start_engine():
             return False
         try:
-            call()
+            tid = call()
         except Exception as exc:
             self._notify("warning", f"Не удалось добавить раздачу: {exc}")
             return False
-        self.refresh()
+        if tid and tid not in self._awaiting:
+            self._awaiting.append(tid)
+        self.refresh()          # refresh откроет окно, если файлы уже есть
         return True
 
     def pause(self, tid):
@@ -652,17 +793,108 @@ class TorrentPage(TransparentScrollArea):
         self.refresh()
         return True
 
-    def choose_files(self, tid):
+    # ------------------------------------------------- выбор файлов 2.6
+
+    def is_pending(self, tid):
+        """Раздача добавлена, но выбор ещё не сделан — она не качает."""
+        try:
+            return self.engine.is_pending(tid)
+        except Exception:
+            return False
+
+    def _check_pending(self):
+        """Открыть окно выбора у раздач, дождавшихся списка файлов.
+
+        Зовётся из refresh и из колбэка движка: у magnet метаданные
+        приходят через секунды, у .torrent — сразу при добавлении.
+        """
+        if self._dialog_busy:
+            return
+        while self._awaiting:
+            tid = self._awaiting[0]
+            item = self.engine.get(tid)
+            if item is None:                    # раздачу уже убрали
+                self._awaiting.pop(0)
+                continue
+            if not item.has_metadata:
+                # Очередь по порядку добавления: ждём список файлов
+                return
+            self._awaiting.pop(0)
+            self._ask_new_torrent(item)
+
+    def choose_pending(self, tid):
+        """Кнопка «Выбрать файлы» на карточке: то же окно, что при
+        добавлении. Нужна, если окно закрыли крестиком или раздача
+        осталась ждать с прошлого запуска программы."""
         item = self.engine.get(tid)
         if item is None or not item.files:
             return False
-        priorities = self.ask_files(item)
-        if priorities is None:
+        return self._ask_new_torrent(item)
+
+    def _ask_new_torrent(self, item):
+        """Окно выбора для только что добавленной раздачи и разбор ответа.
+
+        «Отмена» убирает раздачу целиком, вместе с кусками, успевшими
+        прийти, пока шли метаданные; «Скачать» качает всё отмеченное
+        обычным порядком; «Посмотреть» переключает закачку на одну
+        выделенную серию (focus_file внутри watch).
+        """
+        tid = item.id
+        self._dialog_busy = True
+        try:
+            choice = self.ask_choice(item, MODE_ADD)
+        finally:
+            self._dialog_busy = False
+        if choice.action == ACTION_CLOSE:
+            self.refresh()          # карточка остаётся с «Выбрать файлы»
+            return False
+        if choice.action == ACTION_CANCEL:
+            ok = self._engine_call(
+                lambda: self.engine.remove(tid, delete_files=True))
+            self.refresh()
+            return ok
+        if choice.save_path and choice.save_path != item.save_path:
+            self._engine_call(
+                lambda: self.engine.set_save_path(tid, choice.save_path))
+        if choice.action == ACTION_WATCH and choice.video is not None:
+            # Приоритеты галочек НЕ применяем: просмотр качает строго
+            # одну серию, и явный заказ файлов ему только мешал бы.
+            # focus внутри begin_download — чтобы раздача не успела
+            # потянуть всё подряд в момент разрешения качать
+            if not self._engine_call(lambda: self.engine.begin_download(
+                    tid, focus=choice.video.index)):
+                return False
+            return self.watch(tid, index=choice.video.index)
+        ok = self._engine_call(lambda: self.engine.begin_download(
+            tid, list(choice.priorities)))
+        self.refresh()
+        return ok
+
+    def choose_files(self, tid):
+        """Кнопка «Файлы» уже добавленной раздачи: то же окно.
+
+        «Применить» меняет состав закачки (как и до 2.6), «Посмотреть»
+        переключает закачку на выделенную серию — этим и продолжают
+        сериал после того, как предыдущая серия скачалась.
+        """
+        item = self.engine.get(tid)
+        if item is None or not item.files:
+            return False
+        if self.is_pending(tid):
+            return self.choose_pending(tid)
+        self._dialog_busy = True
+        try:
+            choice = self.ask_choice(item, MODE_MANAGE)
+        finally:
+            self._dialog_busy = False
+        if choice.action == ACTION_WATCH and choice.video is not None:
+            return self.watch(tid, index=choice.video.index)
+        if choice.action != ACTION_DOWNLOAD:
             return False
         # prioritize_files асинхронный: сразу после set_files снимок ещё
         # показывает старый выбор (находка 21) — карточку обновит движок
         return self._engine_call(
-            lambda: self.engine.set_files(tid, priorities))
+            lambda: self.engine.set_files(tid, list(choice.priorities)))
 
     def open_folder(self, tid):
         item = self.engine.get(tid)
@@ -684,18 +916,20 @@ class TorrentPage(TransparentScrollArea):
         """Есть что смотреть: метаданные получены, раздача не в разборе
         и среди выбранных файлов есть видео."""
         if not item.has_metadata or item.state in (te.STATE_METADATA,
+                                                   te.STATE_PENDING,
                                                    te.STATE_CHECKING,
                                                    te.STATE_ERROR):
             return False
         return ts.choose_video_file(item.files) is not None
 
-    def watch(self, tid):
+    def watch(self, tid, index=None):
         """Открыть видео раздачи во внешнем плеере.
 
-        Видео одно — открываем сразу (клик в один шаг для обычного
-        фильма); два и более (сериал) — спрашиваем диалогом (2.2).
-        Скачанный целиком файл открываем напрямую: HTTP-сервер и кэш
-        кусков для него не нужны.
+        index задан (его выбрали в окне файлов) — открываем этот файл;
+        иначе одно видео открываем сразу (клик в один шаг для обычного
+        фильма), а при нескольких показываем окно выбора — там же и
+        галочки. Скачанный целиком файл открываем напрямую: HTTP-сервер
+        и кэш кусков для него не нужны.
 
         С 2.5 выбор серии здесь ещё и переключает на неё закачку
         (engine.focus_file): раньше у сериала качались все серии сразу.
@@ -707,12 +941,15 @@ class TorrentPage(TransparentScrollArea):
         if not targets:
             self._notify("warning", "В раздаче нет видеофайла для просмотра")
             return False
-        if len(targets) == 1:
+        if index is not None:
+            target = next((f for f in targets if f.index == index), None)
+            if target is None:
+                self._notify("warning", "Этот файл нельзя смотреть")
+                return False
+        elif len(targets) == 1:
             target = targets[0]
         else:
-            target = self.ask_watch_file(item, targets)
-            if target is None:
-                return False
+            return self.choose_files(tid)
         local = self.local_path(item, target)
         if local:
             self._focus(tid, target.index)
@@ -893,20 +1130,19 @@ class TorrentPage(TransparentScrollArea):
         ok = bool(dialog.exec())
         return ok, (dialog.delete_files if ok else False)
 
-    def ask_files(self, item):
-        dialog = TorrentFilesDialog(item, self.window())
-        return dialog.priorities() if dialog.exec() else None
+    def ask_choice(self, item, mode):
+        """Окно выбора файлов; возвращает FilesChoice.
 
-    def ask_watch_file(self, item, targets):
-        """Какой файл смотреть; None — отменили. Показываем, сколько уже
-        скачано у каждого: по этому видно, что пойдёт быстрее."""
+        Показываем, сколько уже скачано у каждого файла: по этому видно,
+        какая серия пойдёт быстрее (приём 2.2).
+        """
         try:
             progress = self.engine.file_progress(item.id)
         except Exception:
             progress = ()
-        dialog = WatchFileDialog(item, targets, progress, self.window())
+        dialog = TorrentFilesDialog(item, mode, progress, self.window())
         dialog.exec()
-        return dialog.chosen()
+        return dialog.choice()
 
     def _notify(self, kind, text):
         bar = {"warning": InfoBar.warning, "info": InfoBar.info}.get(
@@ -950,11 +1186,14 @@ class TorrentPage(TransparentScrollArea):
                 card.update_state(item)
         self.empty_label.setVisible(not items)
         self.rows_container.setVisible(bool(items))
+        self._check_pending()
 
     def _on_item_changed(self, item):
         card = self._cards.get(item.id)
         if card is not None:
             card.update_state(item)
+        if item.id in self._awaiting and item.has_metadata:
+            self._check_pending()
 
 
 class TorrentLibraryPage(_PlaceholderPage):

@@ -734,6 +734,143 @@ check("12 удаление раздачи убирает и файл заказ�
       not os.path.exists(eng12c._chosen_path(tid12b)))
 seed.limit(0)
 
+# ---- 13: отложенное добавление — выбор ДО закачки (2.6) ----
+# До 2.6 раздача начинала качать всё сразу после «Добавить». Теперь
+# add_*(defer=True) держит её флагом upload_mode — «данных не просить»:
+# рой собирается, метаданные приходят, но не качается ни байта (замер
+# трёх способов — в docstring _add). Сид без лимита: не сработай
+# удержание, раздача (9 МБ) скачалась бы за секунды.
+seed.limit(0)
+PR_ON = 4              # обычный приоритет файла (галочка «скачать»)
+eng13, ev13 = engine("s13")
+ENGINES.append(eng13)
+eng13.start()
+save13 = os.path.join(BASE, "Загрузки с пробелом", "s13")
+tid13 = eng13.add_torrent_file(TORRENT, save13,
+                               peers=[("127.0.0.1", seed.port)], defer=True)
+
+
+def prios13(eng=None):
+    eng = eng or eng13
+    return [int(p) for p in eng._handles[tid13].get_file_priorities()]
+
+
+def done13(eng=None):
+    eng = eng or eng13
+    return [int(b) for b in eng.file_progress(tid13)]
+
+
+check("13 .torrent с defer: раздача добавлена с «данных не просить»",
+      bool(int(eng13._handles[tid13].status().flags)
+           & int(lt.torrent_flags.upload_mode)))
+check("13 приоритеты файлов остались настоящими (не нули)",
+      prios13() == [4] * len(FILE_ORDER), str(prios13()))
+check("13 раздача помечена ждущей выбора (память и файл рядом с resume)",
+      eng13.is_pending(tid13) and os.path.isfile(eng13._pending_path(tid13)))
+check("13 снимок для GUI — состояние «ожидает выбора», а не ошибка",
+      state(eng13, tid13) == te.STATE_PENDING, str(state(eng13, tid13)))
+time.sleep(3)
+st13 = eng13._handles[tid13].status()
+check("13 за 3 с ожидания не скачано ни байта",
+      int(st13.total_done) == 0 and int(st13.all_time_download) == 0,
+      f"total_done={int(st13.total_done)}, "
+      f"all_time={int(st13.all_time_download)}, пиров {st13.num_peers}")
+check("13 файлов раздачи на диске не появилось",
+      not os.path.isdir(os.path.join(save13, "Тестовая раздача")),
+      str(os.listdir(save13) if os.path.isdir(save13) else []))
+
+# Ожидание должно пережить перезапуск программы: иначе после запуска
+# раздача выглядела бы просто паузой со снятыми галочками
+eng13.shutdown(timeout=3.0)
+ENGINES.remove(eng13)
+eng13b, _ = engine("s13")
+ENGINES.append(eng13b)
+eng13b.start()
+check("13 после перезапуска раздача по-прежнему ждёт выбора",
+      eng13b.is_pending(tid13)
+      and state(eng13b, tid13) == te.STATE_PENDING,
+      str(state(eng13b, tid13)))
+
+# «Посмотреть»: begin_download без приоритетов + focus_file — качается
+# СТРОГО выбранный файл, галочки в явный заказ не попадают
+# Пир задаётся заново: в новом сеансе движка соединений ещё нет, в
+# fastresume подключённых пиров не оказалось, а трекеров и DHT в тесте
+# нет (в жизни адреса дают трекер, magnet-ссылка и DHT)
+eng13b._handles[tid13].connect_peer(("127.0.0.1", seed.port))
+eng13b.begin_download(tid13, focus=I_SMALL)
+check("13 begin_download снял метку ожидания и «данных не просить»",
+      not eng13b.is_pending(tid13)
+      and not os.path.exists(eng13b._pending_path(tid13))
+      and not (int(eng13b._handles[tid13].status().flags)
+               & int(lt.torrent_flags.upload_mode)))
+check("13 «Посмотреть» не записывает явный заказ файлов",
+      tid13 not in eng13b._chosen
+      and not os.path.exists(eng13b._chosen_path(tid13)))
+wait_for(lambda: prios13(eng13b)[I_SMALL] == te.STREAM_PRIORITY, 5)
+check("13 после «Посмотреть» приоритет только у выбранного файла",
+      prios13(eng13b)[I_SMALL] == te.STREAM_PRIORITY
+      and all(p == 0 for i, p in enumerate(prios13(eng13b))
+              if i != I_SMALL), str(prios13(eng13b)))
+
+# Вопрос владельца 17.09.2026: когда выбранная серия докачана и раздача
+# перешла в «Раздаётся», не потянет ли она соседние файлы. Замер, а не
+# вывод из кода: ждём 100%, потом 10 с наблюдаем за соседями.
+finished13 = wait_for(
+    lambda: done13(eng13b)[I_SMALL] >= SIZES["видео 2.bin"], 60)
+seeding13 = wait_for(lambda: state(eng13b, tid13) == te.STATE_SEEDING, 10)
+before13 = done13(eng13b)
+time.sleep(10)
+after13 = done13(eng13b)
+check("13 выбранный файл докачан целиком",
+      finished13 and after13[I_SMALL] >= SIZES["видео 2.bin"],
+      f"{after13[I_SMALL]} из {SIZES['видео 2.bin']}")
+check("13 после 100% раздача перешла в «Раздаётся»",
+      seeding13, str(state(eng13b, tid13)))
+check("13 за 10 с раздачи соседние файлы не сдвинулись ни на байт",
+      [b for i, b in enumerate(after13) if i != I_SMALL]
+      == [b for i, b in enumerate(before13) if i != I_SMALL],
+      f"было {before13} -> стало {after13}")
+check("13 приоритеты соседей так и остались нулевыми",
+      all(p == 0 for i, p in enumerate(prios13(eng13b)) if i != I_SMALL),
+      str(prios13(eng13b)))
+
+# «Скачать»: то же окно, но с галочками — качается всё отмеченное
+eng13b.begin_download(tid13, [PR_ON if i != I_TXT else 0
+                              for i in range(len(FILE_ORDER))])
+got13 = wait_same_as_source(save13, "Тестовая раздача\\видео 1.bin", 60)
+check("13 «Скачать» качает отмеченное галочками",
+      got13 and prios13(eng13b)[I_BIG] == PR_ON, str(prios13(eng13b)))
+check("13 снятая галочка и здесь остаётся явным заказом",
+      eng13b._chosen.get(tid13) == frozenset({I_BIG, I_SMALL}),
+      str(eng13b._chosen.get(tid13)))
+
+# «Отмена»: раздачи не остаётся ни в движке, ни на диске — вместе с
+# кусками, успевшими прийти, пока шли метаданные magnet-ссылки
+eng13c, _ = engine("s13c")
+ENGINES.append(eng13c)
+eng13c.start()
+save13c = os.path.join(BASE, "Загрузки с пробелом", "s13c")
+tid13c = eng13c.add_magnet(magnet(), save13c, defer=True)
+meta13 = wait_for(lambda: eng13c.get(tid13c).has_metadata, 30)
+check("13 magnet: метаданные пришли, раздача ждёт выбора",
+      meta13 and eng13c.is_pending(tid13c)
+      and state(eng13c, tid13c) == te.STATE_PENDING,
+      str(state(eng13c, tid13c)))
+grabbed = int(eng13c._handles[tid13c].status().total_done)
+time.sleep(3)
+check("13 magnet: за 3 с после метаданных ничего не прибавилось",
+      int(eng13c._handles[tid13c].status().total_done) == grabbed,
+      f"{grabbed} байт успело прийти в момент метаданных "
+      f"(проскок, см. _add)")
+eng13c.remove(tid13c, delete_files=True)
+gone13 = wait_for(
+    lambda: not os.path.isdir(os.path.join(save13c, "Тестовая раздача")), 10)
+check("13 «Отмена» убирает раздачу вместе с тем, что успело скачаться",
+      gone13 and eng13c.get(tid13c) is None
+      and not os.path.exists(eng13c._pending_path(tid13c)),
+      str(os.listdir(save13c) if os.path.isdir(save13c) else []))
+seed.limit(0)
+
 # ---- завершение ----
 for eng_ in ENGINES:
     try:

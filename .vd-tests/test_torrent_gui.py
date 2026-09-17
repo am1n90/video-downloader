@@ -12,8 +12,13 @@
 карточка и её подпись; кнопки по состояниям (пауза/продолжение/ошибка);
 дерево файлов с галочками; применение выбора файлов; удаление с файлами;
 группа «Torrent» в Настройках и её связь с живым движком; closeEvent.
-Сессия 2.2 добавила сценарий 9: диалог «что смотреть» для раздачи с
-несколькими видеофайлами и индикатор подготовки плеера.
+Сессия 2.2 добавила сценарий 9: окно выбора для раздачи с несколькими
+видеофайлами и индикатор подготовки плеера. Сессия 2.6 — сценарии 12
+(новый поток добавления: ожидание списка файлов, «Отмена» / «Скачать» /
+«Посмотреть») и 13 (само окно: галочки и выделение — разные ответы).
+
+Окно выбора модальное, поэтому в тесте подменяется ЕДИНСТВЕННАЯ точка
+его показа — TorrentPage.ask_choice (см. ANSWER ниже).
 """
 import collections
 import dataclasses
@@ -170,6 +175,61 @@ def state_of(page, tid):
     return None if item is None else item.state
 
 
+def wait_ready(page, timeout=30):
+    """Дождаться, пока окно выбора ОТВЕТИЛО и раздача пошла качаться.
+
+    С 2.6 одних метаданных мало: пока ответа нет, раздача ждёт (2.6) и
+    «Смотреть» открыл бы окно выбора вместо плеера. Ловилось как флейк
+    сценария 7б раз в несколько прогонов.
+    """
+    return wait_until(lambda: (page.engine.get(IH) is not None)
+                      and page.engine.get(IH).has_metadata
+                      and not page.is_pending(IH), timeout)
+
+
+# С 2.6 раздача после «Добавить» ничего не качает, пока пользователь не
+# ответит в окне выбора, — а окно это модальное и в offscreen-тесте
+# висело бы вечно. Подменяем единственную точку показа (ask_choice) на
+# ответы по контексту: при добавлении — «Скачать» со всеми галочками
+# (прежнее поведение, на нём стоят сценарии 1-11), у кнопки «Файлы» —
+# «ничего не делать». Сценарии меняют ANSWER под себя.
+ASKED = []
+
+
+def download_all(item):
+    return gui_torrent.FilesChoice(
+        gui_torrent.ACTION_DOWNLOAD,
+        tuple(gui_torrent.PRIORITY_ON for _ in item.files),
+        None, item.save_path)
+
+
+def answer_nothing(item):
+    return gui_torrent.FilesChoice(gui_torrent.ACTION_CLOSE)
+
+
+def watch_file(index):
+    """Ответ «Посмотреть» на файле с этим индексом."""
+    def answer(item):
+        video = next(f for f in ts.watchable_files(item.files)
+                     if f.index == index)
+        return gui_torrent.FilesChoice(
+            gui_torrent.ACTION_WATCH,
+            tuple(f.priority for f in item.files), video, item.save_path)
+    return answer
+
+
+ANSWER = {gui_torrent.MODE_ADD: download_all,
+          gui_torrent.MODE_MANAGE: answer_nothing}
+
+
+def fake_choice(self, item, mode):
+    ASKED.append((mode, [f.index for f in ts.watchable_files(item.files)]))
+    return ANSWER[mode](item)
+
+
+gui_torrent.TorrentPage.ask_choice = fake_choice
+
+
 # ---- 1: ленивый запуск движка + добавление magnet ----
 page1, eng1, save1 = make_page("s1")
 check("1 движок не поднят, пока страницу не показали", eng1._ses is None)
@@ -262,7 +322,8 @@ check("2 продолжение возобновляет скачивание", 
 
 # ---- 3: дерево файлов с галочками ----
 item1 = page1.engine.get(IH)
-dialog = gui_torrent.TorrentFilesDialog(item1, page1)
+dialog = gui_torrent.TorrentFilesDialog(item1, gui_torrent.MODE_MANAGE, [],
+                                        page1)
 root = dialog.tree.invisibleRootItem()
 check("3 дерево: одна папка верхнего уровня", root.childCount() == 1,
       str(root.childCount()))
@@ -310,10 +371,10 @@ pump(0.3)
 seed.h.set_upload_limit(64 * 1024)
 page4.magnet_edit.setText(magnet())
 page4.add_magnet()
-check("4 метаданные получены",
-      wait_until(lambda: (page4.engine.get(IH) or None)
-                 and page4.engine.get(IH).has_metadata, 25))
-page4.ask_files = lambda item: [4, 0, 0]       # вместо диалога
+check("4 метаданные получены и окно выбора ответило", wait_ready(page4))
+# Вместо окна — ответ «Скачать» с одной снятой галочкой
+ANSWER[gui_torrent.MODE_MANAGE] = lambda item: gui_torrent.FilesChoice(
+    gui_torrent.ACTION_DOWNLOAD, (4, 0, 0), None, item.save_path)
 check("4 выбор файлов применён", page4.choose_files(IH))
 # prioritize_files асинхронный (находка 21) — ждём, а не проверяем сразу
 ok = wait_until(
@@ -326,11 +387,13 @@ item4 = page4.engine.get(IH)
 check("4 selected_size считает только выбранное",
       item4.selected_size == item4.files[0].size,
       f"{item4.selected_size} vs {item4.files[0].size}")
-reopened = gui_torrent.TorrentFilesDialog(item4, page4)
+reopened = gui_torrent.TorrentFilesDialog(item4, gui_torrent.MODE_MANAGE, [],
+                                          page4)
 check("4 повторно открытый диалог показывает прежний выбор",
       reopened.priorities() == [4, 0, 0], str(reopened.priorities()))
 reopened.close()
 reopened.deleteLater()
+ANSWER[gui_torrent.MODE_MANAGE] = answer_nothing
 seed.h.set_upload_limit(0)
 ok = wait_until(lambda: state_of(page4, IH) == te.STATE_SEEDING, 40)
 got_first = wait_until(lambda: same_as_source(save4, FILE_ORDER[0]), 15)
@@ -431,19 +494,18 @@ gui_torrent.player.launch = (
     lambda target, exe, subtitles=():
     LAUNCHED.append((target, exe, tuple(subtitles))))
 
-# В раздаче два видеофайла, и с 2.2 «Смотреть» спрашивает, какой из них
-# открыть. Здесь отвечаем за пользователя тем же файлом, что выбирался
-# сам в 2.1 (самый большой), — сам диалог и развилка «спрашивать или
-# нет» проверяются сценарием 9.
-ASKED = []
+# В раздаче два видеофайла, и «Смотреть» при нескольких видео открывает
+# окно выбора. Здесь отвечаем за пользователя тем же файлом, что
+# выбирался сам в 2.1 (самый большой), — само окно и развилка
+# «спрашивать или нет» проверяются сценарием 9.
+def pick_biggest(item):
+    video = max(ts.watchable_files(item.files), key=lambda f: f.size)
+    return gui_torrent.FilesChoice(
+        gui_torrent.ACTION_WATCH,
+        tuple(f.priority for f in item.files), video, item.save_path)
 
 
-def pick_biggest(self, item, targets):
-    ASKED.append([f.index for f in targets])
-    return max(targets, key=lambda f: f.size)
-
-
-gui_torrent.TorrentPage.ask_watch_file = pick_biggest
+ANSWER[gui_torrent.MODE_MANAGE] = pick_biggest
 
 VIDEO_INDEX = next(i for i, p in enumerate(FILE_ORDER)
                    if os.path.basename(p) == "видео 1.mkv")
@@ -468,9 +530,7 @@ page7.show()
 pump(0.3)
 page7.magnet_edit.setText(magnet())
 page7.add_magnet()
-started = wait_until(lambda: (page7.engine.get(IH) is not None)
-                     and page7.engine.get(IH).has_metadata
-                     and 0 <= page7.engine.get(IH).progress < 1.0, 30)
+started = wait_ready(page7) and page7.engine.get(IH).progress < 1.0
 LAUNCHED.clear()
 check("7 «Смотреть» недокачанной раздачи открывает http-ссылку",
       started and page7.watch(IH) and len(LAUNCHED) == 1
@@ -592,8 +652,7 @@ seed.h.set_upload_limit(96 * 1024)
 page8 = window8.torrent_page
 page8.magnet_edit.setText(magnet())
 page8.add_magnet()
-started = wait_until(lambda: (page8.engine.get(IH) is not None)
-                     and page8.engine.get(IH).has_metadata, 30)
+started = wait_ready(page8)
 LAUNCHED.clear()
 check("7 просмотр в настоящем окне запущен",
       started and page8.watch(IH) and page8.is_watching(IH), str(LAUNCHED))
@@ -636,9 +695,7 @@ pump(0.3)
 seed.h.set_upload_limit(96 * 1024)
 page9.magnet_edit.setText(magnet())
 page9.add_magnet()
-started9 = wait_until(lambda: (page9.engine.get(IH) is not None)
-                      and page9.engine.get(IH).has_metadata
-                      and 0 <= page9.engine.get(IH).progress < 1.0, 30)
+started9 = wait_ready(page9) and page9.engine.get(IH).progress < 1.0
 item9 = page9.engine.get(IH)
 check("9 раздача добавлена и ещё качается", started9,
       "" if item9 is None else str(item9.state))
@@ -649,33 +706,38 @@ check("9 к просмотру предложены оба видеофайла,
       [os.path.basename(f.path) for f in targets9]
       == ["видео 1.mkv", "видео 2.mp4"],
       str([f.path for f in targets9]))
-dlg9 = gui_torrent.WatchFileDialog(item9, targets9,
-                                   page9.engine.file_progress(IH), page9)
+dlg9 = gui_torrent.TorrentFilesDialog(item9, gui_torrent.MODE_MANAGE,
+                                      page9.engine.file_progress(IH), page9)
 root9 = dlg9.tree.invisibleRootItem()
 folder9 = root9.child(0)
-check("9 диалог показывает всю раздачу, включая невидеофайлы",
+check("9 окно показывает всю раздачу, включая невидеофайлы",
       root9.childCount() == 1 and folder9.childCount() == 3,
       f"{root9.childCount()} / {folder9.childCount()}")
-disabled9 = [folder9.child(i).text(0) for i in range(folder9.childCount())
-             if folder9.child(i).isDisabled()]
-check("9 невидеофайл выбрать нельзя", disabled9 == ["описание.txt"],
-      str(disabled9))
-chosen9 = dlg9._current_file()
-check("9 предвыбран самый большой видеофайл",
-      chosen9 is not None and chosen9.index == VIDEO_INDEX,
-      "" if chosen9 is None else chosen9.path)
-check("9 «Смотреть» доступна при выбранном видео", dlg9.yesButton.isEnabled())
+check("9 при нескольких видео «Посмотреть» ждёт выделения строки",
+      dlg9.watch_target() is None and not dlg9.watch_btn.isEnabled())
+check("9 выделение видео включает «Посмотреть»",
+      dlg9.select(VIDEO_INDEX) and dlg9.watch_btn.isEnabled()
+      and dlg9.watch_target().index == VIDEO_INDEX)
 other9 = next(f for f in targets9 if f.index != VIDEO_INDEX)
-check("9 выбор другого файла меняет ответ диалога",
+check("9 выделение другого файла меняет цель просмотра",
       dlg9.select(other9.index)
-      and dlg9._current_file().index == other9.index)
+      and dlg9.watch_target().index == other9.index)
+txt9 = next(f for f in item9.files if f.path.endswith(".txt"))
+check("9 на невидеофайле «Посмотреть» недоступна",
+      dlg9.select(txt9.index) and dlg9.watch_target() is None
+      and not dlg9.watch_btn.isEnabled())
+check("9 галочка невидеофайла при этом работает",
+      dlg9.set_checked(txt9.index, False)
+      and dlg9.priorities()[txt9.index] == 0, str(dlg9.priorities()))
+dlg9.set_checked(txt9.index, True)
 # У каждого видео видно, сколько уже скачано, — по этому выбирают, что
 # пойдёт быстрее
 shares9 = [folder9.child(i).text(2) for i in range(folder9.childCount())]
 check("9 у видеофайлов показан процент скачанного",
-      all(s.endswith("%") or s == "скачан" for s in shares9[:2])
-      and shares9[2] == "", str(shares9))
-check("9 без подтверждения диалог ничего не отдаёт", dlg9.chosen() is None)
+      all(s.endswith("%") or s == "скачан" for s in shares9[:2]),
+      str(shares9))
+check("9 без нажатия кнопок окно ничего не решает",
+      dlg9.choice().action == gui_torrent.ACTION_CLOSE)
 dlg9.close()
 dlg9.deleteLater()
 
@@ -693,19 +755,21 @@ del page9.engine.get                    # обратно к методу дви�
 
 ASKED.clear()
 LAUNCHED.clear()
-check("9 при двух видеофайлах диалог показывается",
-      page9.watch(IH) and ASKED == [[f.index for f in targets9]], str(ASKED))
-check("9 смотрится тот файл, который выбрали в диалоге",
+check("9 при двух видеофайлах окно показывается",
+      page9.watch(IH)
+      and ASKED == [(gui_torrent.MODE_MANAGE,
+                     [f.index for f in targets9])], str(ASKED))
+check("9 смотрится тот файл, который выбрали в окне",
       page9._stream.active == (IH, VIDEO_INDEX), str(page9._stream.active))
 page9.stop_watch()
 
 ASKED.clear()
 LAUNCHED.clear()
-gui_torrent.TorrentPage.ask_watch_file = lambda self, item, targets: None
-check("9 отмена диалога не запускает ни поток, ни плеер",
+ANSWER[gui_torrent.MODE_MANAGE] = answer_nothing
+check("9 закрытое окно не запускает ни поток, ни плеер",
       page9.watch(IH) is False and not LAUNCHED
       and not page9.is_watching(IH))
-gui_torrent.TorrentPage.ask_watch_file = pick_biggest
+ANSWER[gui_torrent.MODE_MANAGE] = pick_biggest
 
 # 9в. Индикатор подготовки плеера
 LAUNCHED.clear()
@@ -778,11 +842,10 @@ check("9 остановка просмотра гасит индикатор",
       and not page9._prepare_timer.isActive())
 seed.h.set_upload_limit(0)
 
-# ---- 10. Сериал: вложенные папки в диалоге «Что смотреть» (2.3) ----
-# В 2.2 диалог проверялся на плоской раздаче из двух файлов. Сериал с
-# сезонами по папкам строит дерево другой глубины, и предвыбор «самый
-# большой файл» там означает произвольную серию — важно, что выбрать
-# можно ЛЮБУЮ, включая лежащую глубоко.
+# ---- 10. Сериал: вложенные папки в окне выбора (2.3) ----
+# В 2.2 окно проверялось на плоской раздаче из двух файлов. Сериал с
+# сезонами по папкам строит дерево другой глубины — важно, что выделить
+# можно ЛЮБУЮ серию, включая лежащую глубоко.
 import types as _types
 
 _SeriesFile = collections.namedtuple("File", "index path size priority")
@@ -803,11 +866,13 @@ for _i, _path in enumerate(_series):
     if _path.endswith("S01E03.mkv"):
         _size = 900 * 1024 * 1024
     _files10.append(_SeriesFile(_i, _path, _size, 4))
-item10 = _types.SimpleNamespace(id="ee" * 20, files=tuple(_files10))
+item10 = _types.SimpleNamespace(id="ee" * 20, name="Сериал",
+                                save_path=BASE, files=tuple(_files10))
 targets10 = gui_torrent.ts.watchable_files(item10.files)
 # Родитель обязателен: MessageBoxBase qfluentwidgets берёт у него
 # размеры прямо в конструкторе
-dlg10 = gui_torrent.WatchFileDialog(item10, targets10, [], page9)
+dlg10 = gui_torrent.TorrentFilesDialog(item10, gui_torrent.MODE_MANAGE, [],
+                                       page9)
 
 root10 = dlg10.tree.invisibleRootItem()
 serial = root10.child(0)
@@ -820,20 +885,25 @@ check("10 сериал: корневая папка одна, внутри дв�
 check("10 в сезоне видно и серии, и субтитры",
       seasons[0].childCount() == 10,
       str(seasons[0].childCount()))
-check("10 предвыбрана самая большая серия",
-      dlg10._current_file() is not None
-      and os.path.basename(dlg10._current_file().path) == "S01E03.mkv",
-      str(dlg10._current_file() and dlg10._current_file().path))
+check("10 у сериала ничего не предвыбрано — серию выделяет пользователь",
+      dlg10.watch_target() is None and not dlg10.watch_btn.isEnabled())
 _first = next(f for f in targets10
               if os.path.basename(f.path) == "S01E01.mkv")
-check("10 выбирается серия из вложенной папки, а не только предвыбор",
+check("10 выделяется серия из вложенной папки",
       dlg10.select(_first.index)
-      and dlg10._current_file().index == _first.index,
-      str(dlg10._current_file().path))
+      and dlg10.watch_target().index == _first.index,
+      str(dlg10.watch_target().path))
+_deep = next(f for f in targets10
+             if os.path.basename(f.path) == "S02E05.mkv")
+check("10 выделяется и серия из второго сезона",
+      dlg10.select(_deep.index)
+      and dlg10.watch_target().index == _deep.index,
+      str(dlg10.watch_target().path))
 _sub = next(f for f in item10.files if f.path.endswith("S01E01.srt"))
-check("10 субтитры и обложку выбрать нельзя",
-      _sub.index not in dlg10._nodes
-      and not dlg10.select(_sub.index), "")
+check("10 на субтитрах «Посмотреть» гаснет, а галочка работает",
+      dlg10.select(_sub.index) and dlg10.watch_target() is None
+      and dlg10.set_checked(_sub.index, False)
+      and dlg10.priorities()[_sub.index] == 0)
 dlg10.deleteLater()
 
 # ---- 11. «Смотреть» переключает закачку на выбранную серию (2.5) ----
@@ -853,9 +923,7 @@ page11.show()
 pump(0.3)
 page11.magnet_edit.setText(magnet())
 page11.add_magnet()
-started11 = wait_until(lambda: (page11.engine.get(IH) is not None)
-                       and page11.engine.get(IH).has_metadata
-                       and page11.engine.get(IH).progress < 1.0, 30)
+started11 = wait_ready(page11) and page11.engine.get(IH).progress < 1.0
 check("11 раздача добавлена и ещё качается", started11)
 
 
@@ -869,9 +937,7 @@ check("11 до «Смотреть» качаются все файлы разд�
 # Выбираем НЕ предвыбранный (не самый большой) файл — как серию 3 у сериала
 OTHER_INDEX = next(i for i, p in enumerate(FILE_ORDER)
                    if os.path.basename(p) == "видео 2.mp4")
-gui_torrent.TorrentPage.ask_watch_file = (
-    lambda self, item, targets: next(f for f in targets
-                                     if f.index == OTHER_INDEX))
+ANSWER[gui_torrent.MODE_MANAGE] = watch_file(OTHER_INDEX)
 LAUNCHED.clear()
 check("11 «Смотреть» на второй серии запустил просмотр именно её",
       page11.watch(IH) and page11._stream.active == (IH, OTHER_INDEX),
@@ -885,14 +951,12 @@ check("11 остальные файлы раздачи сняты с закач�
 # Главное последствие: в диалоге должны остаться ВСЕ серии, иначе
 # следующую уже не выбрать — «Смотреть» молча открывал бы ту же самую
 targets11 = ts.watchable_files(page11.engine.get(IH).files)
-check("11 в диалоге «Что смотреть» по-прежнему все серии",
+check("11 в окне выбора по-прежнему все серии",
       [f.index for f in targets11] == [VIDEO_INDEX, OTHER_INDEX],
       str([os.path.basename(f.path) for f in targets11]))
 
 # Досмотрели одну, включаем другую — закачка переезжает на неё
-gui_torrent.TorrentPage.ask_watch_file = (
-    lambda self, item, targets: next(f for f in targets
-                                     if f.index == VIDEO_INDEX))
+ANSWER[gui_torrent.MODE_MANAGE] = watch_file(VIDEO_INDEX)
 page11.stop_watch()
 LAUNCHED.clear()
 check("11 «Смотреть» на первой серии переключил просмотр",
@@ -904,11 +968,228 @@ check("11 теперь качается она, а прежняя снята",
       str(prios11()))
 page11.stop_watch()
 
-# Вернуть всё сразу можно диалогом «Файлы» — там галочки и стоят
-page11.ask_files = lambda item: [gui_torrent.PRIORITY_ON] * len(FILE_ORDER)
+# Вернуть всё сразу можно окном «Файлы» — там галочки и стоят
+ANSWER[gui_torrent.MODE_MANAGE] = download_all
 page11.choose_files(IH)
-check("11 диалог «Файлы» возвращает закачку всей раздачи",
+check("11 окно «Файлы» возвращает закачку всей раздачи",
       wait_until(lambda: prios11() == [4] * len(FILE_ORDER), 10), str(prios11()))
+
+# ---- 12. Новый поток добавления: выбор ДО закачки (2.6) ----
+# «Добавить» больше не начинает качать: раздача ждёт, окно выбора
+# открывается само, как только пришёл список файлов, и только ответ в
+# нём («Отмена» / «Скачать» / «Посмотреть») что-то запускает.
+ANSWER[gui_torrent.MODE_MANAGE] = answer_nothing
+seed.h.set_upload_limit(96 * 1024)
+for _page, _eng in list(PAGES):
+    try:
+        _eng.pause(IH)                  # их проверки уже сделаны
+    except Exception:
+        pass
+
+
+def cancel_answer(item):
+    return gui_torrent.FilesChoice(gui_torrent.ACTION_CANCEL)
+
+
+# 12а. Ожидание списка файлов и «Отмена»
+ANSWER[gui_torrent.MODE_ADD] = answer_nothing    # пока окно «закрываем»
+ASKED.clear()
+page12, eng12, save12 = make_page("s12")
+page12.show()
+pump(0.3)
+page12.magnet_edit.setText(magnet())
+page12.add_magnet()
+pump(0.2)
+card12 = page12._cards.get(IH)
+check("12 «Добавить» ничего не качает — раздача ждёт ответа",
+      card12 is not None and page12.is_pending(IH)
+      and int(eng12._handles[IH].status().total_done) == 0,
+      str(state_of(page12, IH)))
+# Как выглядит карточка, пока список файлов ещё не пришёл. Отдельным
+# снимком, а не по ходу: метаданные с локального сида приходят за доли
+# секунды, и поймать это состояние в потоке — гонка
+card12.update_state(dataclasses.replace(
+    page12.engine.get(IH), state=te.STATE_METADATA, has_metadata=False,
+    files=()))
+check("12 пока список файлов не пришёл — «Получаем список файлов…»",
+      card12.meta_label.text() == "Получаем список файлов…"
+      and buttons(card12) == ["Удалить"],
+      f"{card12.meta_label.text()} | {buttons(card12)}")
+asked12 = wait_until(lambda: bool(ASKED), 30)
+pump(0.5)
+check("12 окно выбора открылось само, как только пришёл список",
+      asked12 and ASKED[0][0] == gui_torrent.MODE_ADD, str(ASKED))
+check("12 окно показано один раз, а не на каждый тик движка",
+      len(ASKED) == 1, str(ASKED))
+page12.refresh()
+pump(0.2)
+check("12 закрытое окно ничего не запускает — раздача ждёт",
+      state_of(page12, IH) == te.STATE_PENDING
+      and page12.is_pending(IH), str(state_of(page12, IH)))
+card12 = page12._cards.get(IH)
+check("12 на карточке ждущей раздачи только «Выбрать файлы» и «Удалить»",
+      buttons(card12) == ["Выбрать файлы", "Удалить"], str(buttons(card12)))
+check("12 в подписи — «Ожидает выбора файлов», без процентов",
+      card12.meta_label.text() == "Ожидает выбора файлов",
+      card12.meta_label.text())
+held = int(eng12._handles[IH].status().total_done)
+time.sleep(2)
+pump(0.3)
+check("12 пока ждём ответа, ничего не качается",
+      int(eng12._handles[IH].status().total_done) == held,
+      f"{held} байт успело прийти в момент метаданных")
+
+ASKED.clear()
+ANSWER[gui_torrent.MODE_ADD] = cancel_answer
+page12.choose_pending(IH)               # кнопка «Выбрать файлы»
+pump(0.3)
+gone12 = wait_until(lambda: page12.engine.get(IH) is None, 10)
+check("12 «Выбрать файлы» открывает то же окно, «Отмена» убирает раздачу",
+      gone12 and not page12._cards
+      and ASKED and ASKED[0][0] == gui_torrent.MODE_ADD, str(ASKED))
+check("12 «Отмена» убирает и то, что успело скачаться",
+      wait_until(lambda: not os.path.isdir(
+          os.path.join(save12, "Тестовая раздача")), 10),
+      str(os.listdir(save12) if os.path.isdir(save12) else []))
+
+# 12б. «Скачать»: качается всё отмеченное, папку можно сменить
+other_dir = os.path.join(BASE, "Другая папка")
+WANTED13 = [gui_torrent.PRIORITY_ON] * len(FILE_ORDER)
+WANTED13[OTHER_INDEX] = 0               # одна галочка снята
+ASKED.clear()
+ANSWER[gui_torrent.MODE_ADD] = lambda item: gui_torrent.FilesChoice(
+    gui_torrent.ACTION_DOWNLOAD, tuple(WANTED13), None, other_dir)
+page13, eng13, save13 = make_page("s13")
+page13.show()
+pump(0.3)
+page13.magnet_edit.setText(magnet())
+page13.add_magnet()
+started13 = wait_until(lambda: state_of(page13, IH) == te.STATE_DOWNLOADING, 30)
+check("12 «Скачать» запускает закачку сразу после окна", started13,
+      str(state_of(page13, IH)))
+check("12 «Скачать» качает всё отмеченное галочками",
+      wait_until(lambda: [f.priority for f in page13.engine.get(IH).files]
+                 == WANTED13, 10),
+      str([f.priority for f in page13.engine.get(IH).files]))
+check("12 папка из окна применилась к раздаче",
+      wait_until(lambda: page13.engine.get(IH).save_path == other_dir, 10),
+      page13.engine.get(IH).save_path)
+check("12 раздача больше не ждёт выбора", not page13.is_pending(IH))
+card13 = page13._cards.get(IH)
+check("12 на карточке снова обычные кнопки",
+      "Пауза" in buttons(card13) and "Файлы" in buttons(card13),
+      str(buttons(card13)))
+
+# 12в. «Посмотреть»: качается строго выделенная серия
+try:
+    eng13.pause(IH)                     # её проверки сделаны, канал общий
+except Exception:
+    pass
+seed.h.set_upload_limit(256 * 1024)
+ASKED.clear()
+LAUNCHED.clear()
+ANSWER[gui_torrent.MODE_ADD] = watch_file(OTHER_INDEX)
+page14, eng14, save14 = make_page("s14")
+page14.show()
+pump(0.3)
+page14.magnet_edit.setText(magnet())
+page14.add_magnet()
+watching14 = wait_until(lambda: page14.is_watching(IH), 30)
+pump(0.3)
+check("12 «Посмотреть» из окна запускает просмотр выбранной серии",
+      watching14 and page14._stream.active == (IH, OTHER_INDEX)
+      and len(LAUNCHED) == 1, str(LAUNCHED))
+
+
+def prios14():
+    return [f.priority for f in page14.engine.get(IH).files]
+
+
+check("12 качается ТОЛЬКО выбранная серия, галочки не в счёт",
+      wait_until(lambda: prios14()[VIDEO_INDEX] == 0, 10)
+      and prios14()[OTHER_INDEX] == te.STREAM_PRIORITY
+      and all(p == 0 for i, p in enumerate(prios14()) if i != OTHER_INDEX),
+      str(prios14()))
+check("12 явный заказ файлов при просмотре не записан",
+      IH not in page14.engine._chosen
+      and not os.path.exists(page14.engine._chosen_path(IH)))
+before14 = page14.engine.file_progress(IH)
+wait_until(lambda: page14.engine.file_progress(IH)[OTHER_INDEX]
+           > before14[OTHER_INDEX], 60)
+after14 = page14.engine.file_progress(IH)
+# У соседа прибавка возможна ровно одна — его хвост, лежащий в КУСКЕ,
+# который делится с началом выбранной серии (размеры файлов не кратны
+# куску). Тот же эффект границы разобран по байтам в сессии 2.5
+tail14 = SIZES["видео 1.mkv"] % (256 * 1024)
+grew14 = after14[VIDEO_INDEX] - before14[VIDEO_INDEX]
+check("12 растёт только выбранная серия (у соседа — общий кусок)",
+      after14[OTHER_INDEX] > before14[OTHER_INDEX] and grew14 in (0, tail14),
+      f"{before14} -> {after14}, общий хвост {tail14} Б")
+page14.stop_watch()
+ANSWER[gui_torrent.MODE_ADD] = download_all
+
+# ---- 13. Само окно выбора: галочки и выделение — разные ответы (2.6) ----
+# Галочки отвечают «что скачать», выделение строки — «что смотреть».
+# Клик по квадратику галочки НЕ должен выделять строку: иначе простая
+# расстановка галочек оживляла бы «Посмотреть» на случайной серии.
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QTest
+
+item13 = page13.engine.get(IH)
+dlg13 = gui_torrent.TorrentFilesDialog(item13, gui_torrent.MODE_ADD, [],
+                                       page13)
+check("13 при добавлении отмечены все файлы",
+      dlg13.priorities() == [gui_torrent.PRIORITY_ON] * len(FILE_ORDER),
+      str(dlg13.priorities()))
+check("13 три кнопки: «Отмена», «Скачать», «Посмотреть»",
+      (dlg13.cancelButton.text(), dlg13.yesButton.text(),
+       dlg13.watch_btn.text()) == ("Отмена", "Скачать", "Посмотреть"))
+check("13 папка сохранения показана и её можно сменить",
+      item13.save_path in dlg13.folder_label.text()
+      and dlg13.folder_btn.isEnabled(), dlg13.folder_label.text())
+check("13 при нескольких видео «Посмотреть» ждёт выделения",
+      not dlg13.watch_btn.isEnabled())
+
+dlg13.show()
+pump(0.2)
+leaf13 = dlg13._leaves[VIDEO_INDEX]
+rect13 = dlg13.tree.visualItemRect(leaf13)
+style13 = dlg13.tree.style()
+box_x = rect13.left() + style13.pixelMetric(
+    gui_torrent.QStyle.PM_IndicatorWidth) // 2
+QTest.mouseClick(dlg13.tree.viewport(), Qt.LeftButton, Qt.NoModifier,
+                 QPoint(box_x, rect13.center().y()))
+pump(0.2)
+check("13 клик по галочке снимает её и НЕ выделяет строку",
+      dlg13.priorities()[VIDEO_INDEX] == 0
+      and not leaf13.isSelected() and not dlg13.watch_btn.isEnabled(),
+      f"{dlg13.priorities()} | выделено: {leaf13.isSelected()}")
+
+text_x = rect13.left() + rect13.width() - 10
+QTest.mouseClick(dlg13.tree.viewport(), Qt.LeftButton, Qt.NoModifier,
+                 QPoint(text_x, rect13.center().y()))
+pump(0.2)
+check("13 клик по названию выделяет строку и не трогает галочку",
+      leaf13.isSelected() and dlg13.priorities()[VIDEO_INDEX] == 0
+      and dlg13.watch_btn.isEnabled()
+      and dlg13.watch_target().index == VIDEO_INDEX,
+      f"{dlg13.priorities()} | выделено: {leaf13.isSelected()}")
+check("13 «Посмотреть» работает и на файле без галочки",
+      dlg13.watch_target().index == VIDEO_INDEX)
+dlg13.close()
+dlg13.deleteLater()
+pump(0.1)
+
+# Фильм: единственное видео выделять не нужно
+one_video13 = dataclasses.replace(
+    item13, files=tuple(f for f in item13.files
+                        if not f.path.endswith(".mp4")))
+dlg13b = gui_torrent.TorrentFilesDialog(one_video13, gui_torrent.MODE_ADD, [],
+                                        page13)
+check("13 у фильма «Посмотреть» активна сразу, без выделения",
+      dlg13b.watch_btn.isEnabled()
+      and dlg13b.watch_target().index == VIDEO_INDEX)
+dlg13b.deleteLater()
 
 # ---- завершение: не оставить работающих потоков ----
 for page, engine in PAGES:

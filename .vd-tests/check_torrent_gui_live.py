@@ -44,7 +44,10 @@ BASE = tempfile.mkdtemp(prefix="vd-torrent-live-")
 SRC_ROOT = os.path.join(BASE, "источник")
 CONTENT = os.path.join(SRC_ROOT, "Фильм про котиков")
 os.makedirs(CONTENT)
-SIZES = {"котики 1080p.bin": 12 * MB + 12345, "котики 720p.bin": 6 * MB + 54321,
+# Расширения настоящие: окно выбора отличает видео от прочего по ним —
+# с .bin «Посмотреть» была бы неактивна всегда, и проверка «ждёт
+# выделения строки» проходила бы по ложной причине
+SIZES = {"котики 1080p.mkv": 12 * MB + 12345, "котики 720p.mp4": 6 * MB + 54321,
          "субтитры.srt": 20000}
 for file_name, size in SIZES.items():
     with open(os.path.join(CONTENT, file_name), "wb") as f:
@@ -137,6 +140,46 @@ check("движок поднят показом страницы", w.torrent_eng
 check("подсказка пустого списка видна", page.empty_label.isVisible())
 shot("01-пусто.png")
 
+# С 2.6 после «Добавить» показывается окно выбора, и без ответа раздача
+# ничего не качает. Настоящее окно поднимаем сами — exec() заблокировал
+# бы проверку, — снимаем его и отвечаем за пользователя «Скачать».
+import gui_torrent
+
+SHOWN = []
+
+
+def live_choice(self, item, mode):
+    dialog = gui_torrent.TorrentFilesDialog(
+        item, mode, self.engine.file_progress(item.id), w)
+    dialog.show()
+    pump(1.0)
+    SHOWN.append(dialog)
+    check("окно выбора: три кнопки и все файлы отмечены",
+          (dialog.cancelButton.text(), dialog.yesButton.text(),
+           dialog.watch_btn.text()) == ("Отмена", "Скачать", "Посмотреть")
+          and dialog.priorities() == [gui_torrent.PRIORITY_ON] * 3,
+          str(dialog.priorities()))
+    check("окно выбора: папка сохранения показана",
+          item.save_path in dialog.folder_label.text(),
+          dialog.folder_label.text())
+    check("окно выбора: «Посмотреть» ждёт выделения строки",
+          not dialog.watch_btn.isEnabled())
+    video = next(f for f in item.files if f.path.endswith("1080p.mkv"))
+    dialog.select(video.index)
+    pump(0.4)
+    check("окно выбора: выделение строки включает «Посмотреть»",
+          dialog.watch_btn.isEnabled()
+          and dialog.watch_target().index == video.index)
+    shot("02-окно-выбора.png")
+    choice = dialog.make_choice(gui_torrent.ACTION_DOWNLOAD)
+    dialog.close()
+    dialog.deleteLater()
+    pump(0.3)
+    return choice
+
+
+gui_torrent.TorrentPage.ask_choice = live_choice
+
 page.magnet_edit.setText(
     f"magnet:?xt=urn:btih:{IH}&dn=Фильм+про+котиков&x.pe=127.0.0.1:{seed_port}")
 page.add_magnet()
@@ -144,7 +187,13 @@ pump(0.6)
 card = page._cards.get(IH)
 check("карточка раздачи появилась", card is not None)
 check("карточка видна на экране", card is not None and card.isVisible())
+check("до ответа в окне не скачано ни байта",
+      int(w.torrent_engine._handles[IH].status().total_done) == 0,
+      str(int(w.torrent_engine._handles[IH].status().total_done)))
 shot("02-добавлено.png")
+check("окно выбора показалось само",
+      wait_until(lambda: bool(SHOWN), 30) and SHOWN[0].tree is not None)
+pump(0.6)
 
 ok = wait_until(lambda: page.engine.get(IH).state == te.STATE_DOWNLOADING, 30)
 pump(1.5)
@@ -154,18 +203,19 @@ check("в подписи есть проценты и скорость",
       "%" in meta and ("/с" in meta), meta)
 check("прогресс-бар виден и не нулевой",
       card.bar.isVisible() and card.bar.value() >= 0, str(card.bar.value()))
-check("кнопки скачивания: Пауза/Файлы/Удалить",
+# «Смотреть» первой кнопкой: в раздаче есть видео (2.1)
+check("кнопки скачивания: Смотреть/Пауза/Файлы/Удалить",
       [card.actions_widget.layout().itemAt(i).widget().text()
        for i in range(card.actions_widget.layout().count())]
-      == ["Пауза", "Файлы", "Удалить"])
+      == ["Смотреть", "Пауза", "Файлы", "Удалить"])
 shot("03-скачивается.png")
 
-# дерево файлов поверх настоящего окна
+# то же окно из кнопки «Файлы» поверх настоящего окна
 dialog = None
 item = page.engine.get(IH)
 if item is not None and item.files:
-    import gui_torrent
-    dialog = gui_torrent.TorrentFilesDialog(item, w)
+    dialog = gui_torrent.TorrentFilesDialog(
+        item, gui_torrent.MODE_MANAGE, page.engine.file_progress(IH), w)
     dialog.show()
     pump(0.8)
     check("дерево файлов открылось и показывает 3 файла",
@@ -182,10 +232,10 @@ meta = card.meta_label.text() if card else ""
 check("раздача докачана и раздаётся", ok, page.engine.get(IH).state)
 check("подпись готовой раздачи: «Раздаётся» и 100%",
       "Раздаётся" in meta and "100%" in meta, meta)
-check("кнопки готовой раздачи: Открыть папку/Файлы/Удалить",
+check("кнопки готовой раздачи: Смотреть/Открыть папку/Файлы/Удалить",
       [card.actions_widget.layout().itemAt(i).widget().text()
        for i in range(card.actions_widget.layout().count())]
-      == ["Открыть папку", "Файлы", "Удалить"])
+      == ["Смотреть", "Открыть папку", "Файлы", "Удалить"])
 shot("05-раздаётся.png")
 
 w.close()

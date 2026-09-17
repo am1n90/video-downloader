@@ -184,6 +184,44 @@ except player.PlayerNotFound as exc:
     exe = ""
 
 page = window.torrent_page
+# С 2.6 «Добавить» сначала показывает окно выбора, и без ответа раздача
+# ничего не качает. Окно модальное — exec() остановил бы проверку,
+# поэтому показываем его сами и отвечаем за пользователя. Настоящий
+# здесь виджет и его отрисовка: именно её offscreen-тест не видит
+# (находка 32). Ответы зависят от контекста: при добавлении «Скачать»,
+# у кнопки «Файлы» — «Посмотреть» на второй серии (ниже).
+dialog_shot = {}
+SECOND = None
+
+
+def live_choice(item_arg, mode):
+    dialog = gui_torrent.TorrentFilesDialog(
+        item_arg, mode, page.engine.file_progress(item_arg.id), window)
+    dialog.show()
+    pump(0.6)
+    if mode == gui_torrent.MODE_ADD:
+        dialog_shot["add"] = shot("01b-окно-выбора")
+        dialog_shot["add_all_checked"] = dialog.priorities()
+        dialog_shot["add_watch_off"] = dialog.watch_btn.isEnabled()
+        action = gui_torrent.ACTION_DOWNLOAD
+    else:
+        dialog_shot["path"] = shot("02-окно-выбора-файлы")
+        dialog_shot["watch_before_select"] = dialog.watch_btn.isEnabled()
+        # Берём НЕ самый большой файл: так видно, что ответ окна и правда
+        # доходит до просмотра, а не совпал с прежним «сам выберу»
+        dialog.select(SECOND.index)
+        pump(0.2)
+        dialog_shot["watch_after_select"] = dialog.watch_btn.isEnabled()
+        action = gui_torrent.ACTION_WATCH
+    choice = dialog.make_choice(action)
+    dialog.close()
+    dialog.deleteLater()
+    pump(0.3)
+    return choice
+
+
+page.ask_choice = live_choice
+
 magnet = (f"magnet:?xt=urn:btih:{IH}&dn=live"
           f"&x.pe=127.0.0.1:{seed_ses.listen_port()}")
 page.magnet_edit.setText(magnet)
@@ -200,37 +238,19 @@ check("выбран самый большой видеофайл",
       target is not None and target.path.endswith("котики 1080p.mkv"),
       getattr(target, "path", None))
 
-# ---- 2.2: диалог выбора файла на настоящем окне ----
-# Диалог модальный: exec() остановил бы проверку, поэтому показываем его
-# сам, снимаем и отвечаем за пользователя. Настоящий здесь — виджет и
-# его отрисовка: именно её offscreen-тест не видит (находка 32).
+# ---- 2.2/2.6: окно выбора файла на настоящем окне ----
 TARGETS = ts.watchable_files(item.files)
 check("к просмотру предложены оба видеофайла",
       len(TARGETS) == 2,
       str([os.path.basename(f.path) for f in TARGETS]))
 SECOND = min(TARGETS, key=lambda f: f.size)
-dialog_shot = {}
-
-
-def live_ask(item_arg, targets):
-    dialog = gui_torrent.WatchFileDialog(
-        item_arg, targets, page.engine.file_progress(item_arg.id),
-        window)
-    dialog.show()
-    pump(0.6)
-    dialog_shot["path"] = shot("02-диалог-что-смотреть")
-    dialog_shot["preselected"] = dialog._current_file()
-    # Берём НЕ предвыбранный файл: так видно, что ответ диалога и правда
-    # доходит до просмотра, а не совпал с прежним «сам выберу»
-    dialog.select(SECOND.index)
-    chosen = dialog._current_file()
-    dialog.close()
-    dialog.deleteLater()
-    pump(0.3)
-    return chosen
-
-
-page.ask_watch_file = live_ask
+check("окно выбора при добавлении: все файлы отмечены, просмотр ждёт "
+      "выделения",
+      dialog_shot.get("add_all_checked")
+      == [gui_torrent.PRIORITY_ON] * len(item.files)
+      and dialog_shot.get("add_watch_off") is False,
+      f"{dialog_shot.get('add_all_checked')} | "
+      f"«Посмотреть» активна: {dialog_shot.get('add_watch_off')}")
 
 # Запускаем НАСТОЯЩИЙ плеер, но без окна: проверяем чтение, не картинку
 LOG = os.path.join(OUT, "player.log")
@@ -239,8 +259,11 @@ PROCS = []
 real_launch = player.launch
 
 
-def headless_launch(url, exe_path):
+def headless_launch(url, exe_path, subtitles=()):
+    # subtitles — с 2.3: их проверяет отдельный check_subtitles_live.py,
+    # здесь просто запоминаем, чтобы не расходиться с player.launch
     launched["url"] = url
+    launched["subtitles"] = tuple(subtitles)
     name = os.path.basename(exe_path).lower()
     if name.startswith("mpv"):
         cmd = [exe_path, "--no-config", "--vo=null", "--ao=null",
@@ -265,12 +288,13 @@ check("«Смотреть» запустил плеер", started and "url" in l
 check("карточка показывает «Остановить просмотр»",
       page.is_watching(IH), str(page._stream.active))
 
-# 2.2: диалог сработал и его ответ дошёл до просмотра
-pre = dialog_shot.get("preselected")
-check("в диалоге предвыбран самый большой файл",
-      pre is not None and pre.index == target.index,
-      getattr(pre, "path", None))
-check("смотрится тот файл, который выбрали в диалоге",
+# 2.2/2.6: окно сработало и его ответ дошёл до просмотра
+check("в окне «Файлы» «Посмотреть» оживает только после выделения",
+      dialog_shot.get("watch_before_select") is False
+      and dialog_shot.get("watch_after_select") is True,
+      f"до выделения: {dialog_shot.get('watch_before_select')}, "
+      f"после: {dialog_shot.get('watch_after_select')}")
+check("смотрится тот файл, который выбрали в окне",
       page._stream.active == (IH, SECOND.index),
       f"{page._stream.active}, ждали индекс {SECOND.index}")
 check("ссылка плеера ведёт на выбранный файл",
