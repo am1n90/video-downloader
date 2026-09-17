@@ -1,19 +1,31 @@
-"""Проверки УСТАНОВЛЕННОЙ копии — сессия 2.4, часть B (офисная машина).
+"""Проверки УСТАНОВЛЕННОЙ копии (сессия 2.4 часть B; с релиза 1.1.0 —
+поток добавления 2.6 и Библиотека торрентов).
 
-Часть A шла разовыми скриптами; здесь собраны шаги, оставшиеся на
-установленной копии, каждый отдельной командой (приложение запускается
-и закрывается внутри шага — состояние между шагами не делится):
+Каждый шаг — отдельной командой (приложение запускается и закрывается
+внутри шага — состояние между шагами не делится):
 
     nometa   — закрытие окна с раздачей БЕЗ метаданных (находка 42:
                было 3.28 с, ожидаем < 1 с) + контроль: fastresume
                магнита всё равно записан;
     dialog   — добавление .torrent через СИСТЕМНЫЙ диалог «Выберите
-               .torrent» (настоящее окно выбора файла, ввод пути с
-               клавиатуры);
-    click    — выбор серии НАСТОЯЩИМ кликом мыши в «Что смотреть»
-               (до сих пор этот выбор звали методом select());
+               .torrent», затем «Скачать» в окне выбора (2.6);
+    cancel   — «Отмена» в окне выбора: раздача убрана вместе с
+               fastresume, в Библиотеку не попала (2.6, долг 1.4);
+    readd    — повторное добавление раздачи, которая уже в списке: окно
+               выбора НЕ открывается, файлы целы (до исправления его
+               «Отмена» стирала скачанное — найдено перед релизом 1.1.0);
+    click    — выбор серии НАСТОЯЩИМ кликом мыши в окне выбора и
+               «Посмотреть»: плеер открывает именно её (2.6);
     subs     — что делает VLC с субтитрами по http (только запись
-               наблюдения, правило «та же папка» не чиним).
+               наблюдения, правило «та же папка» не чиним);
+    library  — Библиотека торрентов на установленной копии: запись в
+               settings.json, «Очистить данные библиотеки» не трогает
+               раздачу, удаление записи с галочкой снимает раздачу с
+               «Торрентов» и удаляет файлы (долг 1.4).
+
+С 2.6 окно выбора открывается САМО, как только пришёл список файлов, и
+оно модальное: вызов «Добавить»/«Открыть .torrent…» у .torrent не
+вернётся, пока окно не закрыто, — такие вызовы идут через invoke_async.
 
 Сид поднимается и гасится внутри шагов dialog/click/subs
 (`seed_local_tracker.py`, трекер 127.0.0.1:7788, интернет не нужен).
@@ -38,7 +50,7 @@ VENV_PY = os.path.join(ROOT, "build-venv", "Scripts", "python.exe")
 SEEDER = os.path.join(HERE, "seed_local_tracker.py")
 VLC = r"C:\Program Files\VideoLAN\VLC\vlc.exe"
 
-BASE = os.path.join(tempfile.gettempdir(), "vd-24b")
+BASE = os.path.join(tempfile.gettempdir(), "vd-110")
 DL = os.path.join(BASE, "downloads")
 SEED = os.path.join(BASE, "seed")
 SNAP = os.path.join(BASE, "shots")
@@ -84,7 +96,8 @@ def save_state(**changes):
 
 
 def ensure_backup():
-    """Резервная копия settings.json — ровно одна на всю часть B."""
+    """Резервная копия settings.json — ровно одна на весь прогон шагов
+    (до cleanup)."""
     st = state()
     if st.get("backup") and os.path.isfile(st["backup"]):
         return st["backup"]
@@ -97,11 +110,23 @@ def ensure_backup():
 
 
 def prepare(**extra):
-    """Установленную копию — в режим Torrent со своей папкой загрузок."""
+    """Установленную копию — в режим Torrent со своей папкой загрузок.
+
+    Каждый шаг начинает с ЧИСТОГО состояния: без раздач (fastresume), без
+    загрузок и без записей Библиотеки. Иначе раздача, оставленная прошлым
+    шагом, поднимается из fastresume, и следующий шаг проверяет не то:
+    так «cancel» на первой сборке 1.1.0 прошёл лишь потому, что стёр
+    раздачу шага «dialog» — это и был найденный дефект.
+    """
     ensure_backup()
+    for pid, _parent, _cmd in ui.processes("VideoDownloader.exe"):
+        ui.kill(pid)
+    shutil.rmtree(ui.TORRENT_DATA, ignore_errors=True)
+    shutil.rmtree(DL, ignore_errors=True)
     os.makedirs(DL, exist_ok=True)
     os.makedirs(SNAP, exist_ok=True)
-    changes = {"app_mode": "torrent", "torrent_folder": DL}
+    changes = {"app_mode": "torrent", "torrent_folder": DL,
+               "torrent_history": []}
     changes.update(extra)
     ui.patch_settings(**changes)
 
@@ -168,23 +193,72 @@ def close_app(proc, hwnd, timeout=30):
     return time.monotonic() - t0
 
 
+def _plain(text):
+    """Неразрывные пробелы -> обычные: подписи Библиотеки торрентов не
+    рвут «+ 1 файл» и дату переносом (NBSP внутри частей)."""
+    return (text or "").replace(" ", " ")
+
+
 def card_text(pid, must_have):
     for e in ui.elements(pid):
-        name = e.get("name") or ""
+        name = _plain(e.get("name"))
         if must_have in name:
             return name
     return ""
 
 
 def wait_card(pid, must_have, timeout):
-    e = ui.wait_element(pid, lambda x: must_have in (x.get("name") or ""),
+    e = ui.wait_element(pid, lambda x: must_have in _plain(x.get("name")),
                         timeout)
-    return (e or {}).get("name", "")
+    return _plain((e or {}).get("name", ""))
 
 
 def add_magnet(pid, uri):
+    """Вставить magnet и нажать «Добавить». Нажатие — асинхронно: с 2.6
+    окно выбора открывается, как только пришёл список файлов, и если это
+    случится, пока Qt ещё обрабатывает нажатие, синхронный Invoke ждал
+    бы закрытия модального окна."""
     ui.set_value(pid, uri, ctl_type="ControlType.Edit")
-    ui.invoke(pid, "Добавить")
+    return ui.invoke_async(pid, "Добавить")
+
+
+def click_button(pid, name):
+    """Клик мышью по ВИДИМОЙ кнопке (у кнопок скрытых страниц нет
+    прямоугольника). Клик не ждёт модального окна, в отличие от Invoke."""
+    e = element(pid, name, "ControlType.Button")
+    if e is None:
+        return False
+    ui.click(pid, *center(e))
+    return True
+
+
+CHOICE_TITLE = "Что скачать"       # заголовок окна выбора при добавлении
+
+
+def wait_choice(pid, timeout=90):
+    """Окно выбора (2.6) открылось само — ждём его заголовок."""
+    return ui.wait_element(
+        pid, lambda e: (e.get("name") or "") == CHOICE_TITLE
+        and e.get("w"), timeout) is not None
+
+
+def answer_choice(pid, button):
+    """Нажать кнопку ОКНА ВЫБОРА мышью («Отмена»/«Скачать»/«Посмотреть»).
+    «Отмена» и «Скачать» бывают и вне окна — берём кнопку под деревом."""
+    btn = dialog_button(pid, button, anchor=CHOICE_TITLE)
+    if btn is None:
+        return False
+    ui.click(pid, *center(btn))
+    return True
+
+
+def wait_gone(pid, name, timeout):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if element(pid, name) is None:
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def resume_files():
@@ -217,7 +291,7 @@ def step_nometa(runs=3):
             proc, hwnd = start_app()
             if kind == "магнит":
                 add_magnet(proc.pid, DEAD_MAGNET)
-                label = wait_card(proc.pid, "Получение сведений о раздаче", 30)
+                label = wait_card(proc.pid, "Получаем список файлов", 30)
                 if i == 0:
                     check("карточка магнита без метаданных появилась",
                           bool(label), label)
@@ -275,6 +349,13 @@ def step_dialog():
         ui.type_text(dlg, torrent)
         time.sleep(0.3)
         ui.press(dlg, VK_RETURN)
+
+        # У .torrent список файлов есть сразу: окно выбора открывается
+        # внутри того же вызова, и job не вернётся, пока окно не закрыто
+        check("окно выбора открылось само", wait_choice(proc.pid, 60))
+        grab(hwnd, os.path.join(SNAP, "dialog-choice.png"))
+        check("«Скачать» в окне выбора нажата",
+              answer_choice(proc.pid, "Скачать"))
         job.wait(timeout=60)
 
         label = wait_card(proc.pid, "Сериал про котиков", 60)
@@ -342,17 +423,15 @@ def vlc_lines():
 
 
 def step_click(player=VLC):
-    """Выбор серии настоящим кликом мыши в «Что смотреть»."""
+    """Выбор серии настоящим кликом мыши в окне выбора и «Посмотреть»."""
     print("== click: выбор серии кликом мыши ==")
     if not os.path.isfile(player):
         print(f"  НЕТ ПЛЕЕРА: {player}")
         return 1
     prepare(torrent_player=player)
-    # Папку загрузок чистим, а сид придерживаем: иначе 150 МБ с
+    # Сид придерживаем (папку загрузок чистит prepare): иначе 150 МБ с
     # локального сида скачиваются за секунды, файл открывается прямо с
     # диска и путь через наш сервер вообще не проверяется
-    shutil.rmtree(DL, ignore_errors=True)
-    os.makedirs(DL, exist_ok=True)
     for pid, _parent, cmd in ui.processes("vlc.exe"):
         ui.kill(pid)
     seed, info = seed_start(limit_kb=300)
@@ -362,31 +441,32 @@ def step_click(player=VLC):
         add_magnet(proc.pid, info["magnet"])
         label = wait_card(proc.pid, "Сериал про котиков", 90)
         check("раздача добавлена по magnet", bool(label), label)
-        wait_card(proc.pid, "Скачивается", 90)
+        check("окно выбора открылось, когда пришёл список файлов",
+              wait_choice(proc.pid, 90))
+        check("до ответа раздача ничего не качает",
+              bool(wait_card(proc.pid, "Ожидает выбора файлов", 10)))
 
-        job = ui.invoke_async(proc.pid, "Смотреть")
         node = ui.wait_element(
             proc.pid,
             lambda e: "s01e02" in (e.get("name") or "")
             and "TreeItem" in (e.get("type") or ""), 30)
-        check("диалог «Что смотреть» открылся", node is not None,
+        check("в окне выбора видна вторая серия", node is not None,
               (node or {}).get("name", ""))
         if node is None:
             close_app(proc, hwnd)
             return report()
 
-        x, y = center(node)
+        # По названию, а не по квадратику галочки: клик по галочке строку
+        # не выделяет (2.6, сценарий 13 офлайн-теста)
+        x = node["x"] + node["w"] - 20
+        y = center(node)[1]
         print(f"  клик по строке второй серии: {x},{y}")
         ui.click(proc.pid, x, y)
         time.sleep(0.5)
         grab(hwnd, os.path.join(SNAP, "click-selected.png"))
 
-        watch = dialog_button(proc.pid, "Смотреть")
-        check("кнопка «Смотреть» в диалоге найдена", watch is not None,
-              "" if watch is None else "x=%d y=%d" % (watch["x"], watch["y"]))
-        if watch:
-            ui.click(proc.pid, *center(watch))
-        job.wait(timeout=60)
+        check("«Посмотреть» в окне выбора нажата",
+              answer_choice(proc.pid, "Посмотреть"))
 
         end = time.monotonic() + 60
         cmd = ""
@@ -427,8 +507,6 @@ def step_subs(player=VLC):
     (правило «та же папка» по решению владельца не чиним)."""
     print("== subs: VLC и субтитры по http (наблюдение) ==")
     prepare(torrent_player=player)
-    shutil.rmtree(DL, ignore_errors=True)
-    os.makedirs(DL, exist_ok=True)
     for pid, _parent, cmd in ui.processes("vlc.exe"):
         ui.kill(pid)
     seed, info = seed_start(limit_kb=300)
@@ -437,20 +515,15 @@ def step_subs(player=VLC):
         ui.focus(hwnd)
         add_magnet(proc.pid, info["magnet"])
         wait_card(proc.pid, "Сериал про котиков", 90)
-        wait_card(proc.pid, "Скачивается", 90)
-
-        job = ui.invoke_async(proc.pid, "Смотреть")
+        wait_choice(proc.pid, 90)
         node = ui.wait_element(
             proc.pid,
-            lambda e: "s01e01" in (e.get("name") or "")
+            lambda e: "s01e01.mkv" in (e.get("name") or "")
             and "TreeItem" in (e.get("type") or ""), 30)
         if node is not None:
-            ui.click(proc.pid, *center(node))
+            ui.click(proc.pid, node["x"] + node["w"] - 20, center(node)[1])
             time.sleep(0.4)
-            watch = dialog_button(proc.pid, "Смотреть")
-            if watch:
-                ui.click(proc.pid, *center(watch))
-        job.wait(timeout=60)
+            answer_choice(proc.pid, "Посмотреть")
 
         end = time.monotonic() + 60
         cmd = ""
@@ -474,6 +547,252 @@ def step_subs(player=VLC):
     finally:
         seed_stop(seed)
     return 0
+
+
+# ------------------------------------------------------------ шаг cancel
+
+def infohash_files(infohash):
+    return [n for n in resume_files() if n.startswith(infohash)]
+
+
+def torrent_history():
+    return (ui.read_settings().get("torrent_history") or [])
+
+
+def step_cancel():
+    """«Отмена» в окне выбора: раздача убрана целиком, в Библиотеку не
+    попала (запись появляется только после «Скачать»/«Посмотреть»)."""
+    print("== cancel: «Отмена» в окне выбора ==")
+    prepare()
+    seed, info = seed_start(limit_kb=300)
+    try:
+        proc, hwnd = start_app()
+        ui.focus(hwnd)
+        add_magnet(proc.pid, info["magnet"])
+        check("окно выбора открылось", wait_choice(proc.pid, 90))
+        grab(hwnd, os.path.join(SNAP, "cancel-choice.png"))
+        check("«Отмена» нажата", answer_choice(proc.pid, "Отмена"))
+        check("окно выбора закрылось", wait_gone(proc.pid, CHOICE_TITLE, 15))
+        check("карточка раздачи убрана",
+              wait_gone(proc.pid, "Сериал про котиков", 15))
+        time.sleep(1.0)
+        check("fastresume/.pending раздачи удалены",
+              not infohash_files(info["infohash"]),
+              str(infohash_files(info["infohash"])))
+        close_app(proc, hwnd)
+        check("в Библиотеке записи нет",
+              not any(e.get("id") == info["infohash"]
+                      for e in torrent_history()))
+    finally:
+        seed_stop(seed)
+    return report()
+
+
+# ------------------------------------------------------------ шаг readd
+
+def step_readd():
+    """Повторный magnet уже скачанной раздачи не открывает окно выбора
+    (его «Отмена» удаляла файлы) и ничего не удаляет."""
+    print("== readd: повторное добавление раздачи, которая уже в списке ==")
+    prepare()
+    seed, info = seed_start(limit_kb=20000)
+    video = os.path.join(DL, "Сериал про котиков", "Котики s01e01.mkv")
+    try:
+        proc, hwnd = start_app()
+        ui.focus(hwnd)
+        check("«Скачать» в окне выбора", download_all(proc.pid, info["magnet"]))
+        seeding = wait_card(proc.pid, "Раздаётся", 180)
+        check("раздача скачана и раздаётся", bool(seeding), seeding)
+        size_before = os.path.getsize(video) if os.path.isfile(video) else -1
+
+        add_magnet(proc.pid, info["magnet"])
+        note = wait_card(proc.pid, "Эта раздача уже в списке", 15)
+        check("сообщение «Эта раздача уже в списке»", bool(note), note)
+        opened = wait_choice(proc.pid, 5)
+        grab(hwnd, os.path.join(SNAP, "readd-note.png"))
+        check("окно выбора НЕ открылось", not opened)
+        if opened:                       # не дать «Отмене» случиться
+            ui.close_window(hwnd)
+        time.sleep(2.0)
+        check("раздача по-прежнему в списке и раздаётся",
+              bool(wait_card(proc.pid, "Раздаётся", 10)))
+        check("скачанный файл на месте",
+              os.path.isfile(video) and os.path.getsize(video) == size_before,
+              f"{size_before} байт")
+        check("fastresume раздачи на месте",
+              any(n.endswith(".fastresume")
+                  for n in infohash_files(info["infohash"])),
+              str(infohash_files(info["infohash"])))
+        close_app(proc, hwnd)
+    finally:
+        seed_stop(seed)
+    return report()
+
+
+# ------------------------------------------------------------ шаг library
+
+TORRENT_NAV = ("Торренты", "Библиотека")    # порядок пунктов режима сверху
+
+
+def open_nav(pid, name):
+    """Перейти на страницу режима Torrent через навигацию.
+
+    У пунктов навигации qfluentwidgets в UI Automation НЕТ имени
+    (NavigationTreeItem с пустым name, панель свёрнута до иконок), а
+    пункты чужого режима скрыты и в дамп не попадают. Поэтому пункт
+    ищем по месту: видимые пункты сверху вниз — «Торренты»,
+    «Библиотека», последний (внизу) — «Настройки». Переход
+    подтверждаем заголовком страницы (TitleLabel).
+    """
+    items = sorted((e for e in ui.elements(pid)
+                    if e.get("cls") == "NavigationTreeItem" and e.get("w")),
+                   key=lambda e: e["y"])
+    top = items[:-1]                       # последний — «Настройки»
+    idx = TORRENT_NAV.index(name)
+    if len(top) != len(TORRENT_NAV):
+        print(f"  навигация: ожидалось {len(TORRENT_NAV)} пункта сверху, "
+              f"видно {len(top)}")
+        return False
+    ui.click(pid, *center(top[idx]))
+    title = ui.wait_element(
+        pid, lambda e: e.get("cls") == "TitleLabel"
+        and e.get("name") == name and e.get("w"), 10)
+    return title is not None
+
+
+def page_text(pid, part, timeout=30):
+    return wait_card(pid, part, timeout)
+
+
+def download_all(pid, magnet):
+    add_magnet(pid, magnet)
+    if not wait_choice(pid, 90):
+        return False
+    return answer_choice(pid, "Скачать")
+
+
+def step_library():
+    """Библиотека торрентов на установленной копии (долг 1.4)."""
+    print("== library: Библиотека торрентов ==")
+    prepare()
+    seed, info = seed_start(limit_kb=20000)
+    ih = info["infohash"]
+    root = os.path.join(DL, "Сериал про котиков")
+    try:
+        proc, hwnd = start_app()
+        ui.focus(hwnd)
+
+        # а) «Скачать» -> запись в Библиотеке и в settings.json
+        check("«Скачать» в окне выбора", download_all(proc.pid, info["magnet"]))
+        seeding = wait_card(proc.pid, "Раздаётся", 180)
+        check("раздача скачана и раздаётся", bool(seeding), seeding)
+        check("запись в settings.json установленной копии",
+              any(e.get("id") == ih for e in torrent_history()))
+        if not check("пункт «Библиотека» режима Torrent виден и открывается",
+                     open_nav(proc.pid, "Библиотека")):
+            close_app(proc, hwnd)          # дальше жали бы кнопки не той
+            return report()                # страницы
+        row = page_text(proc.pid, "Скачано 2 из 2 видеофайлов", 20)
+        check("строка раздачи: «Скачано 2 из 2 видеофайлов», «+ 1 файл»",
+              bool(row) and "файл" in row, row)
+        grab(hwnd, os.path.join(SNAP, "library-row.png"))
+
+        # б) «Очистить данные библиотеки»: список пуст, раздача и файлы целы
+        clear = element(proc.pid, "Очистить данные библиотеки",
+                        "ControlType.Button")
+        check("кнопка «Очистить данные библиотеки» найдена", clear is not None)
+        click_button(proc.pid, "Очистить данные библиотеки")
+        time.sleep(1.5)
+        grab(hwnd, os.path.join(SNAP, "library-clear-confirm.png"))
+        buttons = sorted({e.get("name") for e in ui.elements(proc.pid)
+                          if e.get("type") == "ControlType.Button"})
+        print(f"  кнопки при подтверждении очистки: {buttons}")
+        save_state(clear_confirm_buttons=buttons)
+        confirm = None
+        for label in ("Очистить", "OK", "ОК"):
+            confirm = dialog_button(proc.pid, label,
+                                    anchor="Список раздач будет очищен. "
+                                    "Раздачи на странице «Торренты» и "
+                                    "файлы на диске останутся.")
+            if confirm:
+                break
+        check("подтверждение очистки найдено", confirm is not None,
+              "" if confirm is None else confirm["name"])
+        if confirm:
+            ui.click(proc.pid, *center(confirm))
+        empty = page_text(proc.pid, "Здесь появятся раздачи", 15)
+        check("после очистки список пуст", bool(empty))
+        check("очистка: записей в settings.json нет",
+              not torrent_history(), str(len(torrent_history())))
+        check("очистка: файлы на диске целы",
+              os.path.isfile(os.path.join(root, "Котики s01e01.mkv")))
+        check("очистка: раздача осталась на «Торрентах»",
+              open_nav(proc.pid, "Торренты")
+              and bool(wait_card(proc.pid, "Раздаётся", 10)))
+
+        # в) снова в Библиотеку: убрать с карточки без файлов и добавить
+        # заново — запись появится снова (файлы уже есть, докачки нет)
+        click_button(proc.pid, "Удалить")
+        time.sleep(1.0)
+        remove = dialog_button(proc.pid, "Убрать", anchor="Убрать раздачу?")
+        check("карточка: подтверждение «Убрать» найдено", remove is not None)
+        if remove:
+            ui.click(proc.pid, *center(remove))
+        check("карточка убрана без файлов",
+              wait_gone(proc.pid, "Сериал про котиков", 15)
+              and os.path.isfile(os.path.join(root, "Котики s01e01.mkv")))
+        check("снова «Скачать»", download_all(proc.pid, info["magnet"]))
+        check("раздача снова раздаётся",
+              bool(wait_card(proc.pid, "Раздаётся", 120)))
+        check("запись вернулась в settings.json",
+              any(e.get("id") == ih for e in torrent_history()))
+
+        # г) удаление записи с галочкой «удалить файлы»
+        if not check("снова открыта Библиотека",
+                     open_nav(proc.pid, "Библиотека")):
+            close_app(proc, hwnd)
+            return report()
+        page_text(proc.pid, "Сериал про котиков", 15)
+        boxes = [e for e in ui.elements(proc.pid)
+                 if e.get("type") == "ControlType.CheckBox" and e.get("w")]
+        check("галочка строки найдена", bool(boxes), str(len(boxes)))
+        if boxes:
+            ui.click(proc.pid, *center(boxes[0]))
+            time.sleep(0.5)
+        click_button(proc.pid, "Удалить")
+        time.sleep(1.5)
+        files_box = element(proc.pid, "Удалить также файлы с диска")
+        check("в подтверждении есть галочка «Удалить также файлы с диска»",
+              files_box is not None)
+        if files_box:
+            ui.click(proc.pid, *center(files_box))
+            time.sleep(0.5)
+        grab(hwnd, os.path.join(SNAP, "library-delete-confirm.png"))
+        yes = dialog_button(proc.pid, "Удалить", anchor="Удалить 1 запись?")
+        check("кнопка «Удалить» в подтверждении найдена", yes is not None)
+        if yes:
+            ui.click(proc.pid, *center(yes))
+        check("после удаления список пуст",
+              bool(page_text(proc.pid, "Здесь появятся раздачи", 15)))
+        end = time.monotonic() + 20
+        while time.monotonic() < end and os.path.exists(
+                os.path.join(root, "Котики s01e01.mkv")):
+            time.sleep(0.5)
+        check("файлы раздачи удалены с диска",
+              not os.path.exists(os.path.join(root, "Котики s01e01.mkv")))
+        check("fastresume/.chosen/.pending раздачи удалены",
+              not infohash_files(ih), str(infohash_files(ih)))
+        check("раздача снята и с «Торрентов»",
+              open_nav(proc.pid, "Торренты")
+              and wait_gone(proc.pid, "Сериал про котиков", 10))
+        check("записи в settings.json нет",
+              not any(e.get("id") == ih for e in torrent_history()))
+
+        secs = close_app(proc, hwnd)
+        check("закрытие быстрее 1.5 с", secs < 1.5, f"{secs:.2f} с")
+    finally:
+        seed_stop(seed)
+    return report()
 
 
 # ------------------------------------------------------------ уборка
@@ -502,8 +821,11 @@ def step_cleanup():
 STEPS = {
     "nometa": step_nometa,
     "dialog": step_dialog,
+    "cancel": step_cancel,
+    "readd": step_readd,
     "click": step_click,
     "subs": step_subs,
+    "library": step_library,
     "cleanup": step_cleanup,
 }
 
