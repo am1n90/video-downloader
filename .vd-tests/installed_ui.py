@@ -55,8 +55,18 @@ def patch_settings(**changes):
 
 # ------------------------------------------------------------ процесс
 
-def launch(*args):
-    return subprocess.Popen([EXE, *args], cwd=APP_DIR)
+def launch(*args, temp_dir=None):
+    """Запустить установленную копию.
+
+    temp_dir — подменить процессу TEMP/TMP. Нужно проверке «мало места»:
+    временные раздачи живут под %TEMP%, и свободное место движок
+    спрашивает у того тома, куда TEMP показывает.
+    """
+    env = None
+    if temp_dir:
+        env = dict(os.environ)
+        env["TEMP"] = env["TMP"] = temp_dir
+    return subprocess.Popen([EXE, *args], cwd=APP_DIR, env=env)
 
 
 def windows_of(pid):
@@ -306,6 +316,34 @@ def log_since(offset):
             return f.read().decode("utf-8", "replace")
     except OSError:
         return ""
+
+
+def last_boot_events(count=3):
+    """Последние события загрузки системы (Kernel-Boot 27).
+
+    Тем же журналом пользуется движок (torrent_engine.last_boot_time):
+    BootType 0 — холодный старт, 1 — быстрый запуск («выключил и
+    включил»), 2 — выход из гибернации (перезагрузкой не считается).
+    Отдаём [{"time": unix, "boot_type": n}], новые первыми.
+    """
+    ps = ("Get-WinEvent -FilterHashtable @{LogName='System';"
+          "ProviderName='Microsoft-Windows-Kernel-Boot';Id=27} "
+          f"-MaxEvents {int(count)} | ForEach-Object "
+          # ВНИМАНИЕ: -UFormat %s в Windows PowerShell 5.1 считает от
+          # ЛОКАЛЬНОГО времени и завышает результат на смещение зоны
+          # (здесь на 4 часа) — берём честный ToUnixTimeSeconds
+          "{ '{0}|{1}' -f ([datetimeoffset]$_.TimeCreated)"
+          ".ToUnixTimeSeconds(), $_.Properties[0].Value }")
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, errors="replace")
+    events = []
+    for line in out.stdout.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) == 2 and parts[0].lstrip("-").isdigit():
+            events.append({"time": int(parts[0]),
+                           "boot_type": int(parts[1])
+                           if parts[1].isdigit() else -1})
+    return events
 
 
 def firewall_rules():

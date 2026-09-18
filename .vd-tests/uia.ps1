@@ -108,7 +108,10 @@ try {
     } elseif ($Op -eq "setvalue") {
         $p = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
         $p.SetValue((FromB64 $Value))
-        Write-Result @{ ok = $true; el = (Describe $el) }
+        Write-Result @{ ok = $true; value = $p.Current.Value; el = (Describe $el) }
+    } elseif ($Op -eq "getvalue") {
+        $p = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        Write-Result @{ ok = $true; value = $p.Current.Value; el = (Describe $el) }
     } else {
         Write-Result @{ ok = $false; error = "unknown op" }
     }
