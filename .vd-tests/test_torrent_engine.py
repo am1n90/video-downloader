@@ -1183,6 +1183,52 @@ check("14 время последней загрузки этой машины �
       time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(real_boot or 0)))
 seed.limit(0)
 
+# ---- 15: выключение uTP настройкой (torrent_disable_utp, находка 65) ----
+# Ключи уходят в сессию при её СОЗДАНИИ, поэтому проверяем их на живой
+# сессии, а не по словарю движка. Заодно — что обычная закачка целиком
+# (без стриминга) при выключенном uTP доходит до конца: сид локальный и
+# работает по TCP, но раньше этот путь с выключенным uTP не проверялся.
+ev15 = Events()
+eng15 = te.TorrentEngine(
+    data_dir=os.path.join(BASE, "данные", "s15"),
+    on_change=ev15.on_change, on_list_change=ev15.on_list,
+    listen_interfaces="127.0.0.1:0",
+    extra_settings=dict(ENGINE_SETTINGS, enable_incoming_utp=False,
+                        enable_outgoing_utp=False))
+ENGINES.append(eng15)
+eng15.start()
+st15 = eng15._ses.get_settings()
+check("15 uTP выключен в живой сессии libtorrent",
+      st15.get("enable_incoming_utp") is False
+      and st15.get("enable_outgoing_utp") is False,
+      f"in={st15.get('enable_incoming_utp')} "
+      f"out={st15.get('enable_outgoing_utp')}")
+save15 = os.path.join(BASE, "Загрузки с пробелом", "s15")
+tid15 = eng15.add_magnet(magnet(), save15)
+ok15 = wait_for(lambda: state(eng15, tid15) == te.STATE_SEEDING, 60)
+item15 = eng15.get(tid15)
+check("15 без uTP обычная закачка доходит до конца",
+      ok15 and item15.progress >= 1.0,
+      f"{item15.state} {item15.progress:.3f}")
+check("15 файлы совпадают с источником",
+      all(wait_same_as_source(save15, rel) for rel in FILE_ORDER))
+
+# Контроль: без настройки libtorrent оставляет uTP включённым — иначе
+# проверка выше прошла бы и при неработающих ключах.
+ev15b = Events()
+eng15b = te.TorrentEngine(
+    data_dir=os.path.join(BASE, "данные", "s15b"),
+    on_change=ev15b.on_change, on_list_change=ev15b.on_list,
+    listen_interfaces="127.0.0.1:0", extra_settings=ENGINE_SETTINGS)
+ENGINES.append(eng15b)
+eng15b.start()
+st15b = eng15b._ses.get_settings()
+check("15 без настройки uTP остаётся включённым (умолчание libtorrent)",
+      st15b.get("enable_incoming_utp") is True
+      and st15b.get("enable_outgoing_utp") is True,
+      f"in={st15b.get('enable_incoming_utp')} "
+      f"out={st15b.get('enable_outgoing_utp')}")
+
 # ---- завершение ----
 for eng_ in ENGINES:
     try:

@@ -318,6 +318,30 @@ try:
     config.load()
     check("12 одна .corrupt за запуск", len(corrupt_copies(d)) == 1)
 
+    # ---- сценарий 13: настройки прежних версий без новых ключей ----
+    # settings.json, записанный версией 1.1.1, ключа torrent_disable_utp
+    # не содержит: значение должно взяться из DEFAULTS, а прежние —
+    # уцелеть (иначе обновление сбрасывало бы настройки пользователя).
+    p, d = fresh("s13")
+    old_settings = {"theme": "dark", "torrent_folder": "D:/Раздачи",
+                    "torrent_seed_after_download": False, "history": []}
+    with io.open(p, "w", encoding="utf-8") as f:
+        json.dump(old_settings, f, ensure_ascii=False)
+    s13 = config.load()
+    check("13 старый settings.json: новый ключ взят из умолчаний",
+          s13.get("torrent_disable_utp") is True,
+          repr(s13.get("torrent_disable_utp")))
+    check("13 старый settings.json: прежние значения целы",
+          s13.get("theme") == "dark"
+          and s13.get("torrent_folder") == "D:/Раздачи"
+          and s13.get("torrent_seed_after_download") is False)
+    # Выключенный пользователем uTP не должен «чиниться» умолчанием
+    with io.open(p, "w", encoding="utf-8") as f:
+        json.dump(dict(old_settings, torrent_disable_utp=False), f,
+                  ensure_ascii=False)
+    check("13 выбор пользователя (uTP включён) переживает load",
+          config.load().get("torrent_disable_utp") is False)
+
 finally:
     config.CONFIG_PATH = old_path
     config._log_dir_cache = old_cache

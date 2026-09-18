@@ -468,9 +468,9 @@ check("6 папка раздач берётся из настроек",
       window.torrent_page.save_path())
 
 sp = window.settings_page
-check("6 в «Настройках» три карточки группы Torrent",
+check("6 в «Настройках» четыре карточки группы Torrent",
       hasattr(sp, "torrent_folder_edit") and hasattr(sp, "seed_check")
-      and hasattr(sp, "torrent_port_spin"))
+      and hasattr(sp, "torrent_port_spin") and hasattr(sp, "utp_check"))
 check("6 раздача после скачивания включена по умолчанию",
       sp.seed_check.isChecked() and window.torrent_engine.seed_after_download)
 sp.seed_check.setChecked(False)
@@ -487,6 +487,28 @@ sp.torrent_port_spin.setValue(6881)
 pump(0.1)
 check("6 порт сохраняется в настройки", settings["torrent_port"] == 6881,
       str(settings.get("torrent_port")))
+
+# uTP выключен по умолчанию (находка 65). Ключи уходят в сессию при её
+# создании, поэтому проверяем не «дошло до живого движка», как у раздачи,
+# а что движок окна получил их при постройке, и что галочка пишется в
+# настройки — применится при следующем запуске.
+check("6 галочка «Отключить uTP» стоит по умолчанию", sp.utp_check.isChecked())
+check("6 движок окна получил выключённый uTP",
+      window.torrent_engine._settings.get("enable_incoming_utp") is False
+      and window.torrent_engine._settings.get("enable_outgoing_utp") is False,
+      str(window.torrent_engine._settings.get("enable_outgoing_utp")))
+check("6 uTP выключен и в живой сессии",
+      window.torrent_engine._ses.get_settings().get(
+          "enable_outgoing_utp") is False)
+sp.utp_check.setChecked(False)
+pump(0.1)
+check("6 снятая галочка сохраняется в настройки",
+      settings["torrent_disable_utp"] is False,
+      str(settings.get("torrent_disable_utp")))
+sp.utp_check.setChecked(True)
+pump(0.1)
+check("6 возврат галочки сохраняется в настройки",
+      settings["torrent_disable_utp"] is True)
 
 window.close()
 pump(0.4)

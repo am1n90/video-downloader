@@ -176,9 +176,15 @@ def seed_start(limit_kb=1500):
     end = time.monotonic() + 180
     while time.monotonic() < end:
         if os.path.isfile(info):
-            time.sleep(0.5)
-            with open(info, "r", encoding="utf-8") as f:
-                return proc, json.load(f)
+            # Файл пишется не атомарно: пауза в полсекунды однажды не
+            # спасла — seed.json прочитался пустым и шаг упал ещё до
+            # первой проверки. Ждём не время, а годное содержимое.
+            try:
+                with open(info, "r", encoding="utf-8") as f:
+                    return proc, json.load(f)
+            except (ValueError, OSError):
+                time.sleep(0.5)
+                continue
         if proc.poll() is not None:
             out = proc.stdout.read().decode("utf-8", "replace")
             raise RuntimeError(f"сид не поднялся:\n{out}")
@@ -1477,8 +1483,205 @@ def step_cleanup():
     return 0
 
 
+def open_settings(pid):
+    """Открыть «Настройки» — последний пункт навигации (у пунктов
+    qfluentwidgets в UIA нет имени, см. open_nav)."""
+    items = sorted((e for e in ui.elements(pid)
+                    if e.get("cls") == "NavigationTreeItem" and e.get("w")),
+                   key=lambda e: e["y"])
+    if not items:
+        return False
+    ui.click(pid, *center(items[-1]))
+    return ui.wait_element(
+        pid, lambda e: e.get("cls") == "TitleLabel"
+        and e.get("name") == "Настройки" and e.get("w"), 10) is not None
+
+
+def _checkbox_near(pid, title):
+    """Чекбокс, ближайший по вертикали к подписи карточки (у CheckBox
+    без текста имени в UIA нет)."""
+    label = next((e for e in ui.elements(pid)
+                  if (e.get("name") or "") == title and e.get("w")), None)
+    if label is None:
+        return None, None
+    mid = label["y"] + label.get("h", 0) / 2
+    boxes = [e for e in ui.elements(pid)
+             if e.get("type") == "ControlType.CheckBox" and e.get("w")]
+    if not boxes:
+        return label, None
+    best = min(boxes, key=lambda e: abs(e["y"] + e.get("h", 0) / 2 - mid))
+    ok = abs(best["y"] + best.get("h", 0) / 2 - mid) < 40
+    return label, (best if ok else None)
+
+
+def card_checkbox(pid, hwnd, title, tries=12):
+    """Галочка карточки настроек по заголовку, прокрутив до неё.
+
+    Страница «Настройки» прокручивается, и UIA отдаёт элементам ниже
+    видимой области настоящие экранные координаты — они лежат ЗА окном
+    (группа Torrent на y=1038-1326 при нижней границе окна 925), клик по
+    ним уходил мимо и падал «под точкой чужое окно». Крутим колесо, пока
+    карточка не окажется внутри окна. Состояние (ToggleState) дамп не
+    отдаёт — что галочка делает, проверяем по settings.json.
+    """
+    left, top, right, bottom = ui.rect_of(hwnd)
+    cx, cy = (left + right) // 2, (top + bottom) // 2
+    for _ in range(tries):
+        label, box = _checkbox_near(pid, title)
+        if label is None:
+            return None
+        # Запас 60 px снизу: без него прокрутка останавливалась, едва
+        # чекбокс войдёт в окно, и карточка попадала на снимок обрезанной
+        if box is not None and top < box["y"] and \
+                box["y"] + box.get("h", 0) < bottom - 60:
+            return box
+        ui.scroll(pid, cx, cy, -3)
+        time.sleep(0.4)
+    return None
+
+
+def peers_seen(pid):
+    """Сколько пиров показывает карточка (0 — рой не отозвался)."""
+    for name in (_plain(n) for n in ui.names(pid)):
+        if "пиров:" in name:
+            tail = name.split("пиров:", 1)[1].strip()
+            digits = ""
+            for ch in tail:
+                if ch.isdigit():
+                    digits += ch
+                else:
+                    break
+            if digits:
+                return int(digits)
+    return 0
+
+
+SWARM_MAGNET = (
+    "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10"
+    "&tr=udp://tracker.opentrackr.org:1337/announce"
+    "&tr=udp://explodie.org:6969/announce"
+)                                          # Sintel, открытый фильм Blender
+
+
+def step_utp(runs=4):
+    """Настройка «Отключить uTP» (torrent_disable_utp) на установленной
+    копии: доходит ли она из settings.json до сессии libtorrent в
+    СОБРАННОМ exe.
+
+    Изнутри процесса настройки сессии не спросить, а по сокетам условия
+    не различить: 6881/UDP занят под DHT в обоих случаях. Поэтому мерим
+    следствие, найденное в 2.9: разрушение сессии стоит ~0.7 с, если к
+    моменту закрытия живы uTP-соединения (находка 62), и 0.02-0.03 с,
+    если uTP выключен с самого старта. Нужен НАСТОЯЩИЙ рой: локальный
+    сид uTP не использует (находка 46), и с ним оба условия одинаковы.
+
+    ПРАВИЛО РЕШЕНИЯ ЗАПИСАНО ДО ПРОГОНОВ:
+      * проверяем (FAIL, если не так) — с выключенным uTP КАЖДЫЙ прогон
+        закрывается быстрее 1.0 с; это прямое следствие находки 62 и то,
+        ради чего настройка делалась;
+      * прогон засчитывается, только если рой отозвался (пиры > 0) —
+        иначе uTP-соединений нет ни при каком условии и сравнивать
+        нечего (урок 2.3: скрипт сам доказывает годность прогона);
+      * условие «uTP включён» — НАБЛЮДЕНИЕ, не проверка: медленные
+        прогоны там случаются примерно в четверти случаев, и требовать
+        их от живого роя значило бы завести флейк.
+    """
+    print("== utp: настройка «Отключить uTP» на установленной копии ==")
+    print("   (нужен настоящий рой: Sintel, открытый фильм Blender)")
+
+    # --- а) галочка в Настройках управляет ключом settings.json -------
+    # На диск настройки уходят при закрытии окна (config.save в
+    # closeEvent), а не по клику, поэтому читаем файл после закрытия —
+    # заодно видно, что выбор переживает перезапуск.
+    prepare(torrent_disable_utp=True)
+    proc, hwnd = start_app()
+    ui.focus(hwnd)
+    ok_nav = check("страница «Настройки» открывается", open_settings(proc.pid))
+    box = card_checkbox(proc.pid, hwnd, "Отключить uTP") if ok_nav else None
+    check("карточка «Отключить uTP» есть в группе Torrent", box is not None)
+    if box is None:
+        close_app(proc, hwnd)
+        return report()
+    grab(hwnd, os.path.join(SNAP, "utp-setting.png"))
+    ui.click(proc.pid, *center(box))       # снимаем галочку
+    time.sleep(0.5)
+    close_app(proc, hwnd)
+    check("снятая галочка записана в settings.json как False",
+          ui.read_settings().get("torrent_disable_utp") is False,
+          repr(ui.read_settings().get("torrent_disable_utp")))
+
+    proc, hwnd = start_app()
+    ui.focus(hwnd)
+    ok_nav = open_settings(proc.pid)
+    box = card_checkbox(proc.pid, hwnd, "Отключить uTP") if ok_nav else None
+    check("после перезапуска карточка на месте", box is not None)
+    if box is not None:
+        ui.click(proc.pid, *center(box))   # возвращаем галочку
+        time.sleep(0.5)
+    close_app(proc, hwnd)
+    check("возврат галочки записан как True",
+          ui.read_settings().get("torrent_disable_utp") is True,
+          repr(ui.read_settings().get("torrent_disable_utp")))
+
+    # --- б) доходит ли настройка до сессии: замер на настоящем рое ----
+    times = {True: [], False: []}
+    peers = {True: [], False: []}
+    for i in range(runs):
+        for disabled in (True, False) if i % 2 == 0 else (False, True):
+            prepare(torrent_disable_utp=disabled)
+            proc, hwnd = start_app()
+            try:
+                add_magnet(proc.pid, SWARM_MAGNET)
+                if not wait_choice(proc.pid, 180):
+                    print("  метаданные не пришли за 180 с — прогон пропущен")
+                    close_app(proc, hwnd)
+                    continue
+                answer_choice(proc.pid, "Скачать")
+                wait_card(proc.pid, "Скачивается", 60)
+                time.sleep(25.0)           # дать рою раздать соединения
+                seen = peers_seen(proc.pid)
+            except Exception as exc:
+                print(f"  прогон не удался: {exc!r}")
+                close_app(proc, hwnd)
+                continue
+            secs = close_app(proc, hwnd)
+            label = "uTP выкл" if disabled else "uTP вкл "
+            print(f"  {label} закрытие {secs:.2f} с, пиров {seen}", flush=True)
+            if seen > 0:
+                times[disabled].append(secs)
+                peers[disabled].append(seen)
+            else:
+                print("    рой не отозвался — прогон не засчитан")
+
+    for disabled in (True, False):
+        vals = times[disabled]
+        label = "uTP выключен" if disabled else "uTP включён"
+        if vals:
+            print(f"  {label}: прогонов {len(vals)}, медиана "
+                  f"{statistics.median(vals):.2f} с, максимум {max(vals):.2f} с, "
+                  f"пиров в среднем {statistics.mean(peers[disabled]):.0f}")
+        else:
+            print(f"  {label}: годных прогонов нет")
+
+    off = times[True]
+    check("рой отозвался хотя бы в одном прогоне с выключенным uTP",
+          bool(off), f"{len(off)} годных прогонов")
+    if off:
+        check("с выключенным uTP каждое закрытие быстрее 1.0 с",
+              max(off) < 1.0, f"максимум {max(off):.2f} с из {len(off)}")
+    on = times[False]
+    if on:
+        print(f"  наблюдение (не проверка): с включённым uTP медиана "
+              f"{statistics.median(on):.2f} с, максимум {max(on):.2f} с "
+              f"— в 2.9 медленные прогоны были примерно в четверти")
+    shutil.rmtree(ui.TORRENT_DATA, ignore_errors=True)
+    shutil.rmtree(DL, ignore_errors=True)
+    return report()
+
+
 STEPS = {
     "nometa": step_nometa,
+    "utp": step_utp,
     "dialog": step_dialog,
     "cancel": step_cancel,
     "readd": step_readd,

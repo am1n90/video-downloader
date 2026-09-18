@@ -2311,6 +2311,28 @@ class SettingsPage(TransparentScrollArea):
         seed_card.hBoxLayout.addSpacing(SP_GROUP)
         cards.append(seed_card)
 
+        # uTP выключен по умолчанию: он уступает дорогу другому трафику,
+        # поэтому его пиры отдают куски последними — просмотр начинается
+        # заметно дольше (находка 65). Ключи уходят в сессию libtorrent
+        # при её создании, отсюда «после перезапуска», как у порта.
+        utp_card = SettingCard(
+            FIF.GLOBE if hasattr(FIF, "GLOBE") else FIF.SETTING,
+            "Отключить uTP",
+            "Просмотр начинается быстрее, но участников раздачи меньше; "
+            "применяется после перезапуска приложения", parent,
+        )
+        self.utp_check = CheckBox(utp_card)
+        self.utp_check.setChecked(
+            bool(self.settings.get("torrent_disable_utp", True)))
+        self.utp_check.stateChanged.connect(
+            lambda state: self.settings.__setitem__(
+                "torrent_disable_utp", bool(state)
+            )
+        )
+        utp_card.hBoxLayout.addWidget(self.utp_check)
+        utp_card.hBoxLayout.addSpacing(SP_GROUP)
+        cards.append(utp_card)
+
         # Порт задаётся при создании сессии libtorrent, поэтому меняется
         # только с перезапуском; 0 — libtorrent выберет свободный сам
         port_card = SettingCard(
@@ -2658,12 +2680,20 @@ class MainWindow(FluentWindow):
         # при первом показе (TorrentPage.showEvent).
         self.torrent_bridge = Bridge()
         port = int(self.settings.get("torrent_port") or 0)
+        # uTP выключаем по настройке (умолчание True, находка 65). Ключи
+        # уходят в сессию при её создании, поэтому смена галочки видна
+        # только после перезапуска — так же, как смена порта.
+        extra = None
+        if self.settings.get("torrent_disable_utp", True):
+            extra = {"enable_incoming_utp": False,
+                     "enable_outgoing_utp": False}
         self.torrent_engine = torrent_engine.TorrentEngine(
             on_change=lambda item: self.torrent_bridge.itemChanged.emit(item),
             on_list_change=lambda: self.torrent_bridge.queueChanged.emit(),
             seed_after_download=bool(
                 self.settings.get("torrent_seed_after_download", True)),
             listen_interfaces=f"0.0.0.0:{port}" if port else None,
+            extra_settings=extra,
         )
         # Просмотр во время закачки (2.1). Сервер тоже ленивый: сокет на
         # 127.0.0.1 поднимается только при первом «Смотреть».

@@ -176,6 +176,27 @@ def click(pid, x, y, double=False):
         time.sleep(0.08)
 
 
+def scroll(pid, x, y, clicks):
+    """Колесо мыши над точкой (x, y): clicks < 0 — вниз, > 0 — вверх.
+
+    Нужна страницам с прокруткой: в UI Automation элементы ниже видимой
+    области имеют настоящие экранные координаты, которые лежат ЗА окном
+    (страница «Настройки»: группа Torrent на y=1038-1326 при нижней
+    границе окна 925), и клик по ним уходил мимо.
+    """
+    point = wintypes.POINT(x, y)
+    under = user32.WindowFromPoint(point)
+    owner = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(under, ctypes.byref(owner))
+    if owner.value != pid:
+        raise RuntimeError(f"под точкой {x},{y} чужое окно (pid {owner.value})")
+    user32.SetCursorPos(x, y)
+    for _ in range(abs(clicks)):
+        user32.mouse_event(0x0800, 0, 0,                  # MOUSEEVENTF_WHEEL
+                           120 if clicks > 0 else -120, 0)
+        time.sleep(0.05)
+
+
 def shot(hwnd, path):
     from PIL import ImageGrab
     try:
